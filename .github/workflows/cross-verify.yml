@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm, or mac-metal-arm, which only runs when named (all = every one but that)"
+        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm, or mac-metal-arm, mac-vulkan-arm, which only run when named (all = every one but those)"
         default: "all"
 
 concurrency:
@@ -71,8 +71,9 @@ jobs:
           want = None if t == "all" else set(t.split(","))
           inc = [
             dict(name="mac-cpu", os="macos-14", kind="run", backend="cpu"),
-            dict(name="mac-metal", os="macos-15-intel", kind="run", backend="metal"),
-            dict(name="mac-vulkan", os="macos-15-intel", kind="run", backend="vulkan"),
+            # The Intel runner's paravirtual GPU opens, but Metal gives other numbers than the CPU and MoltenVK aborts.
+            dict(name="mac-metal", os="macos-15-intel", kind="build", backend="metal"),
+            dict(name="mac-vulkan", os="macos-15-intel", kind="build", backend="vulkan"),
             dict(name="linux-cpu", os="ubuntu-latest", kind="run", backend="cpu"),
             dict(name="linux-vulkan", os="ubuntu-latest", kind="run", backend="vulkan"),
             dict(name="linux-cuda", os="ubuntu-latest", kind="check", backend="cuda"),
@@ -85,7 +86,10 @@ jobs:
             dict(name="windows-cuda", os="windows-latest", kind="check", backend="cuda", cuda="13.2.0"),
             dict(name="windows-rocm", os="windows-latest", kind="check", backend="rocm"),
           ]
-          named = [dict(name="mac-metal-arm", os="macos-15", kind="run", backend="metal")]
+          named = [
+            dict(name="mac-metal-arm", os="macos-15", kind="run", backend="metal"),
+            dict(name="mac-vulkan-arm", os="macos-15", kind="run", backend="vulkan"),
+          ]
           unknown = (want or set()) - {i["name"] for i in inc + named}
           if unknown:
               print("unknown targets: " + ",".join(sorted(unknown)) + "  (valid: " + ",".join(i["name"] for i in inc + named) + ")", file=sys.stderr)
@@ -144,7 +148,7 @@ jobs:
           sudo apt-get install -y -qq build-essential pkg-config libssl-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
             libjavascriptcoregtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
       - name: macOS — MoltenVK
-        if: matrix.name == 'mac-vulkan'
+        if: matrix.name == 'mac-vulkan-arm'
         run: |
           brew install molten-vk vulkan-loader vulkan-tools >/dev/null 2>&1 || brew install molten-vk vulkan-loader vulkan-tools
           echo "VK_ICD_FILENAMES=$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" >> "$GITHUB_ENV"
@@ -211,7 +215,7 @@ jobs:
         run: |
           case "${{ matrix.kind }}" in
             run)   msg="every step of test_runner.sh on ${{ matrix.backend }}. NOT RUN here: #[ignore] tests with real weights, real CUDA / ROCm / Windows-GPU execution" ;;
-            build) msg="build only (step 01). NOT RUN: tests (no software Vulkan driver on this runner)" ;;
+            build) msg="build only (step 01). NOT RUN: tests (no GPU driver on this runner that gives the CPU's numbers)" ;;
             check) msg="type check only (cargo check). NOT RUN: linking, any test, any kernel on a GPU (no GPU / SDK to link or run)" ;;
           esac
           echo "::notice title=scope ${{ matrix.name }}::$msg"
