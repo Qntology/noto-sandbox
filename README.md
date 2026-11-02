@@ -84,8 +84,9 @@ GitHub Actions(`.github/workflows/cross-verify.yml`)는 브랜치마다 푸시�
 
 | 잡 | 범위 |
 |---|---|
-| `mac-cpu`, `linux-cpu`, `windows-cpu` | 빌드, 전체 단계, `test_runner.bat`에 없는 통합 테스트 |
-| `mac-metal`, `mac-vulkan` | 빌드, 전체 단계. 7단계가 러너의 가상 Apple GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK) |
+| `mac-cpu`, `linux-cpu`, `windows-cpu` | 빌드, 전체 단계, `test_runner.bat`에 없는 통합 테스트. `mac-cpu`는 Apple Silicon(`macos-14`)입니다 |
+| `mac-metal`, `mac-vulkan` | 빌드, 전체 단계. 7단계가 Intel Mac 러너(`macos-15-intel`)의 가상 GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK) |
+| `mac-metal-arm` | `mac-metal`과 같고 Apple Silicon(`macos-15`)에서 돕니다. 러너가 모자라 이름으로 지정할 때만 돕니다 |
 | `linux-vulkan` | 빌드, 전체 단계. 7단계는 lavapipe(소프트웨어 Vulkan)에서 돕니다 |
 | `windows-vulkan` | 빌드만 (러너에 소프트웨어 Vulkan이 없습니다) |
 | `linux-cuda`, `windows-cuda`, `linux-rocm`, `windows-rocm` | `cargo check`만. CUDA는 nvcc로 커널까지 빌드합니다 |

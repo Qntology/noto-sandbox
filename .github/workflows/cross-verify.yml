@@ -2,14 +2,19 @@
 # test_runner.bat through test_runner.sh, its bash twin, on every OS.
 #
 # GitHub-hosted runners have no discrete GPU. So only what can really run is run:
-#   mac (macos-15, M1 virtual): cpu / metal / vulkan (MoltenVK) — the paravirtual GPU runs the models for real
+#   mac metal / vulkan (macos-15-intel): the paravirtual GPU runs the models for real, Vulkan through MoltenVK
 #                    (step 07 compares them with the CPU; a job that opens no device fails, it never skips)
+#   mac cpu (macos-14) : Apple Silicon, no Metal device on that image
 #   cpu            : every step, then the integration tests test_runner.bat does not list
 #   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): every step, step 07 on that device
 #   vulkan (Win)   : build only (no software Vulkan ICD is installed) — reported as "build only"
 #   cuda / rocm    : type check only (`cargo check`, as check_cuda.bat / check_rocm.bat); never executed, never
 #                    reported as a pass of a run. cuda builds its kernels with a real nvcc.
 # Real CUDA / ROCm / Windows-GPU execution and the #[ignore] tests with real weights need a self-hosted runner.
+#
+# macOS labels, measured 2026-11-02: macos-15 and macos-26 (Apple Silicon) are short of runners: most jobs end cancelled
+# after 15-40 minutes with "not acquired by Runner", which fails the run. macos-14 and macos-15-intel start within seconds.
+# Metal on Apple Silicon therefore runs only when named: `[targets: mac-metal-arm]`.
 name: cross-verify
 
 on:
@@ -22,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm (all = every one)"
+        description: "comma list of: mac-cpu, mac-metal, mac-vulkan, linux-cpu, linux-vulkan, linux-cuda, linux-rocm, windows-cpu, windows-vulkan, windows-cuda, windows-rocm, or mac-metal-arm, which only runs when named (all = every one but that)"
         default: "all"
 
 concurrency:
@@ -65,9 +70,9 @@ jobs:
           t = t.replace(" ", "")
           want = None if t == "all" else set(t.split(","))
           inc = [
-            dict(name="mac-cpu", os="macos-15", kind="run", backend="cpu"),
-            dict(name="mac-metal", os="macos-15", kind="run", backend="metal"),
-            dict(name="mac-vulkan", os="macos-15", kind="run", backend="vulkan"),
+            dict(name="mac-cpu", os="macos-14", kind="run", backend="cpu"),
+            dict(name="mac-metal", os="macos-15-intel", kind="run", backend="metal"),
+            dict(name="mac-vulkan", os="macos-15-intel", kind="run", backend="vulkan"),
             dict(name="linux-cpu", os="ubuntu-latest", kind="run", backend="cpu"),
             dict(name="linux-vulkan", os="ubuntu-latest", kind="run", backend="vulkan"),
             dict(name="linux-cuda", os="ubuntu-latest", kind="check", backend="cuda"),
@@ -80,11 +85,12 @@ jobs:
             dict(name="windows-cuda", os="windows-latest", kind="check", backend="cuda", cuda="13.2.0"),
             dict(name="windows-rocm", os="windows-latest", kind="check", backend="rocm"),
           ]
-          unknown = (want or set()) - {i["name"] for i in inc}
+          named = [dict(name="mac-metal-arm", os="macos-15", kind="run", backend="metal")]
+          unknown = (want or set()) - {i["name"] for i in inc + named}
           if unknown:
-              print("unknown targets: " + ",".join(sorted(unknown)) + "  (valid: " + ",".join(i["name"] for i in inc) + ")", file=sys.stderr)
+              print("unknown targets: " + ",".join(sorted(unknown)) + "  (valid: " + ",".join(i["name"] for i in inc + named) + ")", file=sys.stderr)
               sys.exit(1)
-          inc = [i for i in inc if want is None or i["name"] in want]
+          inc = inc if want is None else [i for i in inc + named if i["name"] in want]
           print("targets: " + ",".join(i["name"] for i in inc), file=sys.stderr)
           print("matrix=" + json.dumps({"include": inc}))
           PY
