@@ -68,6 +68,30 @@ dev_vulkan.bat                                  # Vulkan 으로 Tauri 앱 실행
 serve_cuda.bat                                  # 개발 서버 (브라우저)
 ```
 
+macOS와 Linux에서는 `_cargo.sh`가 같은 일을 합니다. 단계 번호와 명령, 로그 형식은 `test_runner.bat`과 같습니다(`test_runner.sh`). protoc가 없으면 `tools/`에 받습니다.
+
+```bash
+./test_metal.sh                                   # 전체 단계 (macOS, Metal)
+./test_metal.sh -p noto-vision --test gpu_backend  # Metal과 CPU 결과 대조만
+./check_metal.sh                                  # Metal 빌드 확인
+./dev_metal.sh                                    # Metal 로 Tauri 앱 실행
+./build_metal.sh                                  # 앱 번들
+./serve_metal.sh                                  # 개발 서버 (브라우저)
+./_cargo.sh vulkan test                           # 다른 백엔드 (cpu, vulkan, cuda, rocm)
+```
+
+GitHub Actions(`.github/workflows/cross-verify.yml`)는 브랜치마다 푸시할 때 세 OS에서 돌아갑니다. 호스팅 러너에는 외장 GPU가 없어 실제로 돌 수 있는 것만 돌리고, 안 돈 것은 통과로 적지 않습니다.
+
+| 잡 | 범위 |
+|---|---|
+| `mac-cpu`, `linux-cpu`, `windows-cpu` | 빌드, 전체 단계, `test_runner.bat`에 없는 통합 테스트 |
+| `mac-metal`, `mac-vulkan` | 빌드, 전체 단계. 7단계가 러너의 가상 Apple GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK) |
+| `linux-vulkan` | 빌드, 전체 단계. 7단계는 lavapipe(소프트웨어 Vulkan)에서 돕니다 |
+| `windows-vulkan` | 빌드만 (러너에 소프트웨어 Vulkan이 없습니다) |
+| `linux-cuda`, `windows-cuda`, `linux-rocm`, `windows-rocm` | `cargo check`만. CUDA는 nvcc로 커널까지 빌드합니다 |
+
+커밋 메시지에 `[targets: mac-metal,windows-cpu]` 한 줄을 넣으면 그 잡만 돌고, Actions 탭의 수동 실행도 같은 목록을 받습니다. 실제 가중치가 필요한 `#[ignore]` 테스트와 실제 CUDA·ROCm 실행은 CI에 없습니다. 단계별 로그는 잡마다 `test-logs-<잡>` 아티팩트로 남습니다.
+
 ### 앱 실행
 
 ```bash
@@ -86,7 +110,7 @@ cargo tauri dev --features metal     # macOS
 
 빌드에 GPU 기능이 있으면 앱은 첫 GPU(CUDA → ROCm → Vulkan → Metal)에서 시작합니다. `NOTO_DEVICE=cpu|cuda|rocm|vulkan|metal|gpu[:번호]`로 고정할 수 있고, 왼쪽 ④ "사전 · 모델"에서 바꿀 수 있습니다. 같은 백엔드의 모델은 장치 하나를 공유하며, 배치 크기는 `NOTO_BATCH_ROWS`, CUDA·ROCm 텍스트 고정 모양은 `NOTO_FIXED_SHAPE=0|1`, SAM 인코더 배치는 `NOTO_SAM_BATCH`로 바꿉니다.
 
-Windows에서는 아래 `.bat`이 다음 설정을 대신합니다(`dev_cuda.bat`, `dev_rocm.bat`, `dev_vulkan.bat`, `dev_cpu.bat` 등). 직접 할 때는 이렇습니다. CUDA를 쓰려면 다음 두 가지가 필요합니다.
+macOS에서는 `./dev_metal.sh`가 위 명령을 대신합니다. Windows에서는 아래 `.bat`이 다음 설정을 대신합니다(`dev_cuda.bat`, `dev_rocm.bat`, `dev_vulkan.bat`, `dev_cpu.bat` 등). 직접 할 때는 이렇습니다. CUDA를 쓰려면 다음 두 가지가 필요합니다.
 
 - MSVC 호스트 컴파일러(`cl.exe`)가 PATH에 있어야 합니다. Visual Studio 개발자 셸에서 실행하거나 `vcvars64.bat`을 먼저 실행하세요.
 - CUDA 13의 CCCL 헤더는 MSVC의 표준 전처리기를 요구합니다. nvcc에 아래 플래그를 넘깁니다.
