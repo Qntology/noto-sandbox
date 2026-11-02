@@ -2,9 +2,10 @@
 # test_runner.bat through test_runner.sh, its bash twin, on every OS.
 #
 # GitHub-hosted runners have no discrete GPU. So only what can really run is run:
-#   mac metal / vulkan (macos-15-intel): the paravirtual GPU runs the models for real, Vulkan through MoltenVK
+#   mac-metal-arm, mac-vulkan-arm (macos-15): the paravirtual Apple GPU runs the models for real, Vulkan through MoltenVK
 #                    (step 07 compares them with the CPU; a job that opens no device fails, it never skips)
-#   mac cpu (macos-14) : Apple Silicon, no Metal device on that image
+#   mac-metal, mac-vulkan (macos-15-intel): build only. That GPU opens, but Metal gives other numbers and MoltenVK aborts
+#   mac-cpu (macos-14) : Apple Silicon, no Metal device on that image
 #   cpu            : every step, then the integration tests test_runner.bat does not list
 #   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): every step, step 07 on that device
 #   vulkan (Win)   : build only (no software Vulkan ICD is installed) — reported as "build only"
@@ -12,9 +13,10 @@
 #                    reported as a pass of a run. cuda builds its kernels with a real nvcc.
 # Real CUDA / ROCm / Windows-GPU execution and the #[ignore] tests with real weights need a self-hosted runner.
 #
-# macOS labels, measured 2026-11-02: macos-15 and macos-26 (Apple Silicon) are short of runners: most jobs end cancelled
-# after 15-40 minutes with "not acquired by Runner", which fails the run. macos-14 and macos-15-intel start within seconds.
-# Metal on Apple Silicon therefore runs only when named: `[targets: mac-metal-arm]`.
+# macOS labels, measured 2026-11-02: macos-15 and macos-26 (Apple Silicon) were short of runners by day (14-18 UTC): jobs
+# ended cancelled after 15-40 minutes with "not acquired by Runner", which fails the run; at 22-24 UTC they started at once.
+# macos-14 and macos-15-intel start within seconds. So the Apple Silicon GPU jobs stay out of the push runs: they run
+# when named (`[targets: mac-metal-arm,mac-vulkan-arm]`) and once a day.
 name: cross-verify
 
 on:
@@ -24,6 +26,8 @@ on:
   # message runs only those jobs (no duplicate runs of what did not change); workflow_dispatch takes the same list.
   push:
     branches: ["**"]
+  schedule:
+    - cron: "23 22 * * *"
   workflow_dispatch:
     inputs:
       targets:
@@ -55,6 +59,7 @@ jobs:
       - id: m
         shell: bash
         env:
+          EVENT: ${{ github.event_name }}
           TARGETS: ${{ inputs.targets || '' }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
@@ -90,6 +95,8 @@ jobs:
             dict(name="mac-metal-arm", os="macos-15", kind="run", backend="metal"),
             dict(name="mac-vulkan-arm", os="macos-15", kind="run", backend="vulkan"),
           ]
+          if os.environ.get("EVENT") == "schedule":
+              want = {i["name"] for i in named}
           unknown = (want or set()) - {i["name"] for i in inc + named}
           if unknown:
               print("unknown targets: " + ",".join(sorted(unknown)) + "  (valid: " + ",".join(i["name"] for i in inc + named) + ")", file=sys.stderr)

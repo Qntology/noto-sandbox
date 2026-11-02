@@ -85,13 +85,13 @@ GitHub Actions(`.github/workflows/cross-verify.yml`)는 브랜치마다 푸시�
 | 잡 | 범위 |
 |---|---|
 | `mac-cpu`, `linux-cpu`, `windows-cpu` | 빌드, 전체 단계, `test_runner.bat`에 없는 통합 테스트. `mac-cpu`는 Apple Silicon(`macos-14`)입니다 |
-| `mac-metal`, `mac-vulkan` | 빌드, 전체 단계. 7단계가 Intel Mac 러너(`macos-15-intel`)의 가상 GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK) |
-| `mac-metal-arm` | `mac-metal`과 같고 Apple Silicon(`macos-15`)에서 돕니다. 러너가 모자라 이름으로 지정할 때만 돕니다 |
+| `mac-metal-arm`, `mac-vulkan-arm` | 빌드, 전체 단계. 7단계가 Apple Silicon 러너(`macos-15`)의 가상 GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK). 낮 시간대에는 러너가 모자라 푸시마다 돌지 않고, 하루 한 번과 이름으로 지정할 때 돕니다 |
+| `mac-metal`, `mac-vulkan` | 빌드만 (`macos-15-intel`). 이 러너의 가상 GPU는 Metal 값이 CPU와 다르고 MoltenVK가 중단됩니다 |
 | `linux-vulkan` | 빌드, 전체 단계. 7단계는 lavapipe(소프트웨어 Vulkan)에서 돕니다 |
 | `windows-vulkan` | 빌드만 (러너에 소프트웨어 Vulkan이 없습니다) |
 | `linux-cuda`, `windows-cuda`, `linux-rocm`, `windows-rocm` | `cargo check`만. CUDA는 nvcc로 커널까지 빌드합니다 |
 
-커밋 메시지에 `[targets: mac-metal,windows-cpu]` 한 줄을 넣으면 그 잡만 돌고, Actions 탭의 수동 실행도 같은 목록을 받습니다. 실제 가중치가 필요한 `#[ignore]` 테스트와 실제 CUDA·ROCm 실행은 CI에 없습니다. 단계별 로그는 잡마다 `test-logs-<잡>` 아티팩트로 남습니다.
+커밋 메시지에 `[targets: mac-metal-arm,windows-cpu]` 한 줄을 넣으면 그 잡만 돌고, Actions 탭의 수동 실행도 같은 목록을 받습니다. 실제 가중치가 필요한 `#[ignore]` 테스트와 실제 CUDA·ROCm 실행은 CI에 없습니다. 단계별 로그는 잡마다 `test-logs-<잡>` 아티팩트로 남습니다.
 
 ### 앱 실행
 
