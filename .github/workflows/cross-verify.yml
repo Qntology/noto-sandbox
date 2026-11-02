@@ -94,7 +94,7 @@ jobs:
   steps-match:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: test_runner.bat and test_runner.sh list the same steps
         shell: bash
         run: |
@@ -119,7 +119,7 @@ jobs:
       # cuda: no GPU to detect the compute capability from (Ampere, the lowest the kernels build for on CUDA 13).
       CUDA_COMPUTE_CAP: "80"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: environment report (runner, before setup)
         run: bash .github/scripts/env-report.sh before-setup
       - uses: dtolnay/rust-toolchain@master
@@ -191,7 +191,7 @@ jobs:
           rc=${PIPESTATUS[0]}
           [ "$rc" = 0 ] || { bash .github/scripts/annot.sh error "check ${{ matrix.backend }}" "$RUNNER_TEMP/check.log"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: test-logs-${{ matrix.name }}

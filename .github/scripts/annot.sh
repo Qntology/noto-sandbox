@@ -15,7 +15,9 @@ case "$kind" in
         msg="$(
             {
                 grep -a -oE '\((exit (code|status)|signal)[^)]*\)' "$log" | head -3 | sed 's/^/ended with /'
-                grep -a -A3 -E '^(error|warning: build failed)|panicked at|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|FAILED|exit code|STATUS_|not found' "$log" | cut -c1-300 | head -30
+                # Every failed test keeps its panic message, however long the backtraces around it are.
+                grep -a -A1 'panicked at' "$log" | grep -a -v '^--$' | cut -c1-260 | head -16
+                grep -a -A3 -E '^(error|warning: build failed)|failed to run custom build|--- stderr|--- stdout|nvcc|fatal|^failures:|exit code|STATUS_|not found' "$log" | cut -c1-300 | head -24
                 echo '--- last lines ---'
                 tail -n 20 "$log" | cut -c1-300
             } | escape
@@ -23,7 +25,7 @@ case "$kind" in
         echo "::error title=$title::$msg"
         ;;
     lines)
-        msg="$(grep -a -E "$4" "$log" | cut -c1-400 | head -32 | escape)"
+        msg="$(grep -a -E "$4" "$log" | cut -c1-400 | head -60 | escape)"
         if [ -n "$msg" ]; then echo "::notice title=$title::$msg"; fi
         ;;
 esac

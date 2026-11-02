@@ -412,7 +412,13 @@ mod tests {
 
     #[test]
     fn the_position_filter_changes_only_grids_the_table_is_shrunk_for() {
-        let mut m = tiny_model();
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let mut m = Siglip2::from_var_builder(tiny_config(), VarBuilder::from_varmap(&vm, DType::F32, &dev), &dev, None).unwrap();
+        // `VarBuilder::get` leaves the table at zero, and both filters give zero from zero.
+        let vars = vm.data().lock().unwrap();
+        let table = &vars["vision_model.embeddings.position_embedding.weight"];
+        table.set(&Tensor::randn(0f32, 1.0, table.dims().to_vec(), &dev).unwrap()).unwrap();
         assert!(m.position_antialias(), "the reference's antialiased filter is the default");
         let wide = test_image(64, 32);
         let square = test_image(16, 16);

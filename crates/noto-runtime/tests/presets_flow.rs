@@ -12,6 +12,8 @@ fn runtime() -> Runtime {
 #[test]
 fn a_preset_from_the_ui_reaches_the_joint_dynamics_and_the_overlay() {
     let mut rt = runtime();
+    // On feet: a wheeled base is drawn as a lift truck, and its overlay marks the drive joints only.
+    rt.api_world_new(7, 64, None, Some("human_foot")).unwrap();
     for (preset, tier) in [("budget", Tier::Budget), ("pro", Tier::Pro), ("mid", Tier::Mid)] {
         rt.api_call("body_plan_set", &json!({"preset": preset})).unwrap();
         assert_eq!(rt.world().body.arm.tier, tier, "{preset}: the world was rebuilt with the plan");
