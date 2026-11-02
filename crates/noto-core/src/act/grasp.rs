@@ -458,7 +458,8 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let working = body.working_hand(inp.hand);
     let pads = HandPads::new(&working, inp.size_m, pad_surface(inp.ground), inp.seed);
     let planned = TopHands::of(&pads.closed, inp.mass_kg, mu.mean);
-    let both_needed = inp.mode == ReachMode::Front && !inp.two_arms && planned.hands != 1;
+    // One arm has no second hand to call on: it tries alone, and the grip decides.
+    let both_needed = inp.mode == ReachMode::Front && !inp.two_arms && planned.hands != 1 && body.arm_count() > 1;
     let two_asked = inp.two_arms || both_needed;
     let goal = ReachGoal::ground_object(inp.size_m[1], inp.mass_kg, two_asked, inp.cargo_kg);
     let plan = match inp.mode {
