@@ -39,7 +39,8 @@ impl MapHead {
         let w = |i: usize| self.in_w.narrow(0, i * d, d);
         let bias = |i: usize| self.in_b.narrow(0, i * d, d);
 
-        let probe = self.probe.broadcast_as((b, 1, d))?;
+        // Contiguous: from a broadcast batch Metal's matmul gets every row after the first wrong.
+        let probe = self.probe.broadcast_as((b, 1, d))?.contiguous()?;
         let q = probe
             .broadcast_matmul(&w(0)?.t()?.contiguous()?)?
             .broadcast_add(&bias(0)?)?;
@@ -86,7 +87,7 @@ impl MapHead {
         let d = self.hidden;
         let (b, n, _) = tokens.dims3()?;
         let hd = d / self.heads;
-        let probe = self.probe.broadcast_as((b, 1, d))?;
+        let probe = self.probe.broadcast_as((b, 1, d))?.contiguous()?;
         let q = probe
             .broadcast_matmul(&self.in_w.narrow(0, 0, d)?.t()?.contiguous()?)?
             .broadcast_add(&self.in_b.narrow(0, 0, d)?)?;
