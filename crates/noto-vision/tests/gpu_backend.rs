@@ -26,6 +26,17 @@ fn weights_on(vm: &VarMap, dev: &Device) -> HashMap<String, Tensor> {
     vm.data().lock().unwrap().iter().map(|(k, v)| (k.clone(), v.as_tensor().to_device(dev).unwrap())).collect()
 }
 
+/// `VarBuilder::get` leaves at zero what a checkpoint fills. Without it the SigLIP2 head reads nothing of its tokens and
+/// the TIPS blocks add nothing, and the comparison holds for constants on any device.
+fn fill_zeroed(vm: &VarMap) {
+    for var in vm.data().lock().unwrap().values() {
+        let t = var.as_tensor();
+        if t.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap() == 0.0 {
+            var.set(&Tensor::randn(0f32, 0.1, t.dims().to_vec(), &Device::Cpu).unwrap()).unwrap();
+        }
+    }
+}
+
 fn worst(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| {
@@ -68,10 +79,14 @@ fn tiny_siglip() -> Siglip2Config {
 fn siglip2_vision_dense_and_text_match_the_cpu() {
     let dev = gpu();
     let vm = VarMap::new();
-    let cpu = Siglip2::from_var_builder(tiny_siglip(), VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &Device::Cpu, None).unwrap();
+    let on_cpu = || VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+    Siglip2::from_var_builder(tiny_siglip(), on_cpu(), &Device::Cpu, None).unwrap();
+    fill_zeroed(&vm);
+    let cpu = Siglip2::from_var_builder(tiny_siglip(), on_cpu(), &Device::Cpu, None).unwrap();
     let g = Siglip2::from_var_builder(tiny_siglip(), VarBuilder::from_tensors(weights_on(&vm, &dev), DType::F32, &dev), &dev, None).unwrap();
     let images: Vec<_> = (0..3).map(|k| frame(96, 64, k).to_dynamic()).collect();
     let (a, b) = (cpu.embed_images(&images, 0).unwrap(), g.embed_images(&images, 0).unwrap());
+    assert_ne!(a[0], a[1], "the embedding reads the image");
     let e_img = a.iter().zip(&b).map(|(x, y)| worst(x, y)).fold(0.0, f32::max);
     let (da, db) = (cpu.embed_dense_batch(&images).unwrap(), g.embed_dense_batch(&images).unwrap());
     let e_dense = da.iter().zip(&db).map(|(x, y)| x.vectors.iter().zip(&y.vectors).map(|(u, v)| worst(u, v)).fold(0.0, f32::max)).fold(0.0, f32::max);
@@ -106,11 +121,15 @@ fn tiny_tips() -> TipsConfig {
 fn tips_depth_batch_matches_the_cpu() {
     let dev = gpu();
     let vm = VarMap::new();
-    let cpu = TipsDepth::from_var_builder(tiny_tips(), VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu), &Device::Cpu).unwrap();
+    let on_cpu = || VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+    TipsDepth::from_var_builder(tiny_tips(), on_cpu(), &Device::Cpu).unwrap();
+    fill_zeroed(&vm);
+    let cpu = TipsDepth::from_var_builder(tiny_tips(), on_cpu(), &Device::Cpu).unwrap();
     let g = TipsDepth::from_var_builder(tiny_tips(), VarBuilder::from_tensors(weights_on(&vm, &dev), DType::F32, &dev), &dev).unwrap();
     let frames: Vec<Rgb> = (0..3).map(|k| frame(192, 128, k)).collect();
     let refs: Vec<&Rgb> = frames.iter().collect();
     let (a, b) = (cpu.predict_batch(&refs).unwrap(), g.predict_batch(&refs).unwrap());
+    assert_ne!(a[0].data, a[1].data, "the depth reads the frame");
     let e = a.iter().zip(&b).map(|(x, y)| worst(&x.data, &y.data)).fold(0.0, f32::max);
     let one = g.predict(&frames[1]).unwrap();
     let e_row = worst(&one.data, &b[1].data);

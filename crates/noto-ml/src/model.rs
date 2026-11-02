@@ -415,10 +415,12 @@ mod tests {
         let dev = Device::Cpu;
         let vm = VarMap::new();
         let mut m = Siglip2::from_var_builder(tiny_config(), VarBuilder::from_varmap(&vm, DType::F32, &dev), &dev, None).unwrap();
-        // `VarBuilder::get` leaves the table at zero, and both filters give zero from zero.
+        // `VarBuilder::get` leaves both at zero: no table to filter, and a head that reads nothing of its tokens.
         let vars = vm.data().lock().unwrap();
-        let table = &vars["vision_model.embeddings.position_embedding.weight"];
-        table.set(&Tensor::randn(0f32, 1.0, table.dims().to_vec(), &dev).unwrap()).unwrap();
+        for name in ["embeddings.position_embedding.weight", "head.attention.in_proj_weight"] {
+            let var = &vars[&format!("vision_model.{name}")];
+            var.set(&Tensor::randn(0f32, 1.0, var.dims().to_vec(), &dev).unwrap()).unwrap();
+        }
         assert!(m.position_antialias(), "the reference's antialiased filter is the default");
         let wide = test_image(64, 32);
         let square = test_image(16, 16);
