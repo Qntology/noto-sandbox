@@ -1,3 +1,5 @@
 # Batch files need CRLF: cmd.exe mis-parses labels in LF-only files.
 *.bat text eol=crlf
 *.ps1 text eol=crlf
+# Shell scripts need LF: bash stops at a CR, and the Windows CI runners check out with autocrlf.
+*.sh text eol=lf

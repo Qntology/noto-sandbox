@@ -459,6 +459,9 @@ fn gpu_hint(state: &AppState) -> Option<String> {
     if noto_ml::device::GPU_ORDER.iter().any(|b| b.compiled()) {
         return Some("GPU 백엔드가 이 빌드에 있지만 열리지 않아 CPU에서 돕니다 (장치 칩의 설명 참고)".into());
     }
+    if cfg!(target_os = "macos") {
+        return Some("이 Mac에는 Metal GPU가 있지만 이 빌드는 CPU 전용입니다. ./dev_metal.sh(또는 ./build_metal.sh)로 실행하면 네 모델이 모두 GPU에서 돕니다".into());
+    }
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
     let nvidia = Path::new(&windir).join("System32").join("nvcuda.dll").is_file();
     nvidia.then(|| "이 PC에는 NVIDIA GPU가 있지만 이 빌드는 CPU 전용입니다. dev_cuda.bat(또는 build_cuda.bat)로 실행하면 네 모델이 모두 GPU에서 돕니다".into())

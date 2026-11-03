@@ -68,6 +68,31 @@ dev_vulkan.bat                                  # Vulkan 으로 Tauri 앱 실행
 serve_cuda.bat                                  # 개발 서버 (브라우저)
 ```
 
+macOS와 Linux에서는 `_cargo.sh`가 같은 일을 합니다. 단계 번호와 명령, 로그 형식은 `test_runner.bat`과 같습니다(`test_runner.sh`). protoc가 없으면 `tools/`에 받습니다.
+
+```bash
+./test_metal.sh                                   # 전체 단계 (macOS, Metal)
+./test_metal.sh -p noto-vision --test gpu_backend  # Metal과 CPU 결과 대조만
+./check_metal.sh                                  # Metal 빌드 확인
+./dev_metal.sh                                    # Metal 로 Tauri 앱 실행
+./build_metal.sh                                  # 앱 번들
+./serve_metal.sh                                  # 개발 서버 (브라우저)
+./_cargo.sh vulkan test                           # 다른 백엔드 (cpu, vulkan, cuda, rocm)
+```
+
+GitHub Actions(`.github/workflows/cross-verify.yml`)는 브랜치마다 푸시할 때 세 OS에서 돌아갑니다. 호스팅 러너에는 외장 GPU가 없어 실제로 돌 수 있는 것만 돌리고, 안 돈 것은 통과로 적지 않습니다.
+
+| 잡 | 범위 |
+|---|---|
+| `mac-cpu`, `linux-cpu`, `windows-cpu` | 빌드, 전체 단계, `test_runner.bat`에 없는 통합 테스트. `mac-cpu`는 Apple Silicon(`macos-14`)입니다 |
+| `mac-metal-arm`, `mac-vulkan-arm` | 빌드, 전체 단계. 7단계가 Apple Silicon 러너(`macos-15`)의 가상 GPU에서 모델을 돌려 CPU와 대조합니다 (Vulkan은 MoltenVK). 낮 시간대에는 러너가 모자라 푸시마다 돌지 않고, 하루 한 번과 이름으로 지정할 때 돕니다 |
+| `mac-metal`, `mac-vulkan` | 빌드만 (`macos-15-intel`). 이 러너의 가상 GPU는 Metal 값이 CPU와 다르고 MoltenVK가 중단됩니다. 앱은 Metal 장치를 열 때 CPU와 비교해 이런 장치를 거부하고 CPU로 돌며, `mac-metal`은 단위 테스트로 이 거부를 확인합니다 |
+| `linux-vulkan` | 빌드, 전체 단계. 7단계는 lavapipe(소프트웨어 Vulkan)에서 돕니다 |
+| `windows-vulkan` | 빌드만 (러너에 소프트웨어 Vulkan이 없습니다) |
+| `linux-cuda`, `windows-cuda`, `linux-rocm`, `windows-rocm` | `cargo check`만. CUDA는 nvcc로 커널까지 빌드합니다 |
+
+커밋 메시지에 `[targets: mac-metal-arm,windows-cpu]` 한 줄을 넣으면 그 잡만 돌고, Actions 탭의 수동 실행도 같은 목록을 받습니다. 실제 가중치가 필요한 `#[ignore]` 테스트와 실제 CUDA·ROCm 실행은 CI에 없습니다. 단계별 로그는 잡마다 `test-logs-<잡>` 아티팩트로 남습니다.
+
 ### 앱 실행
 
 ```bash
@@ -86,7 +111,7 @@ cargo tauri dev --features metal     # macOS
 
 빌드에 GPU 기능이 있으면 앱은 첫 GPU(CUDA → ROCm → Vulkan → Metal)에서 시작합니다. `NOTO_DEVICE=cpu|cuda|rocm|vulkan|metal|gpu[:번호]`로 고정할 수 있고, 왼쪽 ④ "사전 · 모델"에서 바꿀 수 있습니다. 같은 백엔드의 모델은 장치 하나를 공유하며, 배치 크기는 `NOTO_BATCH_ROWS`, CUDA·ROCm 텍스트 고정 모양은 `NOTO_FIXED_SHAPE=0|1`, SAM 인코더 배치는 `NOTO_SAM_BATCH`로 바꿉니다.
 
-Windows에서는 아래 `.bat`이 다음 설정을 대신합니다(`dev_cuda.bat`, `dev_rocm.bat`, `dev_vulkan.bat`, `dev_cpu.bat` 등). 직접 할 때는 이렇습니다. CUDA를 쓰려면 다음 두 가지가 필요합니다.
+macOS에서는 `./dev_metal.sh`가 위 명령을 대신합니다. Windows에서는 아래 `.bat`이 다음 설정을 대신합니다(`dev_cuda.bat`, `dev_rocm.bat`, `dev_vulkan.bat`, `dev_cpu.bat` 등). 직접 할 때는 이렇습니다. CUDA를 쓰려면 다음 두 가지가 필요합니다.
 
 - MSVC 호스트 컴파일러(`cl.exe`)가 PATH에 있어야 합니다. Visual Studio 개발자 셸에서 실행하거나 `vcvars64.bat`을 먼저 실행하세요.
 - CUDA 13의 CCCL 헤더는 MSVC의 표준 전처리기를 요구합니다. nvcc에 아래 플래그를 넘깁니다.
@@ -196,7 +221,7 @@ huggingface-cli download lmz/candle-sam mobile_sam-tiny-vitt.safetensors --local
 - 가중치 파일이 없으면 분류 기능은 명확한 오류 메시지를 보여 줍니다.
 - 월드의 SigLIP2 인식과 Granite TTM은 실제 가중치로 정확도를 재 본 적이 없습니다. 테스트는 가짜 임베더와 0·무작위 가중치로 연결만 확인했고, 정밀도 게이트의 임계값과 "게이트 전/후" 수치는 모의 오류 모델에서 나온 값입니다.
 - 월드는 소프트웨어 레이캐스터로 그려서 SigLIP2의 학습 분포와 많이 다릅니다. 제로샷 정확도는 가중치로 측정한 뒤에 판단해야 합니다.
-- GPU 경로는 CUDA를 RTX 3050 Laptop(4 GB, CUDA 13.3)에서, ROCm을 Radeon RX 6600(HIP 7.2)에서 실행해 CPU 결과와 대조했습니다(CUDA: SigLIP2 ≤ 2.2e-7, TIPS ≤ 3.3e-6, SAM 인코더·디코더 ≤ 7.7e-5, ROCm: SigLIP2 ≤ 2.5e-7, TIPS ≤ 8.0e-7, SAM ≤ 7.3e-5 상대 오차). Vulkan·Metal은 빌드 준비만 했고 실행 검증은 하지 않았습니다. 모델은 모든 백엔드에서 F32입니다.
+- GPU 경로는 CUDA를 RTX 3050 Laptop(4 GB, CUDA 13.3)에서, ROCm을 Radeon RX 6600(HIP 7.2)에서 실행해 CPU 결과와 대조했습니다(CUDA: SigLIP2 ≤ 2.2e-7, TIPS ≤ 3.3e-6, SAM 인코더·디코더 ≤ 7.7e-5, ROCm: SigLIP2 ≤ 2.5e-7, TIPS ≤ 8.0e-7, SAM ≤ 7.3e-5 상대 오차). 이 CUDA·ROCm 수치는 SigLIP2 풀링 헤드와 TIPS 블록이 0이던 이전 대조 테스트의 값이라, 지금 테스트로는 다시 재지 않았습니다. Metal과 Vulkan(MoltenVK)은 GitHub Actions의 Apple Silicon 가상 GPU(`macos-15`)에서 임의 가중치로 대조했습니다(Metal: SigLIP2 ≤ 5e-7, TIPS ≤ 2e-6, SAM ≤ 8e-5, MoltenVK: TIPS ≤ 2e-6, SAM ≤ 1.1e-4). 실제 가중치와 실제 Mac의 GPU로는 돌리지 않았습니다. 모델은 모든 백엔드에서 F32입니다.
 - 한국어 명령은 어휘 사전 일치가 1차 경로입니다. 사전에 없는 표현의 임베딩 보강은 SigLIP2 텍스트 타워의 한국어 품질에 달려 있습니다.
 - Tauri 창에서 직접 돌려 보지는 않았습니다. UI는 개발용 서버 위에서 브라우저로 확인했습니다. 로그 시각은 UTC입니다.
 - TIPSv2 DPT 이식은 실제 체크포인트 헤더의 텐서 이름·형상(227개)을 전부 대조했지만, 가중치로 PyTorch와 수치를 비교하지는 않았습니다. SigLIP2 패치 히트맵(MAP 헤드 value 경로)이 NaFlex 체크포인트에서 잘 되는지도 가중치로 확인해야 합니다.
