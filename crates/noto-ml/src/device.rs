@@ -97,7 +97,7 @@ impl Backend {
             Backend::Metal => {
                 #[cfg(feature = "metal")]
                 {
-                    return Ok(Device::new_metal(ordinal)?);
+                    return open_metal(ordinal);
                 }
                 #[cfg(not(feature = "metal"))]
                 {
@@ -131,6 +131,38 @@ impl Backend {
             }
         }
     }
+}
+
+/// The Metal kernels assume an Apple GPU. Elsewhere (the Intel runner's paravirtual device) the device opens, copies
+/// and means work, and a matmul or a softmax gives other numbers without an error.
+#[cfg(feature = "metal")]
+fn metal_kernels_hold(device: &Device) -> Result<bool> {
+    use candle_core::Tensor;
+    use candle_nn::ops::softmax_last_dim;
+
+    const N: usize = 32;
+    const TOL: f32 = 1e-3;
+    let values = |seed: usize| (0..N * N).map(|i| ((i * 31 + seed) % 97) as f32 / 24.0 - 2.0).collect::<Vec<f32>>();
+    let (a, b) = (Tensor::from_vec(values(1), (N, N), &Device::Cpu)?, Tensor::from_vec(values(5), (N, N), &Device::Cpu)?);
+    let (x, y) = (a.to_device(device)?, b.to_device(device)?);
+    let same = |on: Tensor, cpu: Tensor| -> Result<bool> {
+        let (on, cpu): (Vec<f32>, Vec<f32>) = (on.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?, cpu.flatten_all()?.to_vec1()?);
+        Ok(on.iter().zip(&cpu).all(|(p, q)| (p - q).abs() <= TOL * p.abs().max(q.abs()).max(1.0)))
+    };
+    Ok(same(x.matmul(&y)?, a.matmul(&b)?)? && same(softmax_last_dim(&x)?, softmax_last_dim(&a)?)?)
+}
+
+#[cfg(feature = "metal")]
+fn open_metal(ordinal: usize) -> Result<Device> {
+    // The fork panics where there is no device instead of returning the error.
+    let Ok(device) = std::panic::catch_unwind(|| Device::new_metal(ordinal)) else {
+        bail!("no Metal device");
+    };
+    let device = device?;
+    if !metal_kernels_hold(&device)? {
+        bail!("this Metal device gives other numbers than the CPU (the kernels assume an Apple GPU)");
+    }
+    Ok(device)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,6 +387,18 @@ mod tests {
         if !Backend::Rocm.compiled() {
             let err = Backend::Rocm.open(0).unwrap_err().to_string();
             assert!(err.contains("rocm"));
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn a_metal_device_opens_only_if_it_gives_the_cpus_numbers() {
+        match Backend::Metal.open(0) {
+            Ok(d) => {
+                assert!(metal_kernels_hold(&d).unwrap());
+                println!("[GPU] Metal opened: {}", device_label(&d));
+            }
+            Err(e) => println!("[GPU] Metal refused: {e}"),
         }
     }
 

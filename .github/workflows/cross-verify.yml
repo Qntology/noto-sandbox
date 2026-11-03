@@ -4,7 +4,8 @@
 # GitHub-hosted runners have no discrete GPU. So only what can really run is run:
 #   mac-metal-arm, mac-vulkan-arm (macos-15): the paravirtual Apple GPU runs the models for real, Vulkan through MoltenVK
 #                    (step 07 compares them with the CPU; a job that opens no device fails, it never skips)
-#   mac-metal, mac-vulkan (macos-15-intel): build only. That GPU opens, but Metal gives other numbers and MoltenVK aborts
+#   mac-metal, mac-vulkan (macos-15-intel): build only. That GPU opens, but Metal gives other numbers and MoltenVK aborts;
+#                    mac-metal also runs the unit tests (step 02), where noto_ml refuses that device
 #   mac-cpu (macos-14) : Apple Silicon, no Metal device on that image
 #   cpu            : every step, then the integration tests test_runner.bat does not list
 #   vulkan (Linux) : lavapipe (software Vulkan, a CPU device): every step, step 07 on that device
@@ -77,7 +78,7 @@ jobs:
           inc = [
             dict(name="mac-cpu", os="macos-14", kind="run", backend="cpu"),
             # The Intel runner's paravirtual GPU opens, but Metal gives other numbers than the CPU and MoltenVK aborts.
-            dict(name="mac-metal", os="macos-15-intel", kind="build", backend="metal"),
+            dict(name="mac-metal", os="macos-15-intel", kind="build", backend="metal", only="02"),
             dict(name="mac-vulkan", os="macos-15-intel", kind="build", backend="vulkan"),
             dict(name="linux-cpu", os="ubuntu-latest", kind="run", backend="cpu"),
             dict(name="linux-vulkan", os="ubuntu-latest", kind="run", backend="vulkan"),
@@ -194,7 +195,7 @@ jobs:
         if: matrix.kind != 'check'
         timeout-minutes: 210
         env:
-          ONLY: ${{ matrix.kind == 'build' && '01' || '' }}
+          ONLY: ${{ matrix.only || (matrix.kind == 'build' && '01' || '') }}
           REST: ${{ matrix.backend == 'cpu' && '1' || '' }}
         run: bash _cargo.sh "${{ matrix.backend }}" test
 
@@ -222,7 +223,7 @@ jobs:
         run: |
           case "${{ matrix.kind }}" in
             run)   msg="every step of test_runner.sh on ${{ matrix.backend }}. NOT RUN here: #[ignore] tests with real weights, real CUDA / ROCm / Windows-GPU execution" ;;
-            build) msg="build only (step 01). NOT RUN: tests (no GPU driver on this runner that gives the CPU's numbers)" ;;
+            build) msg="build (step 01)${{ matrix.only && format(' and step {0}', matrix.only) || ' only' }}. NOT RUN: the models on a GPU (no GPU driver on this runner that gives the CPU's numbers)" ;;
             check) msg="type check only (cargo check). NOT RUN: linking, any test, any kernel on a GPU (no GPU / SDK to link or run)" ;;
           esac
           echo "::notice title=scope ${{ matrix.name }}::$msg"
