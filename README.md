@@ -221,7 +221,7 @@ huggingface-cli download lmz/candle-sam mobile_sam-tiny-vitt.safetensors --local
 - 가중치 파일이 없으면 분류 기능은 명확한 오류 메시지를 보여 줍니다.
 - 월드의 SigLIP2 인식과 Granite TTM은 실제 가중치로 정확도를 재 본 적이 없습니다. 테스트는 가짜 임베더와 0·무작위 가중치로 연결만 확인했고, 정밀도 게이트의 임계값과 "게이트 전/후" 수치는 모의 오류 모델에서 나온 값입니다.
 - 월드는 소프트웨어 레이캐스터로 그려서 SigLIP2의 학습 분포와 많이 다릅니다. 제로샷 정확도는 가중치로 측정한 뒤에 판단해야 합니다.
-- GPU 경로는 CUDA를 RTX 3050 Laptop(4 GB, CUDA 13.3)에서, ROCm을 Radeon RX 6600(HIP 7.2)에서 실행해 CPU 결과와 대조했습니다(CUDA: SigLIP2 ≤ 2.2e-7, TIPS ≤ 3.3e-6, SAM 인코더·디코더 ≤ 7.7e-5, ROCm: SigLIP2 ≤ 2.5e-7, TIPS ≤ 8.0e-7, SAM ≤ 7.3e-5 상대 오차). Vulkan·Metal은 빌드 준비만 했고 실행 검증은 하지 않았습니다. 모델은 모든 백엔드에서 F32입니다.
+- GPU 경로는 CUDA를 RTX 3050 Laptop(4 GB, CUDA 13.3)에서, ROCm을 Radeon RX 6600(HIP 7.2)에서 실행해 CPU 결과와 대조했습니다(CUDA: SigLIP2 ≤ 2.2e-7, TIPS ≤ 3.3e-6, SAM 인코더·디코더 ≤ 7.7e-5, ROCm: SigLIP2 ≤ 2.5e-7, TIPS ≤ 8.0e-7, SAM ≤ 7.3e-5 상대 오차). 이 CUDA·ROCm 수치는 SigLIP2 풀링 헤드와 TIPS 블록이 0이던 이전 대조 테스트의 값이라, 지금 테스트로는 다시 재지 않았습니다. Metal과 Vulkan(MoltenVK)은 GitHub Actions의 Apple Silicon 가상 GPU(`macos-15`)에서 임의 가중치로 대조했습니다(Metal: SigLIP2 ≤ 5e-7, TIPS ≤ 2e-6, SAM ≤ 8e-5, MoltenVK: TIPS ≤ 2e-6, SAM ≤ 1.1e-4). 실제 가중치와 실제 Mac의 GPU로는 돌리지 않았습니다. 모델은 모든 백엔드에서 F32입니다.
 - 한국어 명령은 어휘 사전 일치가 1차 경로입니다. 사전에 없는 표현의 임베딩 보강은 SigLIP2 텍스트 타워의 한국어 품질에 달려 있습니다.
 - Tauri 창에서 직접 돌려 보지는 않았습니다. UI는 개발용 서버 위에서 브라우저로 확인했습니다. 로그 시각은 UTC입니다.
 - TIPSv2 DPT 이식은 실제 체크포인트 헤더의 텐서 이름·형상(227개)을 전부 대조했지만, 가중치로 PyTorch와 수치를 비교하지는 않았습니다. SigLIP2 패치 히트맵(MAP 헤드 value 경로)이 NaFlex 체크포인트에서 잘 되는지도 가중치로 확인해야 합니다.
