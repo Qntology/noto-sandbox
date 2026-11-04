@@ -863,7 +863,11 @@ function pickStep(q, rt, needsCoCarry = false, coPhase = 1) {
       if (p.t === 1) {
         const seen = visibleObjects(6).find((o) => o.id === drop.id && o.in_pitch && o.forward > 0.15);
         const range = dist2(a.pos, drop.pos);
-        p.check = seen ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)) } : { ok: false, reason: '숙인 화면 안에 대상이 없음' };
+        // 모의: 깊이로 읽은 물건 자세 (Rust `noto_vision::item_pose` 의 칸들). 원목은 막대, 나머지는 덩어리.
+        const log = rt.it.node === 'tree';
+        const item = { yaw_deg: 0, rel_yaw_deg: Number(((W.rng() - 0.5) * 60).toFixed(1)), length_m: log ? 0.52 : 0.15, width_m: log ? 0.17 : 0.14, height_m: log ? 0.14 : 0.1, top_tilt_deg: 1.2, elongation: log ? 0.65 : 0.1, form: log ? 'bar' : 'block', points: 600 };
+        const stereo = (W.cameras ?? 1) === 2;
+        p.check = seen ? { ok: true, label_ko: rt.it.ko, score: Number((0.86 + W.rng() * 0.1).toFixed(2)), range_m: Number(range.toFixed(2)), depth_m: Number((range * (1 + (W.rng() - 0.5) * 0.04)).toFixed(2)), depth_source: stereo ? 'sgbm' : 'tipsv2+ground', depth_sigma_m: stereo ? 0.006 : 0.04, depth_valid: stereo ? 0.74 : null, item } : { ok: false, reason: '숙인 화면 안에 대상이 없음' };
         log('vision', p.check.ok ? 'info' : 'warn', p.check.ok ? `[로봇 ${coPhase}] 비전 확인 ✓ ${rt.it.ko} ${p.check.range_m} m (깊이 ${p.check.depth_m} m)` : `[로봇 ${coPhase}] 비전 확인 실패: ${p.check.reason}`, { robot_index: coPhase, check: p.check });
       }
       if (p.t >= 2) Object.assign(p, p.check?.ok ? { stage: 'bend', t: 0 } : { stage: 'approach', t: 0, check: null });
@@ -986,6 +990,10 @@ export function procedureView() {
   const phaseLabel = teamCoop ? ` [로봇 ${rt.coPhase ?? 1}/2]` : '';
   return {
     act: 'pick',
+    mechanism: 'hand',
+    cameras: W.cameras ?? 1,
+    depth_procedure: (W.cameras ?? 1) === 2 ? 'sgbm' : 'tipsv2',
+    camera: 'head',
     target: p.drop.id,
     label_ko: `${rt.it.ko}${phaseLabel}`,
     stage: shown,

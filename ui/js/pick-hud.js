@@ -4,7 +4,10 @@
 // world_frame 의 procedure(Rust 런타임 또는 모의 월드)를 그대로 그리며, 1인칭(머리·탑승자) 화면의 비전 확인에는
 // 대상에 조준점을 겹친다. 지게차 절차에서는 포크 카메라 화면을 작게 함께 보이고, 가려지면 그렇게 표시한다.
 // 탑뷰에서는 같은 절차를 unit_frame 의 procedure 로 받아 로봇 위 CCTV 말풍선에 줄여 그린다(renderProcedureBrief).
+// 다리 몸(카메라 2대)은 지게차의 포크 카메라 자리에 머리 카메라의 SGBM 깊이를 띄우고(응시 → 쥐기), 응시 확인이 그 깊이로
+// 읽은 물건의 놓인 각도·크기를 적으며, 자세를 낮추고 쥐고 드는 동안 팔 관절과 손가락 패드 접촉을 함께 그린다.
 import { $, clear, el, fmt } from './util.js';
+import { drawFocus } from './focus-view.js';
 
 const STATE_KO = { done: '완료', active: '진행', pending: '대기', failed: '실패' };
 
@@ -123,6 +126,42 @@ export function wantsForkCam(p) {
   return !!p && p.act != null && p.mechanism === 'fork' && p.act !== 'set_down';
 }
 
+/** 다리 몸(스테레오 눈)의 줍기에서 머리 카메라 SGBM 깊이 화면을 보일지: 응시부터 쥘 때까지. */
+export function wantsEyeDepth(p) {
+  return !!p && p.act != null && p.mechanism === 'hand' && p.depth_procedure === 'sgbm' && ['look', 'check', 'bend', 'grip'].includes(p.stage);
+}
+
+/** 팔·손가락 화면: 자세를 낮추고 쥐고 드는 동안 (런타임이 그때 world_frame 에 focus 를 싣는다). */
+function wantsHandViews(p, focus) {
+  return !!p && !!focus && p.mechanism === 'hand' && ['bend', 'grip', 'lift'].includes(p.stage);
+}
+
+const FORM_KO = { bar: '막대형 (원목처럼 긴 것)', block: '덩어리형' };
+
+/** 응시 확인이 깊이로 읽은 물건: 몸 기준 놓인 각도, 길이·폭·높이, 윗면 기울기. */
+function itemLine(item) {
+  if (!item) return '';
+  const yaw = item.elongation >= 0.25 ? `놓인 각도 ${item.rel_yaw_deg >= 0 ? '+' : ''}${fmt.n(item.rel_yaw_deg, 0)}° (몸 기준)` : '놓인 각도 — (거의 정사각)';
+  return `${yaw} · ${fmt.n(item.length_m, 2)} × ${fmt.n(item.width_m, 2)} × 높이 ${fmt.n(item.height_m, 2)} m · 윗면 ${fmt.n(item.top_tilt_deg, 0)}° · ${FORM_KO[item.form] ?? item.form}`;
+}
+
+/** 깊이 화면 위의 겹침: 대상 상자, 그 안의 SGBM 유효 몫과 깊이. */
+export function drawEyeDepthOverlay(canvas, o) {
+  const ctx = canvas.getContext('2d');
+  const box = o?.box;
+  if (box && box.length === 4) {
+    const [x0, y0, x1, y1] = box;
+    ctx.strokeStyle = (o.box_valid ?? 0) >= 0.05 ? '#3ad29f' : '#ff6b6b';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0 * canvas.width, y0 * canvas.height, (x1 - x0) * canvas.width, (y1 - y0) * canvas.height);
+  }
+  const cap = $('ph-eyedepth-box')?.querySelector('figcaption');
+  if (cap && o) {
+    const inBox = o.box_depth_m != null ? ` · 대상 ${fmt.n(o.box_depth_m, 2)} m (유효 ${fmt.n((o.box_valid ?? 0) * 100, 0)}%)` : '';
+    cap.textContent = `SGBM 깊이 · 매칭 ${fmt.n((o.valid ?? 0) * 100, 0)}%${inBox}`;
+  }
+}
+
 /** 1인칭(머리·탑승자) 화면에 겹칠 비전 확인: 사람은 응시·확인 동안의 확인, 지게차는 탑승자가 숙여 본 확인(재확인 우선). */
 function headCheck(p) {
   if (p.mechanism !== 'fork') return ['look', 'check'].includes(p.stage) ? p.check : null;
@@ -163,13 +202,33 @@ export function renderProcedureBrief(box, p) {
   return true;
 }
 
-/** world_frame 응답의 procedure 를 HUD 로 그린다(1인칭 시점). 없으면 숨긴다. */
-export function renderPickHud(p) {
+/** world_frame 응답의 procedure 를 HUD 로 그린다(1인칭 시점). 없으면 숨긴다. focus 는 그 응답의 FocusFrame. */
+export function renderPickHud(p, focus = null) {
   const hud = $('pick-hud');
   if (!hud) return;
   const show = !!p && p.act != null;
   hud.hidden = !show;
   reticle(show ? headCheck(p) : null);
+  const eye = show && wantsEyeDepth(p);
+  const hands = show && wantsHandViews(p, focus);
+  const views = $('ph-views');
+  hud.classList.toggle('wide', hands);
+  if (views) {
+    views.hidden = !(eye || hands);
+    $('ph-eyedepth-box').hidden = !eye;
+    $('ph-arm-box').hidden = !hands || !(focus.arms ?? []).length;
+    $('ph-fingers-box').hidden = !hands;
+    if (hands) {
+      if ((focus.arms ?? []).length) drawFocus($('ph-arm'), focus, 'arm', { compact: false });
+      drawFocus($('ph-fingers'), focus, 'hand', { compact: false });
+    }
+  }
+  const itemBox = $('ph-item');
+  if (itemBox) {
+    const line = show && p.mechanism === 'hand' ? itemLine(p.check?.item) : '';
+    itemBox.hidden = !line;
+    itemBox.textContent = line ? `깊이로 읽은 물건 · ${line}` : '';
+  }
   const cam = $('ph-forkcam-box');
   if (cam) {
     cam.hidden = !wantsForkCam(p);

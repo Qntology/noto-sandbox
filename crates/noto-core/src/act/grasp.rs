@@ -5,7 +5,7 @@ use crate::contact::{self, FingerContact, FingerContacts, PadSurface};
 use crate::hand::Hand;
 use crate::kin::{self, KinLoads, KinPose};
 use crate::math::Vec3;
-use crate::sim::{grasp as close_hand, top_grasp, ContactSource, GraspSetup, Payload, TopGrasp};
+use crate::sim::{grasp as close_hand, top_grasp_shaped, ContactSource, GraspSetup, Payload, ShapeKind, TopGrasp};
 use crate::surface::Surface;
 
 use super::material::{self, ItemMaterial};
@@ -53,20 +53,21 @@ pub struct HandCapacity {
 }
 
 pub fn top_grasp_ok(hand: &Hand, size_m: [f32; 3], mass_kg: f32, mu_est: f32) -> (f32, bool) {
-    let closed = top_grasp(hand, size_m);
+    top_grasp_ok_shaped(hand, size_m, ShapeKind::Box, mass_kg, mu_est)
+}
+
+pub fn top_grasp_ok_shaped(hand: &Hand, size_m: [f32; 3], shape: ShapeKind, mass_kg: f32, mu_est: f32) -> (f32, bool) {
+    let closed = top_grasp_shaped(hand, size_m, shape);
     (closed.squeeze_max_n(), closed.touching >= 2 && top_hold_n(&closed, mu_est) >= GRIP_SAFETY * mass_kg * G)
 }
 
+/// What one hand holds up: the friction of everything the fingers press on the far face (`SQUEEZE_SURFACES`), and the
+/// hook of each phalanx that has gone round under the item — its own force times how much its normal faces down.
+/// (v1.0 took the strongest contact's normal for the whole finger; with one contact a finger it is the same.)
 pub fn top_hold_n(closed: &TopGrasp, mu: f32) -> f32 {
-    closed
-        .finger_max_n
-        .iter()
-        .enumerate()
-        .map(|(fi, &fmax)| {
-            let edge = closed.contacts.iter().filter(|c| c.finger == fi).max_by(|a, b| a.max_n.total_cmp(&b.max_n)).map_or(0.0, |c| c.normal.y.max(0.0));
-            fmax.max(0.0) * (SQUEEZE_SURFACES * mu.max(0.0) + edge)
-        })
-        .sum()
+    let squeeze: f32 = closed.finger_max_n.iter().map(|f| f.max(0.0)).sum();
+    let hook: f32 = closed.contacts.iter().map(|c| c.max_n.max(0.0) * c.normal.y.max(0.0)).sum();
+    squeeze * SQUEEZE_SURFACES * mu.max(0.0) + hook
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -107,7 +108,12 @@ impl TopHands {
 }
 
 pub fn top_hands(hand: &Hand, size_m: [f32; 3], mass_kg: f32, mu_est: f32) -> TopHands {
-    TopHands::of(&top_grasp(hand, size_m), mass_kg, mu_est)
+    top_hands_shaped(hand, size_m, ShapeKind::Box, mass_kg, mu_est)
+}
+
+/// `top_hands` for an item of the given shape — what `grasp` itself plans with (`ItemMaterial::shape`).
+pub fn top_hands_shaped(hand: &Hand, size_m: [f32; 3], shape: ShapeKind, mass_kg: f32, mu_est: f32) -> TopHands {
+    TopHands::of(&top_grasp_shaped(hand, size_m, shape), mass_kg, mu_est)
 }
 
 pub fn capacity(hand: &Hand, size_m: [f32; 3], mass_kg: f32, mu_est: f32) -> HandCapacity {
@@ -177,23 +183,36 @@ pub struct PadState {
 
 impl HandPads {
     pub fn new(hand: &Hand, size_m: [f32; 3], surface: PadSurface, seed: u64) -> HandPads {
-        let closed = top_grasp(hand, size_m);
+        HandPads::shaped(hand, size_m, ShapeKind::Box, surface, seed)
+    }
+
+    /// The pads of a hand closed on an item of this shape: every phalanx that presses is a pad of its own, with its
+    /// share of the squeeze (`max_n` over the hand's total, so the shares add up to the whole grip). The friction
+    /// spread is drawn per finger, so the phalanges of one finger share it and a seed draws what it drew before.
+    /// Past `MAX_ACTIVE_PADS` the weakest go and the rest share the grip.
+    pub fn shaped(hand: &Hand, size_m: [f32; 3], shape: ShapeKind, surface: PadSurface, seed: u64) -> HandPads {
+        let closed = top_grasp_shaped(hand, size_m, shape);
         let mut d = Draw::new(seed ^ FINGER_MU_STREAM);
         let scales: Vec<f32> = (0..hand.fingers.len()).map(|_| d.lognormal(1.0, contact::FINGER_MU_COV)).collect();
-        let total = closed.squeeze_max_n().max(1e-6);
-        let mut fingers = Vec::new();
-        for (fi, &fmax) in closed.finger_max_n.iter().enumerate() {
-            if fmax <= 1e-6 {
-                continue;
-            }
-            if let Some(c) = closed.contacts.iter().filter(|c| c.finger == fi).max_by(|a, b| a.max_n.total_cmp(&b.max_n)) {
-                fingers.push(PadFinger { finger: fi, phalanx: c.phalanx, point: c.point, normal: c.normal, share: fmax / total, mu_scale: scales[fi] });
-            }
+        let mut pressing: Vec<&crate::sim::PhalanxContact> = closed.contacts.iter().filter(|c| c.max_n > 1e-6).collect();
+        if pressing.len() > contact::MAX_ACTIVE_PADS {
+            pressing.sort_by(|a, b| b.max_n.total_cmp(&a.max_n));
+            pressing.truncate(contact::MAX_ACTIVE_PADS);
+            pressing.sort_by_key(|c| (c.finger, c.phalanx));
         }
+        let total = pressing.iter().map(|c| c.max_n).sum::<f32>().max(1e-6);
+        let fingers = pressing.iter().map(|c| PadFinger { finger: c.finger, phalanx: c.phalanx, point: c.point, normal: c.normal, share: c.max_n / total, mu_scale: scales[c.finger] }).collect();
         HandPads { closed, fingers, surface }
     }
 
+    /// Fingers that press (a finger may press with more than one phalanx: `pads`).
     pub fn touching(&self) -> usize {
+        let mut seen: Vec<usize> = self.fingers.iter().map(|f| f.finger).collect();
+        seen.dedup();
+        seen.len()
+    }
+
+    pub fn pads(&self) -> usize {
         self.fingers.len()
     }
 
@@ -230,14 +249,16 @@ impl HandPads {
                 state: p.state,
                 radius_m: p.radius_m,
                 slip_dir: p.slip_dir,
+                indentation_m: material::pad_indentation_m(p.n),
+                peak_kpa: material::pad_peak_kpa(p.n),
             });
         }
         PadState { capacity_n: shared.capacity_n + support_n, support_n, torsion_cap_nm, mu_mean, finger_stick_min, shared, contacts }
     }
 }
 
-fn mu_seen(st: &PadState, fingers: usize) -> f32 {
-    st.shared.pads[..fingers.min(st.shared.pads.len())].iter().filter(|p| p.n > 1e-6 && p.ft > 1e-6).map(|p| contact::mu_from_stick(p.ft, p.n, p.stick).min(p.mu.max(p.ft / p.n))).fold(f32::INFINITY, f32::min)
+fn mu_seen(st: &PadState) -> f32 {
+    st.shared.pads.iter().filter(|p| p.n > 1e-6 && p.ft > 1e-6).map(|p| contact::mu_from_stick(p.ft, p.n, p.stick).min(p.mu.max(p.ft / p.n))).fold(f32::INFINITY, f32::min)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -456,7 +477,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let half = [0.5 * inp.size_m[0], 0.5 * inp.size_m[2]];
     let mu = material::pad_on(inp.material);
     let working = body.working_hand(inp.hand);
-    let pads = HandPads::new(&working, inp.size_m, pad_surface(inp.ground), inp.seed);
+    let pads = HandPads::shaped(&working, inp.size_m, inp.material.shape(), pad_surface(inp.ground), inp.seed);
     let planned = TopHands::of(&pads.closed, inp.mass_kg, mu.mean);
     // One arm has no second hand to call on: it tries alone, and the grip decides.
     let both_needed = inp.mode == ReachMode::Front && !inp.two_arms && planned.hands != 1 && body.arm_count() > 1;
@@ -578,6 +599,8 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     metrics.push(("squeeze_cap_n", squeeze_max));
     metrics.push(("squeeze_plan_n", cap.squeeze_n));
     metrics.push(("touching", touching as f32));
+    metrics.push(("pads", pads.pads() as f32));
+    metrics.push(("hook_cap_n", pads.closed.contacts.iter().map(|c| c.max_n * c.normal.y.max(0.0)).sum()));
     if missed {
         let why = if touching < 2 {
             format!("손가락이 {:.2} m 물체를 감싸지 못함 (접촉 {}개)", inp.size_m[0], touching)
@@ -622,7 +645,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
         if load > 1e-6 {
             stick_min = stick_min.min(st.finger_stick_min);
             if st.finger_stick_min < contact::STICK_ALARM && !st.shared.gross_slip {
-                let seen = mu_seen(&st, touching);
+                let seen = mu_seen(&st);
                 if ctl.incipient(t, seen) {
                     incipients += 1;
                     seen_mu = Some(seen);
@@ -639,7 +662,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
             mu_est: ctl.mu_est,
             slip_ratio: if load > 1e-6 { st.capacity_n / load } else { 99.0 },
             twist_margin_nm: st.torsion_cap_nm - need,
-            contacts: touching as u8,
+            contacts: st.contacts.n,
             closure,
             detail: Some(st.contacts),
         };
@@ -828,7 +851,7 @@ pub fn grasp(inp: &GraspInput) -> ActRollout {
     let r_bay = kin::solve_fast(body, &bay, &KinLoads::holding(inp.mass_kg, two_arms, 0.0));
     let t_stow = reach::move_time(&r_hold, &r_bay).max(lift_travel_s(body, &hold, &bay));
     let n = (t_stow / SAMPLE_S).ceil().max(1.0) as usize;
-    let grip_stow = held_grip(&pads, &ctl, mu_act, grip_hold, weight, touching);
+    let grip_stow = held_grip(&pads, &ctl, mu_act, grip_hold, weight);
     for i in 1..=n {
         let u = min_jerk(i as f32 / n as f32);
         let pose = KinPose::lerp(&hold, &bay, u);
@@ -885,9 +908,9 @@ fn rise_time(pts: &[(f32, f32)], level: f32) -> Option<f32> {
     })
 }
 
-fn held_grip(pads: &HandPads, ctl: &GripCtl, mu_obj: f32, grip_n: f32, load_n: f32, touching: usize) -> Grip {
+fn held_grip(pads: &HandPads, ctl: &GripCtl, mu_obj: f32, grip_n: f32, load_n: f32) -> Grip {
     let st = pads.state(mu_obj, grip_n, load_n, 0.0);
-    Grip { grip_n, load_n, mu: st.mu_mean, mu_est: ctl.mu_est, slip_ratio: if load_n > 1e-6 { st.capacity_n / load_n } else { 99.0 }, twist_margin_nm: st.torsion_cap_nm, contacts: touching as u8, closure: pads.closed.mean_closure(), detail: Some(st.contacts) }
+    Grip { grip_n, load_n, mu: st.mu_mean, mu_est: ctl.mu_est, slip_ratio: if load_n > 1e-6 { st.capacity_n / load_n } else { 99.0 }, twist_margin_nm: st.torsion_cap_nm, contacts: st.contacts.n, closure: pads.closed.mean_closure(), detail: Some(st.contacts) }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -917,7 +940,7 @@ pub fn release(inp: &ReleaseInput) -> ActRollout {
 }
 
 pub fn release_by(inp: &ReleaseInput, hand: &Hand) -> ActRollout {
-    release_closed(inp, top_grasp(hand, inp.size_m).mean_closure())
+    release_closed(inp, top_grasp_shaped(hand, inp.size_m, inp.material.shape()).mean_closure())
 }
 
 fn release_closed(inp: &ReleaseInput, closed: f32) -> ActRollout {
@@ -1029,7 +1052,7 @@ mod tests {
     }
 
     fn log_input<'a>(b: &'a Body, h: &'a Hand, seed: u64) -> GraspInput<'a> {
-        let (_, one) = top_grasp_ok(h, [0.15; 3], 2.4, material::pad_on(ItemMaterial::Wood).mean);
+        let (_, one) = top_grasp_ok_shaped(h, [0.15; 3], ItemMaterial::Wood.shape(), 2.4, material::pad_on(ItemMaterial::Wood).mean);
         GraspInput { two_arms: !one, ..input(b, h, seed, 0.0) }
     }
 
@@ -1136,7 +1159,7 @@ mod tests {
         assert!(r.metric("gf_lf_corr").unwrap() > 0.8, "{:?}", r.metric("gf_lf_corr"));
         let pads = HandPads::new(&h, [0.10; 3], PadSurface::Dry, 1);
         let st = pads.state(0.6, 20.0, 8.0, 0.0);
-        assert_eq!(st.shared.pads.len(), pads.touching());
+        assert_eq!(st.shared.pads.len(), pads.pads());
         let held: f32 = st.shared.pads.iter().map(|p| p.ft).sum();
         assert!((held - 8.0).abs() < 1e-3 && !st.shared.gross_slip, "{held}");
         assert!(st.capacity_n > 8.0 && st.capacity_n < 0.6 * 20.0 * 1.3, "{}", st.capacity_n);
@@ -1146,7 +1169,7 @@ mod tests {
         let wet = HandPads::new(&h, [0.10; 3], PadSurface::Wet, 1);
         let st = wet.state(0.35, before, 10.0, 0.0);
         assert!(st.finger_stick_min < contact::STICK_ALARM && !st.shared.gross_slip, "{:?}", st.finger_stick_min);
-        let seen = mu_seen(&st, wet.touching());
+        let seen = mu_seen(&st);
         assert!(seen < 0.6 && ctl.incipient(0.0, seen));
         let after = ctl.grip(1.0, 10.0, 1.0);
         assert!(after > before * 1.2, "{before} → {after}");
@@ -1195,7 +1218,7 @@ mod tests {
         let a = inp(&legs);
         let b = inp(&wheels);
         let (_, hand) = setup(BaseKind::HumanFoot, FingerCount::Five);
-        let held = top_grasp(&hand, [0.1; 3]).mean_closure();
+        let held = top_grasp_shaped(&hand, [0.1; 3], ItemMaterial::Stone.shape()).mean_closure();
         assert!(held < 0.95 && a.samples.iter().filter(|s| s.phase == "lower").all(|s| (s.pose.closure - held).abs() < 1e-5), "{held}");
         assert!(a.samples.iter().all(|s| s.pose.closure <= held + 1e-5));
         assert!(a.metric("drop_height_m").unwrap() < 0.05, "{:?}", a.metric("drop_height_m"));
@@ -1243,7 +1266,7 @@ mod tests {
         for fingers in FingerCount::ALL {
             let (b, h) = setup(BaseKind::HumanFoot, fingers);
             for (mat, kg, size) in WORLD_ITEMS {
-                let th = top_hands(&h, size, kg, material::pad_on(mat).mean);
+                let th = top_hands_shaped(&h, size, mat.shape(), kg, material::pad_on(mat).mean);
                 let codes = |two: bool| (0..SEEDS).map(|seed| grasp(&GraspInput::front(&b, &h, mat, kg, size, Surface::Gravel, two, 0.0, 0.0, seed)).outcome.code).collect::<Vec<_>>();
                 let slips = |c: &[Option<&str>]| c.iter().filter(|c| **c == Some("grasp_slip")).count() as u64;
                 let what = format!("{fingers:?} {mat:?} {kg} kg: {th:?}");
@@ -1271,7 +1294,7 @@ mod tests {
                 let cap = capacity(&h, size, kg, mu);
                 let margin = mu * cap.squeeze_n / (kg * G * GRIP_SAFETY);
                 let world = if cap.contacts >= 2 && margin >= 1.0 { Some(false) } else if 2.0 * margin >= 1.0 { Some(true) } else { None };
-                let th = top_hands(&h, size, kg, mu);
+                let th = top_hands_shaped(&h, size, mat.shape(), kg, mu);
                 let ok = |two: bool| {
                     let runs: Vec<ActRollout> = (0..100u64).map(|seed| grasp(&GraspInput::front(&b, &h, mat, kg, size, Surface::Gravel, two, 0.0, 0.0, seed))).collect();
                     let other = runs.iter().filter(|r| !r.outcome.ok && r.outcome.code != Some("grasp_slip")).count();

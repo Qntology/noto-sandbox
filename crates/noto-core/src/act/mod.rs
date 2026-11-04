@@ -311,6 +311,33 @@ pub fn cruise_slip(spec: &crate::base::BaseSpec, ground: &crate::surface::Surfac
 mod tests {
     use super::*;
 
+    /// What one act sample costs in memory: its grip carries every pad's contact (`contact::MAX_ACTIVE_PADS`).
+    #[test]
+    #[ignore]
+    fn print_sample_size() {
+        #[allow(dead_code)]
+        struct FingerContactV16 {
+            finger: u8,
+            phalanx: u8,
+            point: [f32; 3],
+            normal: [f32; 3],
+            fn_n: f32,
+            ft: [f32; 3],
+            ft_n: f32,
+            torsion_nm: f32,
+            mu: f32,
+            cone_use: f32,
+            stick: f32,
+            state: crate::contact::SlipState,
+            radius_m: f32,
+            slip_dir: [f32; 2],
+        }
+        let old_contacts = 4 + 5 * std::mem::size_of::<FingerContactV16>();
+        let now_contacts = std::mem::size_of::<crate::contact::FingerContacts>();
+        let sample = std::mem::size_of::<ActSample>();
+        println!("[SIZE] FingerContact {} B (v1.6 {} B) · FingerContacts {now_contacts} B (v1.6 about {old_contacts} B) · Grip {} B · ActSample {sample} B (v1.6 about {} B)", std::mem::size_of::<crate::contact::FingerContact>(), std::mem::size_of::<FingerContactV16>(), std::mem::size_of::<Grip>(), sample - (now_contacts - old_contacts));
+    }
+
     #[test]
     fn draws_repeat_per_seed_and_have_the_asked_moments() {
         let mut a = Draw::new(7);

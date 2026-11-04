@@ -243,12 +243,19 @@ pub struct FingerContact {
     pub state: SlipState,
     pub radius_m: f32,
     pub slip_dir: [f32; 2],
+    /// How far the pad has sunk in (m, `material::pad_indentation_m`) and the pressure in the middle of its patch (kPa).
+    pub indentation_m: f32,
+    pub peak_kpa: f32,
 }
+
+/// The most pads a hand records per sample: every phalanx of four fingers and the thumb's two [추정]. `ActSample` is
+/// copied 50 times a second, so the record is a fixed array; past this the weakest pads are left out of the hold.
+pub const MAX_ACTIVE_PADS: usize = 12;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FingerContacts {
     pub n: u8,
-    pub c: [FingerContact; 5],
+    pub c: [FingerContact; MAX_ACTIVE_PADS],
 }
 
 impl FingerContacts {

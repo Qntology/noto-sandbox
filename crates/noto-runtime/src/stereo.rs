@@ -55,6 +55,9 @@ pub struct BoxDepth {
     /// The share of the box's pixels with depth.
     pub valid_frac: f32,
     pub reason: Option<String>,
+    /// Which way the item lies, its size and its top, read from the same depth over the whole box
+    /// (`noto_vision::item_pose`).
+    pub item: Option<noto_vision::ItemPose>,
 }
 
 impl BoxDepth {
@@ -105,6 +108,61 @@ pub fn in_box(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, bbox: [f32; 4], 
     let ray = intr.ray(pose.yaw, cx, cy);
     let surface = [pose.x + d * ray[0], pose.eye_m + d * ray[1], pose.z + d * ray[2]];
     (Some(d), frac, Some(crate::perception::centre_from_surface_at([pose.x, pose.eye_m, pose.z], surface, centre_m)))
+}
+
+/// The head camera's stereo depth now, as a walker's pick-up HUD shows it beside the picture the way a lift truck's
+/// shows its carriage camera: the pair rendered at `cam`'s size, SGBM on it with the looks' matcher and grid, coloured
+/// over the 5th–95th percentile of what it matched (where it matched nothing is dark). With a target — where a look put
+/// it and its piece size — the box that size makes on the picture from where the robot believes its head is
+/// (`HeadView::est`), how much of it SGBM matched, its median depth and the item's pose read from it.
+pub fn eye_depth(world: &world_sim::World, cam: &Camera, baseline_m: f32, target: Option<((f32, f32), [f32; 3])>) -> anyhow::Result<(world_sim::Frame, serde_json::Value)> {
+    let left = world.render(cam);
+    let right = world.render_right(cam, baseline_m);
+    let l = noto_vision::Rgb::new(left.width as u32, left.height as u32, left.rgb);
+    let r = noto_vision::Rgb::new(right.width as u32, right.height as u32, right.rgb);
+    let rig = StereoRig { baseline_m, ..rig_for(cam, world.body.head.sensor) };
+    let t0 = std::time::Instant::now();
+    let out = noto_vision::sgbm(&l, &r, &rig, &SgbmCfg::default(), Some(&PyramidCfg::default()))?;
+    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    let depth = out.depth;
+    let mut seen: Vec<f32> = depth.data.iter().copied().filter(|d| d.is_finite() && *d > 0.0).collect();
+    let valid = seen.len() as f32 / depth.data.len().max(1) as f32;
+    seen.sort_by(f32::total_cmp);
+    let (lo, hi) = if seen.len() > 20 { (seen[seen.len() / 20], seen[seen.len() * 19 / 20].max(seen[seen.len() / 20] + 0.1)) } else { (0.3, 3.0) };
+    let img = depth.colorize_in(lo, hi);
+    let intr = crate::record::intrinsics(world, cam);
+    let pose = crate::record::odometry(world, cam);
+    let bbox = target.and_then(|((x, z), size)| {
+        let est = world.head_view(cam).est;
+        let g = world.agent_ground_m();
+        let r = 0.5 * size[0].max(size[2]);
+        let pts: Vec<(f32, f32)> = (0..8)
+            .flat_map(|k| {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                [g, g + size[1]].map(|y| [x + r * a.cos(), y, z + r * a.sin()])
+            })
+            .filter_map(|p| cam.project_in(&est, p).map(|(u, v, _)| (u, v)))
+            .collect();
+        (pts.len() >= 8).then(|| {
+            let (w, h) = (cam.width as f32, cam.height as f32);
+            let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for &(u, v) in &pts {
+                (x0, y0, x1, y1) = (x0.min(u), y0.min(v), x1.max(u), y1.max(v));
+            }
+            [(x0 / w).clamp(0.0, 1.0), (y0 / h).clamp(0.0, 1.0), (x1 / w).clamp(0.0, 1.0), (y1 / h).clamp(0.0, 1.0)]
+        })
+    });
+    let (box_depth, box_valid) = bbox.map_or((None, None), |b| {
+        let (d, frac, _) = in_box(&depth, &intr, &pose, b, 0.0);
+        (d, Some(frac))
+    });
+    let item = bbox.and_then(|b| noto_vision::item_pose(&depth, &intr, &pose, b, 0.0));
+    let frame = world_sim::Frame { width: img.width as usize, height: img.height as usize, rgb: img.data, ids: vec![0; (img.width * img.height) as usize], depth: vec![0.0; (img.width * img.height) as usize], tick: world.tick };
+    let overlay = serde_json::json!({
+        "source": "sgbm", "valid": valid, "scale_m": [lo, hi], "ms": ms, "grid": [depth.width, depth.height],
+        "box": bbox, "box_valid": box_valid, "box_depth_m": box_depth, "item": item,
+    });
+    Ok((frame, overlay))
 }
 
 /// Whether a box has enough stereo depth to give a range: the fail-safe that keeps a look from turning a few stray

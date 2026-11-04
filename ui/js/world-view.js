@@ -6,7 +6,7 @@ import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
 import { drawJointOverlay } from './joint-view.js';
-import { renderPickHud, wantsForkCam } from './pick-hud.js';
+import { drawEyeDepthOverlay, renderPickHud, wantsEyeDepth, wantsForkCam } from './pick-hud.js';
 import { isOpen } from './overlays.js';
 
 const POLL_MS = 160;
@@ -103,6 +103,9 @@ async function drawFrame(f) {
   $('frame-info').textContent = `틱 ${f.tick} · ${f.width}×${f.height} · ${fmt.bytes(f.bytes)} · 인코딩 ${fmt.n(f.encode_ms, 1)} ms${cam}`;
   $('sb-frame').textContent = `${fmt.bytes(f.bytes)} · ${fmt.n(f.encode_ms, 1)} ms`;
   state.procedure = c ? f.procedure ?? null : null;
+  // While a walker bends, grips and lifts, the runtime puts the focus frame on the first-person frame too: the pick
+  // HUD draws its arm and its finger pads from it.
+  state.pickFocus = c ? f.focus ?? null : null;
   renderDetections();
   bus.emit('frame', state.frame);
 }
@@ -130,7 +133,7 @@ function renderDetections() {
       layer.append(box);
     }
   }
-  renderPickHud(state.procedure);
+  renderPickHud(state.procedure, state.pickFocus);
   const list = $('lg-list');
   clear(list);
   const sorted = [...dets].sort((a, b) => b.score - a.score).slice(0, 10);
@@ -161,6 +164,26 @@ async function drawForkCam(quality) {
   img.close?.();
 }
 
+// ── 다리 몸: 줍기 HUD 안의 머리 카메라 SGBM 깊이 (스테레오 눈) ────────────
+// 런타임이 그 순간의 스테레오 쌍에 SGBM 을 돌려 색 입힌 깊이와 대상 상자를 준다. 정합 한 번이 수십 ms 라
+// 프레임마다가 아니라 EYE_DEPTH_MS 마다 다시 받는다.
+const EYE_DEPTH_MS = 400;
+let eyeDepthAt = 0;
+async function drawEyeDepth(quality) {
+  if (Date.now() - eyeDepthAt < EYE_DEPTH_MS) return;
+  eyeDepthAt = Date.now();
+  const f = await call('world_frame', { width: 240, height: 160, quality, view: 'eye_depth' }, { quiet: true });
+  const img = await decode(f.webp_base64);
+  const canvas = $('ph-eyedepth');
+  if (canvas.width !== 240 || canvas.height !== 160) {
+    canvas.width = 240;
+    canvas.height = 160;
+  }
+  canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+  img.close?.();
+  drawEyeDepthOverlay(canvas, f.overlay);
+}
+
 // ── 폴링 ────────────────────────────────────────────────────────
 async function poll(force = false) {
   // 분석 모달은 월드를 덮으므로 그동안은 받지 않는다(닫으면 틱이 달라 다음 주기에 받는다).
@@ -177,6 +200,7 @@ async function poll(force = false) {
     lastKey = key;
     await drawFrame(f);
     if (view === 'agent' && wantsForkCam(state.procedure)) await drawForkCam(p.quality);
+    if (view === 'agent' && wantsEyeDepth(state.procedure)) await drawEyeDepth(p.quality).catch(() => {});
   } catch (e) {
     retryAt = Date.now() + RETRY_MS;
     $('frame-info').textContent = `프레임 오류: ${e.message}`;

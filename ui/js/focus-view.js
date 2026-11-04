@@ -8,6 +8,7 @@ export const FOCUS_PARTS = [
   { id: 'auto', ko: '자동 (행위 부위)' },
   { id: 'hand', ko: '손 모양' },
   { id: 'hand_joints', ko: '손 관절' },
+  { id: 'arm', ko: '팔 관절' },
   { id: 'foot', ko: '발 모양' },
   { id: 'foot_joints', ko: '발 관절' },
   { id: 'waist', ko: '허리' },
@@ -16,7 +17,7 @@ export const FOCUS_PARTS = [
   { id: 'track', ko: '트랙' },
 ];
 export const PART_KO = Object.fromEntries(FOCUS_PARTS.map((p) => [p.id, p.ko]));
-export const DRAWN_PARTS = ['hand', 'hand_joints', 'foot', 'foot_joints', 'waist', 'neck', 'wheel', 'track'];
+export const DRAWN_PARTS = ['hand', 'hand_joints', 'arm', 'foot', 'foot_joints', 'waist', 'neck', 'wheel', 'track'];
 
 export const EVENT_KO = {
   fork_down: '포크 내림', fork_in: '포크 넣음', fork_up: '포크 들어올림', fork_out: '포크 뺌',
@@ -51,6 +52,7 @@ export function partAvailable(f, part) {
   if (!f) return false;
   switch (part) {
     case 'foot': case 'foot_joints': return (f.foot ?? []).length > 0;
+    case 'arm': return (f.arms ?? []).length > 0;
     case 'wheel': return (f.wheel ?? []).length > 0;
     case 'track': return !!f.track;
     case 'waist': return true;
@@ -80,6 +82,7 @@ export function drawFocus(canvas, f, part, { compact = false } = {}) {
   switch (part) {
     case 'hand': return drawHand(g, f);
     case 'hand_joints': return drawHandJoints(g, f);
+    case 'arm': return drawArm(g, f);
     case 'foot': return drawFoot(g, f);
     case 'foot_joints': return drawFootJoints(g, f);
     case 'waist': return drawWaist(g, f);
@@ -145,21 +148,31 @@ function drawHand(g, f) {
   let zmin = -palmLen - 0.01, zmax = 0.02, ymin = -0.02, ymax = 0.03;
   for (const fg of h.fingers ?? []) for (const [, y, z] of fg) { zmax = Math.max(zmax, z + 0.01); ymax = Math.max(ymax, y + 0.01); ymin = Math.min(ymin, y - 0.01); }
   const obj = h.object_half;
-  if (obj) { ymax = Math.max(ymax, 0.012 + 2 * obj[1] + 0.005); zmin = Math.min(zmin, -palmLen / 2 - obj[2] - 0.005); }
+  // Where the closed hand holds it (Rust `top_grasp`: palm pad on its near face, far face just behind the knuckles).
+  const oc = h.object_center ?? (obj ? [0, 0.012 + obj[1], -palmLen / 2] : null);
+  if (obj) { ymax = Math.max(ymax, oc[1] + obj[1] + 0.005); zmin = Math.min(zmin, oc[2] - obj[2] - 0.005); }
   const top = compact ? 4 : 16;
-  const bottom = compact ? 12 : 30;
+  const bottom = compact ? 12 : 42;
   const s = Math.min((W - 8) / (zmax - zmin), (H - top - bottom) / (ymax - ymin));
   const X = (z) => 4 + (z - zmin) * s;
   const Y = (y) => top + (y - ymin) * s;
-  // 물체 (손바닥 아래, 쥔 정도로 감싸인 상자)
+  // 물체 단면: 상자 · 원통(원목) · 덩어리(모서리를 둥글린 상자) — 손가락이 실제로 닫힌 형상
   if (obj) {
     ctx.fillStyle = 'rgba(184, 146, 90, 0.35)';
     ctx.strokeStyle = css('--cv-object');
     ctx.lineWidth = 1.2;
-    const x0 = X(-palmLen / 2 - obj[2]);
-    const y0 = Y(0.012);
-    ctx.fillRect(x0, y0, 2 * obj[2] * s, 2 * obj[1] * s);
-    ctx.strokeRect(x0, y0, 2 * obj[2] * s, 2 * obj[1] * s);
+    const shape = h.object_shape ?? { kind: 'box' };
+    const [cy, cz] = [oc[1], oc[2]];
+    ctx.beginPath();
+    if (shape.kind === 'cylinder' && (shape.axis ?? 0) === 0) {
+      ctx.arc(X(cz), Y(cy), 0.5 * (obj[1] + obj[2]) * s, 0, Math.PI * 2);
+    } else {
+      const r = shape.kind === 'lump' ? Math.min(1, Math.max(0, shape.round ?? 0)) * Math.min(obj[0], obj[1], obj[2]) * s : 0;
+      const [x0, y0, w, hh] = [X(cz - obj[2]), Y(cy - obj[1]), 2 * obj[2] * s, 2 * obj[1] * s];
+      if (r > 0.5 && ctx.roundRect) ctx.roundRect(x0, y0, w, hh, r); else ctx.rect(x0, y0, w, hh);
+    }
+    ctx.fill();
+    ctx.stroke();
   }
   // 손바닥
   ctx.fillStyle = css('--cv-palm');
@@ -179,18 +192,48 @@ function drawHand(g, f) {
     ctx.fillStyle = color;
     for (const [, y, z] of pts) { ctx.beginPath(); ctx.arc(X(z), Y(y), compact ? 1.4 : 2.2, 0, Math.PI * 2); ctx.fill(); }
   });
+  // 마디 패드마다: 접촉 원(헤르츠 반경) — 안쪽 초록 원이 고착 몫, 바깥 고리가 미세 미끄럼(경고·위험),
+  // 물체를 누르는 수직항력(흰 화살표)과 패드가 받는 마찰(주황 화살표). 원뿔 사용 0.85 이상은 빨강 테.
+  const pads = h.contacts ?? [];
+  const fmax = Math.max(1, ...pads.map((c) => c.fn_n ?? 0));
+  for (const c of pads) {
+    const [, py, pz] = c.point;
+    const [, ny, nz] = c.normal;
+    const x = X(pz), y = Y(py);
+    const a = Math.max(compact ? 2 : 3.5, (c.radius_m ?? 0) * s);
+    const stick = Math.max(0, Math.min(1, c.stick ?? 0));
+    ctx.fillStyle = c.state === 'slip' ? css('--danger') : css('--warning');
+    ctx.beginPath(); ctx.arc(x, y, a, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = css('--success');
+    ctx.beginPath(); ctx.arc(x, y, a * Math.sqrt(stick), 0, Math.PI * 2); ctx.fill();
+    if ((c.cone_use ?? 0) >= 0.85) { ctx.strokeStyle = css('--danger'); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, a + 1.5, 0, Math.PI * 2); ctx.stroke(); }
+    if (!compact) {
+      const len = 6 + 22 * (c.fn_n ?? 0) / fmax;
+      arrow(ctx, x, y, x - nz * len, y - ny * len, 'rgba(250,250,250,0.85)', 1.2);
+      const ft = c.ft ?? [0, 0, 0];
+      const tl = Math.hypot(ft[1], ft[2]);
+      if (tl > 0.05) arrow(ctx, x, y, x + (ft[2] / tl) * (4 + 18 * tl / fmax), y + (ft[1] / tl) * (4 + 18 * tl / fmax), css('--warning'), 1.2);
+    }
+  }
   // 물체가 손에 거는 힘 (아래로 = 무게 + 관성)
   const fz = h.force_n?.[2] ?? 0;
   if (Math.abs(fz) > 0.5 && !compact) {
-    const cx = X(-palmLen / 2);
+    const cx = X(oc ? oc[2] : -palmLen / 2);
     const len = Math.min(H * 0.3, Math.abs(fz) * 0.6);
     arrow(ctx, cx, Y(0.012) + 2, cx, Y(0.012) + 2 + Math.sign(-fz) * len, 'rgba(250,250,250,0.7)');
   }
   const gr = h.grip;
   if (gr) {
-    const txt = compact ? `여유 ${n(gr.slip_ratio, 2)}` : `쥠 ${n(gr.grip_n, 0)} N · 하중 ${n(gr.load_n, 0)} N · 여유 ${n(gr.slip_ratio, 2)} · 접촉 ${gr.contacts}`;
-    label(g, txt, 4, H - (compact ? 3 : 16), slipColor(gr.slip_ratio));
-    if (!compact) label(g, `마찰 ${n(gr.mu, 2)} (믿음 ${n(gr.mu_est, 2)}) · 비틀림 여유 ${n(gr.twist_margin_nm, 3)} N·m`, 4, H - 4, css('--text-dim'));
+    const txt = compact ? `여유 ${n(gr.slip_ratio, 2)}` : `쥠 ${n(gr.grip_n, 0)} N · 하중 ${n(gr.load_n, 0)} N · 여유 ${n(gr.slip_ratio, 2)} · 패드 ${gr.contacts}`;
+    label(g, txt, 4, H - (compact ? 3 : 28), slipColor(gr.slip_ratio));
+    if (!compact) {
+      label(g, `마찰 ${n(gr.mu, 2)} (믿음 ${n(gr.mu_est, 2)}) · 비틀림 여유 ${n(gr.twist_margin_nm, 3)} N·m`, 4, H - 16, css('--text-dim'));
+      if (pads.length) {
+        const most = (k) => Math.max(...pads.map((c) => c[k] ?? 0));
+        const least = (k) => Math.min(...pads.map((c) => c[k] ?? 1));
+        label(g, `압입 ${n(most('indentation_m') * 1000, 1)} mm · 압력 ${n(most('peak_kpa'), 0)} kPa · 원뿔 ${n(most('cone_use') * 100, 0)}% · 고착 ${n(least('stick'), 2)}`, 4, H - 4, most('cone_use') >= 0.85 ? css('--danger') : css('--text-dim'));
+      }
+    }
   } else {
     label(g, `오므림 ${Math.round((h.closure ?? 0) * 100)}%${h.object_kg ? ` · ${n(h.object_kg, 1)} kg` : ''}`, 4, H - (compact ? 3 : 16), css('--text-dim'));
     if (!compact) label(g, `손바닥 높이 ${n(h.palm_at?.[2], 2)} m`, 4, H - 4, css('--text-dim'));
@@ -222,6 +265,61 @@ function drawHandJoints(g, f) {
     }
   });
   if (!compact) label(g, '손 관절 (막대 = 토크/최대, 숫자 = 굽힘)', 4, 11, css('--text-muted'));
+}
+
+// ── 팔 관절: 옆에서 본 어깨–팔꿈치–손목–손바닥 사슬 (x 앞 →, z 위 ↑), 관절 원 = 토크/피크 ──
+function drawArm(g, f) {
+  const { ctx, W, H, compact } = g;
+  const arms = f.arms ?? [];
+  const pts = arms.flatMap((a) => a.chain);
+  if (!pts.length) return note(ctx, W, H, '팔 없음');
+  let [x0, x1, z0, z1] = [Math.min(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[2])), Math.max(...pts.map((p) => p[2]))];
+  const obj = f.hand?.object_half;
+  if (obj) z0 = Math.min(z0, (f.hand.palm_at?.[2] ?? z0) - 2 * obj[1] - 0.03);
+  const pad = 0.06;
+  [x0, x1, z0, z1] = [x0 - pad, x1 + pad, z0 - pad, z1 + pad];
+  const top = compact ? 3 : 16;
+  const bottom = compact ? 10 : 30;
+  const s = Math.min((W - 8) / (x1 - x0), (H - top - bottom) / (z1 - z0));
+  const X = (x) => 4 + (x - x0) * s;
+  const Y = (z) => top + (z1 - z) * s;
+  // The item hangs from (or rests on) the palm, as the hand view has it.
+  if (obj && f.hand?.palm_at) {
+    const [px, , pz] = f.hand.palm_at;
+    ctx.fillStyle = 'rgba(184, 146, 90, 0.35)';
+    ctx.strokeStyle = css('--cv-object');
+    ctx.strokeRect(X(px - obj[2]), Y(pz - 0.02), 2 * obj[2] * s, 2 * obj[1] * s);
+    ctx.fillRect(X(px - obj[2]), Y(pz - 0.02), 2 * obj[2] * s, 2 * obj[1] * s);
+  }
+  ctx.lineCap = 'round';
+  // The right arm in front, the left behind it, fainter.
+  [...arms].reverse().forEach((a) => {
+    const right = a.side === 'r';
+    ctx.globalAlpha = right ? 1 : 0.4;
+    ctx.strokeStyle = css('--cv-finger');
+    ctx.lineWidth = compact ? 3 : 5;
+    ctx.beginPath();
+    a.chain.forEach((p, k) => (k ? ctx.lineTo(X(p[0]), Y(p[2])) : ctx.moveTo(X(p[0]), Y(p[2]))));
+    ctx.stroke();
+    for (const [p, j] of [[a.chain[0], a.shoulder], [a.chain[1], a.elbow]]) {
+      ctx.fillStyle = ratioColor(j.ratio);
+      ctx.beginPath(); ctx.arc(X(p[0]), Y(p[2]), compact ? 3 : 6, 0, Math.PI * 2); ctx.fill();
+      if (!compact && right) label(g, `${n(j.angle_deg, 0)}° · ${n(j.ratio * 100, 0)}%`, X(p[0]) + 8, Y(p[2]) - 4, ratioColor(j.ratio));
+    }
+    ctx.fillStyle = css('--cv-palm');
+    ctx.beginPath(); ctx.arc(X(a.chain[2][0]), Y(a.chain[2][2]), compact ? 2 : 3.5, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  const r = arms.find((a) => a.side === 'r') ?? arms[0];
+  if (!compact) {
+    label(g, '팔 관절 (원 = 토크/피크)', 4, 11, css('--text-muted'));
+    const reachColor = r.reach > 0.98 ? css('--danger') : r.reach > 0.9 ? css('--warning') : css('--text-dim');
+    const abd = r.abduction ? ` · 외전 ${n(r.abduction.angle_deg, 0)}°` : '';
+    label(g, `뻗음 ${n(r.reach * 100, 0)}% (팔 길이 대비)${abd}`, 4, H - 16, reachColor);
+    label(g, `어깨 ${n(r.shoulder.torque_nm, 1)}/${n(r.shoulder.peak_nm, 0)} N·m · 팔꿈치 ${n(r.elbow.torque_nm, 1)}/${n(r.elbow.peak_nm, 0)} N·m`, 4, H - 4, css('--text-dim'));
+  } else {
+    label(g, `뻗음 ${n(r.reach * 100, 0)}%`, 3, H - 3, css('--text-dim'));
+  }
 }
 
 // ── 발 모양: 위에서 본 두 발바닥, 압력 중심, 접지력, ZMP ──

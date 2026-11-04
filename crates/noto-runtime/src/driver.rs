@@ -1520,6 +1520,7 @@ impl Runtime {
             depth_source: boxd.as_ref().map(|b| b.source.clone()),
             depth_sigma_m: boxd.as_ref().and_then(|b| b.sigma_m),
             depth_valid: boxd.as_ref().map(|b| b.valid_frac),
+            item: boxd.as_ref().and_then(|b| b.item),
         })
     }
 
@@ -1696,6 +1697,7 @@ impl Runtime {
             return BoxDepth { valid_frac, ..BoxDepth::none("sgbm", "민무늬·반사·근접으로 매칭 안 됨") };
         }
         let (Some(d), Some(at)) = (d, at) else { return BoxDepth { valid_frac, ..BoxDepth::none(source, "상자에 깊이 없음") } };
+        let item = noto_vision::item_pose(&depth, &intr, &pose, bbox, 0.0);
         let range_m = self.dist_me(at.0, at.1);
         let sigma_m = match rel {
             Some(r) => r * range_m,
@@ -1703,7 +1705,7 @@ impl Runtime {
             // measurement, not the scatter the scan's looks were learned to have.
             None => self.mem_ctx().sigma_law(d).max(0.002),
         };
-        BoxDepth { source: source.into(), depth_m: Some(d), at: Some(at), range_m: Some(range_m), sigma_m: Some(sigma_m), valid_frac, reason: None }
+        BoxDepth { source: source.into(), depth_m: Some(d), at: Some(at), range_m: Some(range_m), sigma_m: Some(sigma_m), valid_frac, reason: None, item }
     }
 
     pub(crate) fn refresh_memory(&self, m: &Memory, kind: ItemKind, odo: f32) -> Option<(Memory, f32)> {

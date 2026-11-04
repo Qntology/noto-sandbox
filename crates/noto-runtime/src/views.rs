@@ -65,6 +65,7 @@ pub fn parse_view(view: &str) -> Result<FrameView, String> {
         ("agent", []) => Ok(FrameView::Agent),
         ("top", []) => Ok(FrameView::Top),
         ("fork", []) => Ok(FrameView::Fork),
+        ("eye_depth", []) => Ok(FrameView::EyeDepth),
         ("chase", []) => Ok(FrameView::Chase { orbit_deg: 0 }),
         ("chase", [o]) => Ok(FrameView::Chase { orbit_deg: num(o, "궤도 각")?.clamp(-180.0, 180.0) as i16 }),
         ("focus", []) => Ok(FrameView::Focus(FocusCam::Hand)),
@@ -85,7 +86,7 @@ pub fn parse_view(view: &str) -> Result<FrameView, String> {
             };
             Ok(FrameView::Iso { az_step, zoom_pct: (zoom * 100.0).round() as u16, dimetric })
         }
-        _ => Err(format!("알 수 없는 시점 '{view}' (agent · top · chase[:궤도°] · focus:hand|side|low · iso[:방향[:배율[:30]]])")),
+        _ => Err(format!("알 수 없는 시점 '{view}' (agent · top · fork · eye_depth · chase[:궤도°] · focus:hand|side|low · iso[:방향[:배율[:30]]])")),
     }
 }
 
