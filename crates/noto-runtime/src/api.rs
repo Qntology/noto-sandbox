@@ -610,7 +610,12 @@ impl Runtime {
     pub fn api_world_frame(&mut self, width: u32, height: u32, quality: f32, view: &str) -> Result<Value, String> {
         let view = crate::views::parse_view(view)?;
         let view_id = if view == FrameView::Agent { "agent" } else { "other" };
-        let focus = matches!(view, FrameView::Focus(_)).then(|| serde_json::to_value(self.world.focus_frame()).unwrap_or(Value::Null));
+        // A walker's pick-up HUD draws its arm and its fingers on the item while it bends, grips and lifts: the same
+        // focus frame the focus views carry.
+        let hands_busy = view == FrameView::Agent
+            && !noto_core::act::fork::applies(&self.world.body)
+            && matches!(self.world.act_phase(), Some((noto_core::act::ActKind::Grasp, "reach" | "close" | "squeeze" | "load" | "lift" | "stow")));
+        let focus = (matches!(view, FrameView::Focus(_)) || hands_busy).then(|| serde_json::to_value(self.world.focus_frame()).unwrap_or(Value::Null));
         let f = self.frame_sized(view, width, height, quality).map_err(|e| e.to_string())?;
         let units = f.marks.iter().map(|m| self.unit_json(m.id).map_or(Value::Null, |mut u| {
             u["u"] = json!(r3(m.u));
@@ -748,8 +753,12 @@ impl Runtime {
             .enumerate()
             .map(|(i, (id, ko))| json!({"id": id, "label_ko": ko, "state": if i < at { "done" } else if i == at { "active" } else { "pending" }}))
             .collect();
+        let item_json = |p: &noto_vision::ItemPose| {
+            json!({"yaw_deg": r3(p.yaw_deg), "rel_yaw_deg": r3(p.rel_yaw_deg), "length_m": r3(p.length_m), "width_m": r3(p.width_m), "height_m": r3(p.height_m), "top_tilt_deg": r3(p.top_tilt_deg), "elongation": r3(p.elongation), "form": p.form, "points": p.points})
+        };
         let check = self.gaze_check.as_ref().filter(|g| Some(g.drop) == drop && w.tick.saturating_sub(g.tick) < 600).map(|g| {
-            json!({"ok": g.ok, "label_ko": g.label_ko, "score": g.score.map(r3), "range_m": g.range_m.map(r3), "depth_m": g.depth_m.map(r3), "bbox": g.bbox.map(|b| b.map(r3)), "reason": g.reason, "depth_source": g.depth_source, "depth_sigma_m": g.depth_sigma_m.map(r4f)})
+            json!({"ok": g.ok, "label_ko": g.label_ko, "score": g.score.map(r3), "range_m": g.range_m.map(r3), "depth_m": g.depth_m.map(r3), "bbox": g.bbox.map(|b| b.map(r3)), "reason": g.reason, "depth_source": g.depth_source, "depth_sigma_m": g.depth_sigma_m.map(r4f),
+                   "depth_valid": g.depth_valid.map(r3), "item": g.item.as_ref().map(item_json)})
         });
         let hv = w.head_view(&self.cam);
         let pose = w.current_kin_pose();
@@ -761,7 +770,7 @@ impl Runtime {
         let tip = w.act.as_ref().or(w.last_act.as_ref()).filter(|_| forks).and_then(|p| p.rollout.metric("tip_ratio"));
         let sight = |s: &crate::vision::Sighting| {
             json!({"camera": s.camera, "ok": s.ok, "matched": s.matched, "label_ko": s.label_ko, "score": s.score.map(r3), "range_m": s.range_m.map(r3), "depth_m": s.depth_m.map(r3), "bbox": s.bbox.map(|b| b.map(r3)), "neck_deg": r3(s.neck_deg), "reason": s.reason,
-                   "depth_source": s.depth_source, "depth_sigma_m": s.depth_sigma_m.map(r4f), "depth_valid": s.depth_valid.map(r3), "sigma_m": s.sigma_m.map(r4f)})
+                   "depth_source": s.depth_source, "depth_sigma_m": s.depth_sigma_m.map(r4f), "depth_valid": s.depth_valid.map(r3), "sigma_m": s.sigma_m.map(r4f), "item": s.item.as_ref().map(item_json)})
         };
         let cross = self.fork_cross.as_ref().filter(|c| forks && !setting_down && Some(c.drop) == drop).map(|c| {
             json!({

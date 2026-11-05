@@ -209,6 +209,9 @@ pub enum FrameView {
     Iso { az_step: u8, zoom_pct: u16, dimetric: bool },
     /// The fork carriage camera of a wheeled or tracked base (the head camera on legs).
     Fork,
+    /// The head camera's stereo depth, live, as a walker's pick-up HUD shows it beside the picture (a stereo eye only):
+    /// SGBM on the pair at the asked size, with the box where the robot believes its target is (`stereo::eye_depth`).
+    EyeDepth,
 }
 
 pub(crate) struct WorldLabels<'a>(&'a World);
@@ -1290,6 +1293,19 @@ impl Runtime {
                 self.world.fork_cam = noto_core::act::fork::applies(&self.world.body);
                 let f = self.world.render(&cam);
                 self.world.fork_cam = false;
+                (f, Vec::new())
+            }
+            FrameView::EyeDepth => {
+                let cam = Camera { width: width.clamp(32, 1024) as usize, height: height.clamp(32, 1024) as usize, ..self.cam };
+                let baseline = self.stereo_baseline().ok_or_else(|| anyhow!("카메라 1대(TIPSv2) 몸에는 스테레오 깊이 화면이 없습니다"))?;
+                // The box of the item the last look checked, while that look is fresh (as the procedure's check).
+                let target = self
+                    .gaze_check
+                    .as_ref()
+                    .filter(|g| self.world.tick.saturating_sub(g.tick) < 600)
+                    .and_then(|g| g.at.zip(self.world.drop_item(g.drop).map(|d| d.kind.spec().piece_size_m(d.amount))));
+                let (f, o) = crate::stereo::eye_depth(&self.world, &cam, baseline, target)?;
+                overlay = Some(o);
                 (f, Vec::new())
             }
             FrameView::Top => {

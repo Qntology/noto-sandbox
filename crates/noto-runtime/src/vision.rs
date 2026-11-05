@@ -42,6 +42,10 @@ pub struct GazeCheck {
     pub pitch_deg: f32,
     pub depth_source: Option<String>,
     pub depth_sigma_m: Option<f32>,
+    /// The share of the box with depth, where the look put the item, and which way it lies and how big it is.
+    pub depth_valid: Option<f32>,
+    pub at: Option<(f32, f32)>,
+    pub item: Option<noto_vision::ItemPose>,
 }
 
 /// One look at an item through one camera: the scan's match of its kind nearest the memory (its label, score and
@@ -74,6 +78,8 @@ pub struct Sighting {
     pub depth_sigma_m: Option<f32>,
     /// The share of the box with depth (SGBM leaves what it cannot match empty).
     pub depth_valid: Option<f32>,
+    /// Which way the item lies, its size and its top, from the depth over the whole box (`noto_vision::item_pose`).
+    pub item: Option<noto_vision::ItemPose>,
 }
 
 impl Sighting {
@@ -92,6 +98,9 @@ impl Sighting {
             pitch_deg: self.pitch_deg,
             depth_source: self.depth_source.clone(),
             depth_sigma_m: self.depth_sigma_m,
+            depth_valid: self.depth_valid,
+            at: self.at,
+            item: self.item,
         }
     }
 }

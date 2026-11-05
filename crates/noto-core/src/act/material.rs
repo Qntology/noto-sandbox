@@ -1,5 +1,6 @@
 use serde::Serialize;
 
+use crate::sim::ShapeKind;
 use crate::surface::Surface;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
@@ -33,6 +34,16 @@ impl ItemMaterial {
             ItemMaterial::IronOre => "철광석",
             ItemMaterial::Cardboard => "골판지",
         }
+    }
+
+    /// The shape the fingers meet: what the world is made of. Its renderer, its collision boxes, the tines and the
+    /// stereo evaluation all hold every item as a box (a log too, 0.50 × 0.14 × 0.14 m), so the hand does as well —
+    /// a round log only in the hand would show the eyes one thing and the fingers another. The world's sizes barely
+    /// feel it anyway: five coupled fingers stop at 70 % closure on a 14 cm log as on the box, 38.9 N against 38.8 N
+    /// (`sim::tests::print_top_grasps`); a round item changes the grip from about 6 cm down, where the fingertips go
+    /// under it. When the world draws round logs, `Wood` becomes `ShapeKind::Cylinder { axis: 0 }` here.
+    pub fn shape(self) -> ShapeKind {
+        ShapeKind::Box
     }
 }
 
@@ -150,6 +161,26 @@ pub fn torsion_capacity_nm(mu: f32, n: f32) -> f32 {
     3.0 * std::f32::consts::PI / 16.0 * mu * n * contact_radius_m(n)
 }
 
+/// The silicone a phalanx pad can give before its core: half the 9 mm pad (`sim::PHALANX_PAD_M`) over a rigid
+/// bone [추정].
+pub const PAD_THICKNESS_M: f32 = 0.0045;
+
+/// How far a pad pressed with `n` (N) sinks in (m). Hertz gives `δ = a²/R` for the patch `contact_radius_m` makes; a
+/// layer of finite thickness on a rigid core follows it while it is thin against the layer and stiffens as it nears the
+/// core, never passing it: `h·(1 − e^(−δ/h))` [추정: the saturating form; the patch radius itself stays Hertz, so the
+/// contact model is unchanged].
+pub fn pad_indentation_m(n: f32) -> f32 {
+    let a = contact_radius_m(n);
+    let d = a * a / PAD_RADIUS_M;
+    PAD_THICKNESS_M * (1.0 - (-d / PAD_THICKNESS_M).exp())
+}
+
+/// The pressure in the middle of the patch (kPa): Hertz `3N / (2πa²)`, in the unit of `contact::SolePatch::peak_kpa`.
+pub fn pad_peak_kpa(n: f32) -> f32 {
+    let a = contact_radius_m(n).max(1e-6);
+    3.0 * n.max(0.0) / (2.0 * std::f32::consts::PI * a * a) / 1000.0
+}
+
 pub fn impact(v: f32, m: f32, k: f32) -> (f32, f32) {
     (v.abs() * (k * m).sqrt(), std::f32::consts::PI * (m / k).sqrt())
 }
@@ -178,5 +209,25 @@ mod tests {
         let (s, k) = item_on(ItemMaterial::Wood, Surface::Gravel);
         assert!(k.mean < s.mean);
         assert!((stereo_depth_sigma(1.0, 424.0, 0.05, 0.08) - 0.0038).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_pad_sinks_like_hertz_when_light_and_never_through_its_layer() {
+        let hertz = |n: f32| contact_radius_m(n).powi(2) / PAD_RADIUS_M;
+        assert!((pad_indentation_m(0.2) / hertz(0.2) - 1.0).abs() < 0.03, "a light touch is the Hertz approach");
+        let mut last = 0.0;
+        for n in [0.5f32, 1.0, 5.0, 10.0, 30.0, 60.0, 100.0, 400.0] {
+            let d = pad_indentation_m(n);
+            assert!(d > last && d < PAD_THICKNESS_M && d <= hertz(n), "{n} N: {d}");
+            last = d;
+        }
+        assert!(pad_indentation_m(100.0) > 0.8 * PAD_THICKNESS_M, "a hard squeeze nears the core");
+        let (p1, p8) = (pad_peak_kpa(10.0), pad_peak_kpa(80.0));
+        assert!(p1 > 100.0 && p1 < 500.0 && (p8 / p1 - 2.0).abs() < 0.01, "p ∝ N^(1/3): {p1} {p8}");
+    }
+
+    #[test]
+    fn the_hand_meets_items_in_the_shape_the_world_draws_them() {
+        assert!(ItemMaterial::ALL.iter().all(|m| m.shape() == ShapeKind::Box));
     }
 }

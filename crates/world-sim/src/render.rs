@@ -778,8 +778,8 @@ fn render_shifted(world: &World, cam: &Camera, right_m: f32) -> Frame {
         let casters = world.shadow_casters();
         return render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &world.fork_front_boxes(), &casters, None);
     }
-    // What the eyes look down at of the body's own: the tines and their load, or the item in the hands.
-    let own: Vec<Obb> = if world.rider_sees_forks() { world.fork_front_boxes() } else { world.hand_load_boxes() };
+    // What the eyes look down at of the body's own: the tines and their load, or the hands and the item in them.
+    let own: Vec<Obb> = world.own_view_boxes();
     if !own.is_empty() {
         let casters = world.shadow_casters();
         let mut f = render_rays(world, cam, &Rays::Pinhole { view: hv.view, exposure: hv.exposure }, &own, &casters, None);
@@ -1027,10 +1027,22 @@ impl FocusCam {
     }
 }
 
+/// Where the hand camera stands off the hand and what it holds, in the body frame (forward, left, up).
+pub const HAND_CAM_OFF_M: [f32; 3] = [0.36, -0.24, 0.20];
+
 pub fn render_focus(world: &World, cam: &Camera, which: FocusCam) -> Frame {
     let pose = world.body_pose();
     let boxes = pose.as_ref().map(|p| world.robot_boxes(p)).unwrap_or_default();
-    let (t, off) = which.aim(pose.as_ref());
+    let (mut t, mut off) = which.aim(pose.as_ref());
+    if which == FocusCam::Hand {
+        // Close in on the right hand and what it holds, from in front, to the right and above, looking back at the far
+        // face the phalanges go round (about half a metre off).
+        if let (Some(p), Some((_, _, c))) = (pose.as_ref(), world.hand_load()) {
+            let palm = world.holding_boxes(p).into_iter().find(|b| b.name == "palm_r").map_or(t, |b| b.center);
+            t = [0.5 * (palm[0] + c[0]), 0.5 * (palm[1] + c[1]), 0.5 * (palm[2] + c[2])];
+            off = HAND_CAM_OFF_M;
+        }
+    }
     let target = world.body_to_world(t);
     let mut origin = world.body_to_world([t[0] + off[0], t[1] + off[1], t[2] + off[2]]);
     let floor = world.surface_m(origin[0], origin[2]) + 0.08;
@@ -1290,10 +1302,32 @@ impl World {
         v
     }
 
-    /// The item in the hands (`hand_load`) as a box in the world.
+    /// The item in the hands (`hand_load`) as a box in the world: across the body, its length (`size[0]`) along the
+    /// knuckles as the grip closes on it (`sim::top_grasp`), the way the carry places it and a sub-worker draws it.
     pub fn hand_load_boxes(&self) -> Vec<Obb> {
         let axes = [self.body_dir_to_world([1.0, 0.0, 0.0]), self.body_dir_to_world([0.0, 1.0, 0.0]), self.body_dir_to_world([0.0, 0.0, 1.0])];
-        self.hand_load().map(|(k, size, c)| Obb { center: self.body_to_world(c), axes, half: [0.5 * size[0], 0.5 * size[2], 0.5 * size[1]], color: k.spec().color, solid: Solid::Box }).into_iter().collect()
+        self.hand_load().map(|(k, size, c)| Obb { center: self.body_to_world(c), axes, half: [0.5 * size[2], 0.5 * size[0], 0.5 * size[1]], color: k.spec().color, solid: Solid::Box }).into_iter().collect()
+    }
+
+    /// What the head camera sees of its own body: the tines and their load on a lift truck the rider looks down at,
+    /// or the item in the hands — with the forearms and hands round it while a pick or a set-down has them out in
+    /// front, where a head bent to watch them sees them. Walking with a load the eyes look ahead over it, and the step
+    /// they read in the depth (`noto_vision::stairs`) lies where the arms would be drawn: there the item rides alone,
+    /// as before.
+    pub fn own_view_boxes(&self) -> Vec<Obb> {
+        if self.rider_sees_forks() {
+            return self.fork_front_boxes();
+        }
+        let mut v = self.hand_load_boxes();
+        let busy_hands = self.act.as_ref().is_some_and(|p| matches!(p.rollout.kind, noto_core::act::ActKind::Grasp | noto_core::act::ActKind::Release));
+        if busy_hands && !noto_core::act::fork::applies(&self.body) && self.body.arm_count() > 0 {
+            if let Some(pose) = self.body_pose() {
+                let palette = Palette::default();
+                let arms = self.own_arm_boxes(&pose);
+                v.extend(rig::dress(&self.body, &arms, &palette).iter().map(|p| Obb::placed(p, |c| self.body_to_world(c), |a| self.body_dir_to_world(a))));
+            }
+        }
+        v
     }
 
     /// The first worker's outside in the body frame: dressed links on legs; on wheels and tracks the lift truck, its
@@ -1301,7 +1335,7 @@ impl World {
     pub fn robot_parts(&self, pose: &noto_core::dynamics::BodyPose) -> Vec<VisualPart> {
         let palette = Palette::default();
         if !noto_core::act::fork::applies(&self.body) {
-            return rig::dress(&self.body, &pose.boxes, &palette);
+            return rig::dress(&self.body, &self.holding_boxes(pose), &palette);
         }
         let mut v = rig::truck_parts(&self.body, &palette);
         if !self.rider.is_some_and(|r| r.off()) {
@@ -1869,12 +1903,13 @@ mod tests {
     #[cfg_attr(not(windows), ignore = "Windows' pixels: sin and cos differ in the last bit under another libm")]
     fn flat_lighting_keeps_its_pixels() {
         // v1.5: full-size trees and logs, the grain on every surface, the robot drawn from `noto_core::rig`.
+        // v1.7: a knuckle ball at the root of every phalanx (the rider's fingers in "chase").
         let want: [(&str, u64); 7] = [
             ("rest", 0x7990_df86_dfb0_1581),
             ("turn", 0xfd98_ffbd_86cc_7c23),
             ("walk", 0x9ac8_58ae_59c9_3021),
             ("rugged", 0x5a2e_6f68_6ebe_e09b),
-            ("chase", 0xbec5_dc45_4b5a_1b42),
+            ("chase", 0xe01d_d72f_bef8_3c26),
             ("focus", 0xc52e_326a_aed5_f073),
             ("top", 0x1777_dd2f_41f0_963c),
         ];

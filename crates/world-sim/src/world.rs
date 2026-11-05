@@ -20,6 +20,7 @@ use crate::terrain::{cell_center, FlatZone, RuggedLayout, Terrain, TerrainKind, 
 mod acts;
 pub mod cargo;
 mod eye;
+pub mod hands;
 mod motion;
 pub mod steps;
 pub mod traffic;

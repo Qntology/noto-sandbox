@@ -356,7 +356,13 @@ export function renderFrame({ width, height, quality, view }) {
   if (ctx) {
     if (view === 'top') drawTopView(ctx, w, h, W);
     else if (view === 'fork') drawForkView(ctx, w, h, W, hits);
-    else drawAgentView(ctx, w, h, W, hits);
+    else if (view === 'eye_depth') {
+      // 모의 SGBM: 머리 카메라 그림에 깊이 색을 입히고 가운데 물건 자리를 가깝게(따뜻하게) 칠한다.
+      drawAgentView(ctx, w, h, W, hits);
+      tintDepth(ctx, w, h, 0.05);
+      ctx.fillStyle = 'rgba(250, 120, 40, 0.85)';
+      ctx.fillRect(w * 0.38, h * 0.42, w * 0.24, h * 0.2);
+    } else drawAgentView(ctx, w, h, W, hits);
     ({ b64, encode_ms } = encode(quality));
   }
   const pad = b64.endsWith('==') ? 2 : b64.endsWith('=') ? 1 : 0;
@@ -388,10 +394,13 @@ export function renderFrame({ width, height, quality, view }) {
     const hit = hits.find((x) => x.o.id === procedure.target);
     if (hit) procedure.check = { ...procedure.check, bbox: hit.bbox.map((v, i) => Number(Math.max(0, Math.min(1, v / (i % 2 ? h : w))).toFixed(4))) };
   }
+  // 다리 몸이 낮추고 쥐고 드는 동안 1인칭 프레임에도 포커스를 싣는다(Rust 와 같은 단계).
+  const handsBusy = procedure?.mechanism === 'hand' && ['bend', 'grip', 'lift'].includes(procedure.stage);
+  const eyeDepth = view === 'eye_depth' ? { source: 'sgbm', valid: 0.81, scale_m: [0.4, 3.2], ms: 0, grid: [w, h], box: [0.36, 0.4, 0.64, 0.64], box_valid: 0.72, box_depth_m: 0.68, item: null } : null;
   return {
     webp_base64: b64, width: w, height: h, bytes: Math.floor((b64.length * 3) / 4) - pad, encode_ms, tick: W.tick, detections, camera, procedure,
     units: view === 'top' ? topUnits(w, h, W) : [],
-    overlay: view.startsWith('chase') ? mockOverlay(w, h) : null,
-    focus: view.startsWith('focus') ? mockFocus() : null,
+    overlay: view.startsWith('chase') ? mockOverlay(w, h) : eyeDepth,
+    focus: view.startsWith('focus') || handsBusy ? mockFocus() : null,
   };
 }

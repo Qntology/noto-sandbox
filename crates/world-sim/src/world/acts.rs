@@ -637,7 +637,7 @@ impl World {
         let drive = (!self.body.legged()).then(|| noto_core::act::drive::state(&self.body, props, self.posture_now().0.slope_deg, 0.0, self.carried_kg(), 0.0));
         let obj = object.map(|(k, a)| {
             let s = k.spec().piece_size_m(a);
-            ([0.5 * s[0], 0.5 * s[1], 0.5 * s[2]], k.spec().mass_kg * a)
+            ([0.5 * s[0], 0.5 * s[1], 0.5 * s[2]], k.spec().mass_kg * a, material_of(k).shape())
         });
         focus::frame(&FocusCtx { body: &self.body, hand: &self.hand, report: &r, sample: sample.as_ref(), action: kind, event: event.as_ref(), ground_mu: noto_core::surface::available_mu(self.body.base, props), drive, object: obj, step_mu: if walking { self.walk.last_mu } else { None } })
     }

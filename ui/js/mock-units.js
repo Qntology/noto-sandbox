@@ -127,7 +127,18 @@ export function mockFocus() {
       palm: [0.08, 0.09], palm_at: [0.3, 0, 0.8], closure: close, thumbs: [true, false, false, false, false],
       fingers: [0, 0.002, 0.004, 0.006, 0.008].map((y) => finger(y, 3)),
       grip: { grip_n: 42, load_n: 12, slip_ratio: 1.6, contacts: 4, mu: 0.6, mu_est: 0.55, twist_margin_nm: 0.4 },
+      // 마디 패드 (Rust `FingerContact`): 먼 면(법선 +z)에 닿은 말절 넷, 고착이 손가락마다 조금씩 다르다.
+      object_half: [0.05, 0.05, 0.05], object_center: [0, 0.062, -0.06], object_shape: { kind: 'box' },
+      contacts: [1, 2, 3, 4].map((f, i) => ({
+        finger: f, phalanx: 2, point: [0, 0.07 + 0.004 * i, -0.01], normal: [0, 0, 1], fn_n: 9.7, ft: [0, -2.4, 0], ft_n: 2.4,
+        torsion_nm: 0, mu: 0.6, cone_use: 0.35 + 0.12 * i, stick: 0.8 - 0.12 * i, state: i === 3 ? 'incipient' : 'stick', radius_m: 0.0045, slip_dir: [1, 0],
+        indentation_m: 0.0016, peak_kpa: 230,
+      })),
     },
+    arms: ['r', 'l'].map((side) => ({
+      side, chain: [[0, side === 'r' ? -0.2 : 0.2, 1.35], [0.18, side === 'r' ? -0.2 : 0.2, 1.08], [0.36, side === 'r' ? -0.2 : 0.2, 0.86], [0.44, side === 'r' ? -0.2 : 0.2, 0.8]],
+      shoulder: joint(`shoulder_${side}`, 42, 0.46), elbow: joint(`elbow_${side}`, 38, 0.62), abduction: null, reach: 0.82,
+    })),
     hand_joints: ['엄지', '검지', '중지'].flatMap((f) => [0, 1, 2].map((j) => ({ finger: f, joint: j, torque_nm: 0.2 + 0.1 * j, max_nm: 0.6, angle_deg: 20 + 15 * j }))),
     foot: forks ? [] : ['r', 'l'].map((side, i) => ({
       side, rect: [-0.08, 0.16, i ? 0.05 : -0.15, i ? 0.15 : -0.05], normal_n: 300, shear_n: 12, cop: [0.03, i ? 0.1 : -0.1], rcof: 0.04, mu: 0.7, in_air: false,

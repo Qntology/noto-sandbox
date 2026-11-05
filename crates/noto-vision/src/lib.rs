@@ -5,6 +5,7 @@ pub mod decide;
 pub mod depth;
 pub mod frame;
 pub mod fusion;
+pub mod item;
 pub mod locate;
 pub mod pyramid;
 pub mod sam;
@@ -22,6 +23,7 @@ pub use decide::{centroid_sigma, scale_usable, DecideCfg, Decider, Decision, Dec
 pub use fusion::{features, flags, FlagCfg, Features, FusionInput};
 pub use depth::{depth_metrics, DepthMetrics, DepthModel, DepthScene, SceneHeads};
 pub use frame::{DepthKind, DepthMap, Mask, NormalMap, Rgb, SegMap};
+pub use item::{item_pose, ItemPose};
 pub use locate::{label_heats, Heat, LabelPrompt, LabelTexts, LocateCfg, LocateScoring, SemanticLocator, SemanticPoint, SiglipLocator};
 pub use pyramid::{cell_geometry, gate_points, snap_points, CellGateCfg, CellGeo, Pyramid, PyramidCfg, PyramidReport, SnapCfg};
 pub use tips::{ade_name, InputGrid, TipsConfig, TipsDepth, ADE_SKY};

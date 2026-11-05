@@ -191,8 +191,14 @@ fn dress_link(b: &LinkBox, d: &Dims, p: &Palette, v: &mut Vec<VisualPart>) {
         "palm_r" | "palm_l" | "hand_r" | "hand_l" => {
             v.push(f.cube([0.0; 3], [hx * 0.62, hy * 1.0, hz], JOINT));
         }
-        "finger_r" | "finger_l" => {
-            v.push(f.capsule([0.0, 0.0, -hz], [0.0, 0.0, hz], hx, TRIM));
+        "finger_r" | "finger_l" | "thumb_r" | "thumb_l" => {
+            // A knuckle at the near joint and the phalanx after it; the thumb a little thicker, so its turn shows.
+            let r = if b.name.starts_with("thumb") { hx * 1.12 } else { hx };
+            v.push(f.ball([0.0, 0.0, -hz], r * 1.08, JOINT));
+            v.push(f.capsule([0.0, 0.0, -hz], [0.0, 0.0, hz], r, TRIM));
+        }
+        "wrist_r" | "wrist_l" => {
+            v.push(f.capsule([0.0, 0.0, -hz], [0.0, 0.0, hz], hx, JOINT));
         }
         "thigh_r" | "thigh_l" => {
             v.push(f.capsule([0.0, 0.0, -hz + 0.04 * k], [0.0, 0.0, hz - 0.05 * k], hx * 1.56, p.shell));
