@@ -139,9 +139,11 @@ Tauri 앱은 네 모델이 모두 연산 장치에 올라가기 전에는 월드
 | SigLIP2 base patch16 NaFlex | 인식 · 의미 위치 · 명령 임베딩 | `google/siglip2-base-patch16-naflex` @ `b53b807d` | `models/siglip2-base-patch16-naflex` (`SIGLIP2_DIR`) | 1.54 GB |
 | Granite TTM-R3 52-16 | 시계열 예측 | `ibm-granite/granite-timeseries-ttm-r3` @ `7d99b7e3` (가지 `52-16-dec-52-r3`) | `models/granite-timeseries-ttm-r3/52-16-dec-52-r3` (`TTM_DIR`) | 5.9 MB |
 | TIPSv2-B/14 DPT | 깊이 | `google/tipsv2-b14-dpt` @ `da81b552` | `models/tipsv2-b14-dpt` (`TIPS_DIR`) | 632 MB |
-| MobileSAM (TinyViT) | 마스크 추적 | `lmz/candle-sam` @ `8b4cb7c7` | `models/sam` (`SAM_DIR`) | 41 MB |
+| MobileSAM (TinyViT) | 마스크 추적 (선택, `NOTO_SAM=1`) | `lmz/candle-sam` @ `8b4cb7c7` | `models/sam` (`SAM_DIR`) | 41 MB |
 
 `models/sam`에 `sam_vit_b_01ec64.safetensors`만 있어도 SAM은 그것을 씁니다(4 GB GPU에는 MobileSAM 권장).
+
+마스크 추적의 기본은 영역 확장(색 · 깊이 단차로 씨앗 둘레를 묶되, 사전의 물체 크기 f·R/Z 화소 밖으로는 자라지 않음)이고, MobileSAM 은 `NOTO_SAM=1`일 때만 받고 올립니다. RX 6600 에서 키프레임 한 장 17 s 중 13.8 s 가 SAM 이었고(포크가 깊이별 합성곱을 채널 그룹마다 호스트로 보냄), 영역 확장으로 3.3 s 가 됩니다 ([`docs/research/ml-perforated.md`](docs/research/ml-perforated.md) §7).
 
 **장치 메모리 (양자화 · 토큰 표)**: 위 크기는 받는 F32 원본입니다. 장치에는 그보다 작게 올라갑니다 ([`docs/research/ml-quant.md`](docs/research/ml-quant.md)).
 
