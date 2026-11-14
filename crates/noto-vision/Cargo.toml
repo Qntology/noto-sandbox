@@ -16,9 +16,9 @@ candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 noto-ml = { path = "../noto-ml" }
 noto-ts = { path = "../noto-ts" }
+noto-core = { path = "../noto-core" }
 
 [dev-dependencies]
-noto-core = { path = "../noto-core" }
 world-sim = { path = "../world-sim" }
 
 [features]

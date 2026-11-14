@@ -1224,6 +1224,54 @@ pub fn render_rays(world: &World, cam: &Camera, rays: &Rays, robot: &[Obb], cast
     Frame { width: w, height: h, rgb, ids, depth, tick: world.tick }
 }
 
+/// The flat background of a robot-only condition frame (`render_boxes_only`) [추정: a neutral grey a little cooler than
+/// the ground, so no rendered part shares it].
+pub const NEUTRAL_BG: [u8; 3] = [185, 188, 192];
+
+/// Boxes alone on a flat background, through the pinhole `view`: the same ray hits and the same shading as a body in
+/// `render_rays` without the sun, ids 0 where a box is hit, depth along the optical axis, `bg` and infinity elsewhere.
+/// The robot stream of a condition triplet: what moves, with nothing of the scene.
+pub fn render_boxes_only(cam: &Camera, view: &View, boxes: &[Obb], bg: [u8; 3]) -> Frame {
+    let (w, h) = (cam.width.max(1), cam.height.max(1));
+    let half_w = (cam.fov_deg.to_radians() * 0.5).tan();
+    let half_h = half_w * h as f32 / w as f32;
+    let (fwd, right, up) = basis_rpy(view.yaw, view.pitch, view.roll);
+    let mut rgb = vec![0u8; w * h * 3];
+    let ids = vec![0u32; w * h];
+    let mut depth = vec![f32::INFINITY; w * h];
+    rgb.par_chunks_mut(w * 3).zip(depth.par_chunks_mut(w)).enumerate().for_each(|(j, (row_rgb, row_depth))| {
+        let sy = (1.0 - 2.0 * (j as f32 + 0.5) / h as f32) * half_h;
+        for i in 0..w {
+            let sx = (2.0 * (i as f32 + 0.5) / w as f32 - 1.0) * half_w;
+            let d = [0, 1, 2].map(|k| fwd[k] + right[k] * sx + up[k] * sy);
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+            let d = d.map(|v| v / len);
+            let along = d[0] * fwd[0] + d[1] * fwd[1] + d[2] * fwd[2];
+            let hit = boxes.iter().filter_map(|b| b.hit(view.origin, d).map(|(t, n)| (t, n, b))).min_by(|a, b| a.0.total_cmp(&b.0));
+            let (c, z) = match hit {
+                Some((t, l, b)) => {
+                    let dim = 1.0 - 0.25 * (t / cam.max_dist_m.max(1e-3)).clamp(0.0, 1.0);
+                    let k = (l[0] * l[0] + 0.86 * l[1] * l[1] + 0.72 * l[2] * l[2]) * dim;
+                    ([0, 1, 2].map(|c| (b.color[c] as f32 * k).clamp(0.0, 255.0) as u8), t * along)
+                }
+                None => (bg, f32::INFINITY),
+            };
+            row_rgb[i * 3..i * 3 + 3].copy_from_slice(&c);
+            row_depth[i] = z;
+        }
+    });
+    Frame { width: w, height: h, rgb, ids, depth, tick: 0 }
+}
+
+/// The scene with no one in it, through `view`: no robot, no sub-workers, no rider (the static background stream of a
+/// condition triplet; on a live run the first frame's scene, held for the whole episode).
+pub fn render_scene_only(world: &World, cam: &Camera, view: &View) -> Frame {
+    let mut empty = world.clone();
+    empty.crew.clear();
+    empty.rider = None;
+    render_rays(&empty, cam, &Rays::Pinhole { view: *view, exposure: Exposure::default() }, &[], &[], None)
+}
+
 pub fn visible_objects(world: &World, frame: &Frame) -> Vec<VisibleObject> {
     struct Acc {
         px: u32,

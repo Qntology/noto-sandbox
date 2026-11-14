@@ -11,7 +11,9 @@ pub mod dims;
 pub mod dynamics;
 pub mod effects;
 pub mod finger;
+pub mod fit3;
 pub mod hand;
+pub mod handfit;
 pub mod joint;
 pub mod kin;
 pub mod math;
@@ -21,6 +23,7 @@ pub mod parts;
 pub mod rig;
 pub mod sim;
 pub mod surface;
+pub mod tactile;
 pub mod tactbench;
 pub mod wear;
 
