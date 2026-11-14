@@ -177,6 +177,10 @@ impl AppState {
             Siglip2::load(&dir, &device).with_context(|| format!("loading SigLIP2 from {}", dir.display()))?,
         );
         let dict = Dictionary::from_json(DICTIONARY_JSON)?;
+        // The token table keeps only the rows in use on the device: put the lexicon's, the dictionary's and the command
+        // endings' tokens there now (any other text's rows come from the mapped checkpoint when it is first embedded).
+        let texts = noto_runtime::vocab_texts(WORLD_LEXICON_JSON, Some(&dict))?;
+        model.prime_vocab(&texts.iter().map(String::as_str).collect::<Vec<_>>())?;
         let anchors = Anchors::build(&model, &dict)?;
         let engine = Arc::new(VisionEngine {
             model,

@@ -57,6 +57,11 @@ impl TextTokenizer {
     pub fn max_len(&self) -> usize {
         self.max_len
     }
+
+    /// The id of `<unk>` (the Gemma tokenizer falls back to bytes, so a text only gets it for a broken byte).
+    pub fn unk_id(&self) -> Option<u32> {
+        self.inner.token_to_id("<unk>")
+    }
 }
 
 #[cfg(test)]

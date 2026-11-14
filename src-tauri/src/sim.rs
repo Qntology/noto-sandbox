@@ -82,7 +82,7 @@ pub async fn sam_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, Str
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         if enabled == Some(false) {
             return shared.with_world(|rt| {
-                rt.use_region_tracker();
+                rt.use_region_tracker_clamped();
                 models_json(&shared, rt)
             });
         }

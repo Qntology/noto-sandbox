@@ -57,6 +57,8 @@ test_cuda.bat -p noto-runtime --test ml_ab -- --ignored --nocapture ml_ab_benchm
 
 `data/ml_calib.json`에 보정이 실려 있으면 처음부터 그것을 쓰고(맞춤 시드는 정직한 대역만 맞춤), 비었거나 `MLAB_REFIT=1`이면 맞춤 시드에서 다시 맞춘다. 닫힌 고리(퀘스트 전체)는 `ml_ab_quests`(`MLAB_QUESTS`, `MLAB_QUEST_SEEDS`), 이식 대조 입력은 `ml_port_dump`(§6 원인 10).
 
+모델은 `NOTO_QUANT`(기본: GPU 는 Q8_0, CPU 는 F32)와 `NOTO_VOCAB`로 올린다. 양자화 배분의 묶음별 민감도는 `ml_quant_screen`(`MLQ_PLANS`, `MLQ_MODELS=sig|tips`, `MLQ_FUSED`), 토큰 표 대조는 `ml_vocab_check`, 타일 스캔의 밀집 풀링은 `ml_scan_dense` — 결과와 결정은 [`ml-quant.md`](ml-quant.md). 유공(일부 패치만) L1 패스와 지뢰찾기식 확장은 `ml_perforated`(`MLP_ARMS`) — [`ml-perforated.md`](ml-perforated.md).
+
 ## 2. 엔진 입력 (그룹 A)
 
 ### 2.1 깊이 정렬 (`noto_vision::align`)

@@ -9,9 +9,38 @@ use crate::config::Siglip2Config;
 use crate::device::{device_family, trim_idle_pool, BatchPolicy};
 use crate::parallel::{fnv1a, FNV_OFFSET};
 use crate::preprocess::{preprocess, preprocess_grid, DenseGrid, NaflexInput};
+use crate::quant::{Family, QWeights, QuantPlan, QuantStats};
 use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
-use crate::vision::VisionTower;
+use crate::vision::{SparsePass, VisionTower};
+use crate::vocab::{MappedRows, TokenTable, VocabPolicy, VocabStats};
+
+/// `NOTO_FUSED_QKV=1`: the vision tower's query, key and value projections as one GEMM.
+pub const FUSED_QKV_ENV: &str = "NOTO_FUSED_QKV";
+const TOKEN_TABLE: &str = "text_model.embeddings.token_embedding.weight";
+
+/// How a checkpoint is put on the device.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadOpts {
+    /// The pyramid tiers of the linear weights (F32 by default).
+    pub quant: QuantPlan,
+    /// The token table: only the rows in use on the device (default) or the whole table.
+    pub vocab: VocabPolicy,
+    /// One GEMM for the vision tower's Q, K and V (the text tower keeps its three, so phrase vectors do not move).
+    pub fused_qkv: bool,
+}
+
+impl LoadOpts {
+    /// The options for `device`: `NOTO_QUANT` (else the measured default, [`QuantPlan::for_load`]), `NOTO_VOCAB` and
+    /// `NOTO_FUSED_QKV`.
+    pub fn for_device(device: &Device) -> Result<LoadOpts> {
+        Ok(LoadOpts {
+            quant: QuantPlan::for_load(device)?,
+            vocab: VocabPolicy::from_env(),
+            fused_qkv: std::env::var(FUSED_QKV_ENV).is_ok_and(|v| v.trim() == "1"),
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DenseEmbedding {
@@ -20,6 +49,27 @@ pub struct DenseEmbedding {
     pub vectors: Vec<Vec<f32>>,
     pub attention: Vec<f32>,
     pub pooled: Vec<f32>,
+}
+
+/// A dense pass over some cells of the patch grid (`Siglip2::embed_dense_sparse`, more cells with `open_cells`): the
+/// unit vector of every cell evaluated so far (row-major, `None` for a hole) and the pooled embedding over them.
+#[derive(Clone, Debug)]
+pub struct SparseDense {
+    pub grid_h: usize,
+    pub grid_w: usize,
+    pub vectors: Vec<Option<Vec<f32>>>,
+    pub pooled: Vec<f32>,
+    /// Tokens that went through the encoder, over all passes (a cell computed again counts again).
+    pub tokens_run: usize,
+    input: NaflexInput,
+    pass: SparsePass,
+}
+
+impl SparseDense {
+    /// Cells with a vector.
+    pub fn evaluated(&self) -> usize {
+        self.vectors.iter().filter(|v| v.is_some()).count()
+    }
 }
 
 pub struct Siglip2 {
@@ -33,10 +83,19 @@ pub struct Siglip2 {
     policy: BatchPolicy,
     checkpoint: u64,
     fingerprint: u64,
+    /// The plan the weights were loaded with (after [`QuantPlan::for_device`]).
+    quant: QuantPlan,
+    quant_stats: QuantStats,
+    fused_qkv: bool,
 }
 
 impl Siglip2 {
+    /// [`Siglip2::load_with`] the options for `device` ([`LoadOpts::for_device`]).
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_with(dir, device, &LoadOpts::for_device(device)?)
+    }
+
+    pub fn load_with(dir: &Path, device: &Device, opts: &LoadOpts) -> Result<Self> {
         let weights = dir.join("model.safetensors");
         if !weights.exists() {
             return Err(anyhow!(
@@ -51,15 +110,23 @@ impl Siglip2 {
         } else {
             Siglip2Config::default()
         };
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
         let tokenizer = TextTokenizer::from_file(
             &dir.join("tokenizer.json"),
             config.text_pad_id,
             config.text_max_len,
         )?;
-        let mut model = Self::from_var_builder(config, vb, device, Some(tokenizer))?;
+        let tokens = match opts.vocab {
+            VocabPolicy::Full => None,
+            VocabPolicy::Active => Some(TokenTable::active(MappedRows::open(&weights, TOKEN_TABLE, config.text_vocab, config.text_hidden)?, device)),
+        };
+        let w = QWeights::with_plan(vb, &weights, Family::Siglip2, &opts.quant)?;
+        let mut model = Self::build(config, w, device, Some(tokenizer), tokens, opts.fused_qkv)?;
         model.checkpoint = checkpoint_fingerprint(dir, &model.config);
-        model.fingerprint = device_salt(model.checkpoint, device, &model.policy);
+        model.fingerprint = text_salt(device_salt(model.checkpoint, device, &model.policy), &model.quant);
+        // The tokens every text has (padding, the tokenizer's added ones) go on the device now.
+        let base: Vec<&str> = vec![""];
+        model.prime_vocab(&base)?;
         Ok(model)
     }
 
@@ -69,13 +136,19 @@ impl Siglip2 {
         device: &Device,
         tokenizer: Option<TextTokenizer>,
     ) -> Result<Self> {
-        let vision = VisionTower::new(&config, vb.pp("vision_model"))?;
-        let text = TextTower::new(&config, vb.pp("text_model"))?;
-        let logit_scale = read_scalar(&vb, "logit_scale").unwrap_or(0.0);
-        let logit_bias = read_scalar(&vb, "logit_bias").unwrap_or(0.0);
+        Self::build(config, QWeights::plain(vb, Family::Siglip2), device, tokenizer, None, false)
+    }
+
+    fn build(config: Siglip2Config, w: QWeights, device: &Device, tokenizer: Option<TextTokenizer>, tokens: Option<TokenTable>, fused_qkv: bool) -> Result<Self> {
+        let vision = VisionTower::with_weights(&config, &w.pp("vision_model"), fused_qkv)?;
+        let text = TextTower::with_weights(&config, &w.pp("text_model"), tokens, false)?;
+        let vb = w.vb();
+        let logit_scale = read_scalar(vb, "logit_scale").unwrap_or(0.0);
+        let logit_bias = read_scalar(vb, "logit_bias").unwrap_or(0.0);
         let policy = BatchPolicy::for_device(device);
         let checkpoint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
-        let fingerprint = device_salt(checkpoint, device, &policy);
+        let quant = w.plan().clone();
+        let fingerprint = text_salt(device_salt(checkpoint, device, &policy), &quant);
         Ok(Siglip2 {
             config,
             vision,
@@ -87,7 +160,46 @@ impl Siglip2 {
             policy,
             checkpoint,
             fingerprint,
+            quant,
+            quant_stats: w.stats(),
+            fused_qkv,
         })
+    }
+
+    /// The plan the weights run with.
+    pub fn quant_plan(&self) -> &QuantPlan {
+        &self.quant
+    }
+
+    /// What the load quantized (formats, bytes, time).
+    pub fn quant_stats(&self) -> &QuantStats {
+        &self.quant_stats
+    }
+
+    /// The part of the dense locator's mode that keeps a quantized or fused vision tower's statistics and calibration
+    /// apart from the F32 one's (`""` for the F32 tower).
+    pub fn mode_suffix(&self) -> String {
+        let mut s = self.quant.mode_suffix(Family::Siglip2);
+        if self.fused_qkv {
+            s.push_str("+fqkv");
+        }
+        s
+    }
+
+    /// The token table on the device.
+    pub fn vocab_stats(&self) -> VocabStats {
+        self.text.vocab_stats()
+    }
+
+    /// Tokenizes `texts` and puts their token rows on the device ahead of use (an active table; nothing for the whole
+    /// one). Returns the rows added and the number of `<unk>` tokens the texts produced.
+    pub fn prime_vocab(&self, texts: &[&str]) -> Result<(usize, usize)> {
+        let Some(tok) = self.tokenizer.as_ref() else { return Ok((0, 0)) };
+        let (ids, mask) = tok.encode(texts)?;
+        let mut used: Vec<u32> = ids.iter().zip(&mask).filter(|(_, m)| **m > 0.0).map(|(i, _)| *i).collect();
+        used.push(self.config.text_pad_id);
+        let unk = tok.unk_id().map_or(0, |u| used.iter().filter(|i| **i == u).count());
+        Ok((self.text.prime(&used)?, unk))
     }
 
     pub fn batch_policy(&self) -> BatchPolicy {
@@ -103,7 +215,7 @@ impl Siglip2 {
     }
 
     pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
-        self.fingerprint = device_salt(self.checkpoint, &self.device, &policy);
+        self.fingerprint = text_salt(device_salt(self.checkpoint, &self.device, &policy), &self.quant);
         self.policy = policy;
     }
 
@@ -220,6 +332,48 @@ impl Siglip2 {
         Ok(out.into_iter().map(|d| d.expect("every input is in one chunk")).collect())
     }
 
+    /// The (grid_h, grid_w) of the dense pass on `grid` for a `width` × `height` image.
+    pub fn dense_grid(&self, width: u32, height: u32, grid: DenseGrid) -> (usize, usize) {
+        grid.grid_for(width, height, self.config.patch_size, self.config.max_patches)
+    }
+
+    /// The dense pass over the cells `cells` of `grid`'s grid only (row-major, see `dense_grid`): the other patches are
+    /// left out of the encoder (not blacked out), each evaluated patch keeps its own cell's position. With every cell
+    /// in order the vectors are `embed_dense_batch_grid`'s.
+    pub fn embed_dense_sparse(&self, image: &DynamicImage, grid: DenseGrid, cells: &[u32]) -> Result<SparseDense> {
+        let (gh, gw) = self.dense_grid(image.width(), image.height(), grid);
+        let input = preprocess_grid(image, &self.config, gh, gw);
+        let pass = self.vision.forward_sparse(&input, cells)?;
+        let mut sd = SparseDense { grid_h: gh, grid_w: gw, vectors: vec![None; gh * gw], pooled: Vec::new(), tokens_run: cells.len(), input, pass };
+        self.fill_sparse(&mut sd, None)?;
+        Ok(sd)
+    }
+
+    /// Evaluates `cells` on top of the cells `sd` has: they attend to everything evaluated so far, whose features stay
+    /// (a cell listed again is computed anew with its new neighbours). The pooled embedding is taken over all of them.
+    pub fn open_cells(&self, sd: &mut SparseDense, cells: &[u32]) -> Result<()> {
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let more = self.vision.extend_sparse(&sd.input, &sd.pass, cells)?;
+        sd.tokens_run += cells.len();
+        sd.pass = self.vision.merge_sparse(&sd.pass, &more)?;
+        self.fill_sparse(sd, Some(&more))
+    }
+
+    /// The vectors of `fresh`'s cells (all of the pass's when `None`) and the pooled embedding over the whole pass.
+    fn fill_sparse(&self, sd: &mut SparseDense, fresh: Option<&SparsePass>) -> Result<()> {
+        let pooled = self.vision.head_pooled(&sd.pass.tokens)?;
+        let src = fresh.unwrap_or(&sd.pass);
+        let dense = l2_normalize(&self.vision.head_dense(&src.tokens)?)?.squeeze(0)?.to_vec2::<f32>()?;
+        for (c, v) in src.cells.iter().zip(dense) {
+            sd.vectors[*c as usize] = Some(v);
+        }
+        sd.pooled = l2_normalize(&pooled)?.flatten_all()?.to_vec1()?;
+        trim_idle_pool(&self.device);
+        Ok(())
+    }
+
     pub fn embed_dense(&self, image: &DynamicImage) -> Result<DenseEmbedding> {
         let input = preprocess(image, &self.config);
         let (dense, attn, pooled) = self.vision.forward_dense(&input)?;
@@ -243,9 +397,8 @@ impl Siglip2 {
         }
         let len = self.config.text_max_len;
         if !self.policy.fixed_shape {
-            let ids_t = Tensor::from_slice(ids, (rows, len), &self.device)?;
             let mask_t = Tensor::from_slice(mask, (rows, len), &self.device)?;
-            let emb = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?;
+            let emb = l2_normalize(&self.text.forward_ids(ids, (rows, len), &mask_t)?)?;
             trim_idle_pool(&self.device);
             return Ok(emb.to_vec2()?);
         }
@@ -259,9 +412,8 @@ impl Siglip2 {
                 i.extend_from_slice(&ids[start * len..(start + 1) * len]);
                 m.extend_from_slice(&mask[start * len..(start + 1) * len]);
             }
-            let ids_t = Tensor::from_vec(i, (b, len), &self.device)?;
             let mask_t = Tensor::from_vec(m, (b, len), &self.device)?;
-            let emb: Vec<Vec<f32>> = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?.to_vec2()?;
+            let emb: Vec<Vec<f32>> = l2_normalize(&self.text.forward_ids(&i, (b, len), &mask_t)?)?.to_vec2()?;
             out.extend(emb.into_iter().take(n));
         }
         trim_idle_pool(&self.device);
@@ -307,6 +459,21 @@ fn device_salt(h: u64, device: &Device, policy: &BatchPolicy) -> u64 {
     } else {
         h
     }
+}
+
+/// The fingerprint keys the phrase bank, whose vectors only the text tower makes: its quantized groups enter it (an F32
+/// text tower keeps the F32 fingerprint, whatever the vision tower runs with or how many token rows are on the device).
+fn text_salt(h: u64, plan: &QuantPlan) -> u64 {
+    if !plan.touches("st") {
+        return h;
+    }
+    let text: Vec<(&String, &crate::quant::QType)> = plan.groups.iter().filter(|(g, _)| g.starts_with("st.")).collect();
+    let mut h = fnv1a(h, b"text-quant");
+    for (g, q) in text {
+        h = fnv1a(h, g.as_bytes());
+        h = fnv1a(h, q.name().as_bytes());
+    }
+    h
 }
 
 fn sigmoid(x: f32) -> f32 {
@@ -363,6 +530,41 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
             Rgb([(x * 7 % 256) as u8, (y * 13 % 256) as u8, 128])
         }))
+    }
+
+    #[test]
+    fn a_sparse_pass_over_every_cell_is_the_dense_pass_and_opened_cells_leave_the_first_ones_alone() {
+        let m = tiny_model();
+        let img = test_image(24, 16);
+        let grid = DenseGrid::Pyramid { short_side: 3 };
+        let full = m.embed_dense_batch_grid(&[img.clone()], grid).unwrap().pop().unwrap();
+        let (gh, gw) = m.dense_grid(24, 16, grid);
+        assert_eq!((gh, gw), (full.grid_h, full.grid_w));
+        let n = (gh * gw) as u32;
+        let all: Vec<u32> = (0..n).collect();
+        let sd = m.embed_dense_sparse(&img, grid, &all).unwrap();
+        let vecs: Vec<Vec<f32>> = sd.vectors.iter().map(|v| v.clone().unwrap()).collect();
+        assert_eq!(vecs, full.vectors, "every cell in order is the dense pass, bit for bit");
+        assert_eq!(sd.pooled, full.pooled);
+
+        let (even, odd): (Vec<u32>, Vec<u32>) = all.iter().partition(|c| *c % 2 == 0);
+        let mut sd = m.embed_dense_sparse(&img, grid, &even).unwrap();
+        assert_eq!(sd.evaluated(), even.len());
+        assert!(odd.iter().all(|c| sd.vectors[*c as usize].is_none()));
+        assert_ne!(sd.vectors[0].as_ref().unwrap(), &full.vectors[0], "the holes are absent, so the context differs");
+        let before = sd.vectors.clone();
+        m.open_cells(&mut sd, &odd).unwrap();
+        assert_eq!(sd.evaluated(), n as usize);
+        assert_eq!(sd.tokens_run, n as usize);
+        for c in &even {
+            assert_eq!(sd.vectors[*c as usize], before[*c as usize], "opening cells keeps the earlier cells' features");
+        }
+        // Every cell again, nothing left as context: the dense pass once more.
+        m.open_cells(&mut sd, &all).unwrap();
+        let vecs: Vec<Vec<f32>> = sd.vectors.iter().map(|v| v.clone().unwrap()).collect();
+        assert_eq!(vecs, full.vectors);
+        assert_eq!(sd.pooled, full.pooled);
+        assert!(m.embed_dense_sparse(&img, grid, &[n]).is_err(), "a cell outside the grid");
     }
 
     #[test]

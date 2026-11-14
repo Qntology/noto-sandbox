@@ -7,9 +7,14 @@ use candle_nn::{
     ConvTranspose2dConfig, LayerNorm, Linear, VarBuilder,
 };
 
+use noto_ml::quant::{Family, QLinear, QWeights, QuantPlan, QuantStats};
 use noto_ml::vision::antialias_bilinear_weights;
 
 use crate::depth::{clamp_metric, DepthModel, DepthScene, SceneHeads};
+
+fn to_candle(e: anyhow::Error) -> candle_core::Error {
+    candle_core::Error::Msg(format!("{e:#}"))
+}
 use crate::frame::{DepthKind, DepthMap, NormalMap, Rgb, SegMap};
 
 pub const MODE: &str = "tipsv2-b14-dpt";
@@ -251,16 +256,21 @@ impl InputGrid {
 }
 
 struct Attention {
-    qkv: Linear,
-    proj: Linear,
+    qkv: QLinear,
+    proj: QLinear,
     heads: usize,
     head_dim: usize,
 }
 
 impl Attention {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
         let d = cfg.hidden;
-        Ok(Attention { qkv: linear(d, 3 * d, vb.pp("qkv"))?, proj: linear(d, d, vb.pp("proj"))?, heads: cfg.heads, head_dim: d / cfg.heads })
+        Ok(Attention {
+            qkv: w.pp("qkv").linear(d, 3 * d).map_err(to_candle)?,
+            proj: w.pp("proj").linear(d, d).map_err(to_candle)?,
+            heads: cfg.heads,
+            head_dim: d / cfg.heads,
+        })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
@@ -282,22 +292,24 @@ struct Block {
     attn: Attention,
     ls1: Tensor,
     norm2: LayerNorm,
-    fc1: Linear,
-    fc2: Linear,
+    fc1: QLinear,
+    fc2: QLinear,
     ls2: Tensor,
 }
 
 impl Block {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+    /// Norms and the LayerScale vectors stay F32 whatever the plan (they scale every channel of the residual).
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
         let (d, eps) = (cfg.hidden, cfg.layer_norm_eps);
-        let mlp = vb.pp("mlp");
+        let vb = w.vb();
+        let mlp = w.pp("mlp");
         Ok(Block {
             norm1: layer_norm(d, eps, vb.pp("norm1"))?,
-            attn: Attention::new(cfg, vb.pp("attn"))?,
+            attn: Attention::new(cfg, &w.pp("attn"))?,
             ls1: vb.pp("ls1").get(d, "gamma")?,
             norm2: layer_norm(d, eps, vb.pp("norm2"))?,
-            fc1: linear(d, cfg.mlp_hidden, mlp.pp("fc1"))?,
-            fc2: linear(cfg.mlp_hidden, d, mlp.pp("fc2"))?,
+            fc1: mlp.pp("fc1").linear(d, cfg.mlp_hidden).map_err(to_candle)?,
+            fc2: mlp.pp("fc2").linear(cfg.mlp_hidden, d).map_err(to_candle)?,
             ls2: vb.pp("ls2").get(d, "gamma")?,
         })
     }
@@ -330,7 +342,8 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        let vb = w.vb();
         let (d, side) = (cfg.hidden, cfg.position_side());
         let patch_cfg = Conv2dConfig { stride: cfg.patch_size, ..Default::default() };
         let register_tokens = match cfg.register_tokens {
@@ -342,7 +355,7 @@ impl Encoder {
             cls_token: vb.get((1, 1, d), "cls_token")?,
             register_tokens,
             pos_embed: vb.get((1, 1 + side * side, d), "pos_embed")?,
-            blocks: (0..cfg.layers).map(|i| Block::new(cfg, vb.pp(format!("blocks.{i}")))).collect::<candle_core::Result<_>>()?,
+            blocks: (0..cfg.layers).map(|i| Block::new(cfg, &w.pp(format!("blocks.{i}")))).collect::<candle_core::Result<_>>()?,
             norm: layer_norm(d, cfg.layer_norm_eps, vb.pp("norm"))?,
             side,
             hidden: d,
@@ -399,7 +412,7 @@ impl Encoder {
 }
 
 struct ReassembleLevel {
-    readout: Linear,
+    readout: QLinear,
     out_projection: Conv2d,
     resize: Resize,
     gelu_tanh: bool,
@@ -412,7 +425,10 @@ enum Resize {
 }
 
 impl ReassembleLevel {
-    fn new(level: usize, cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+    /// The readout projection may be quantized (a plan's `tv.readout`); the 1×1 projection and the resampling
+    /// convolutions stay F32 (candle has no quantized convolution).
+    fn new(level: usize, cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        let vb = w.vb();
         let (d, ch) = (cfg.hidden, cfg.post_process_channels[level]);
         let resize_vb = vb.pp("resize_layers").pp(level);
         let resize = match LEVEL_SCALES[level] {
@@ -424,7 +440,7 @@ impl ReassembleLevel {
             }
         };
         Ok(ReassembleLevel {
-            readout: linear(2 * d, d, vb.pp("readout_projects").pp(level))?,
+            readout: w.pp("readout_projects").pp(level).linear(2 * d, d).map_err(to_candle)?,
             out_projection: conv2d(d, ch, 1, Conv2dConfig::default(), vb.pp("out_projections").pp(level))?,
             resize,
             gelu_tanh: cfg.readout_gelu_tanh,
@@ -500,11 +516,12 @@ struct Decoder {
 }
 
 impl Decoder {
-    fn new(cfg: &TipsConfig, vb: &VarBuilder) -> candle_core::Result<Self> {
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        let vb = w.vb();
         let ch = cfg.dpt_channels;
         let same = Conv2dConfig { padding: SAME_PAD_3X3, ..Default::default() };
         Ok(Decoder {
-            reassemble: (0..DPT_LEVELS).map(|i| ReassembleLevel::new(i, cfg, vb.pp("reassemble"))).collect::<candle_core::Result<_>>()?,
+            reassemble: (0..DPT_LEVELS).map(|i| ReassembleLevel::new(i, cfg, &w.pp("reassemble"))).collect::<candle_core::Result<_>>()?,
             convs: (0..DPT_LEVELS).map(|i| conv2d_no_bias(cfg.post_process_channels[i], ch, 3, same, vb.pp("convs").pp(i))).collect::<candle_core::Result<_>>()?,
             fusion: (0..DPT_LEVELS).map(|i| FusionBlock::new(ch, i > 0, vb.pp("fusion_blocks").pp(i))).collect::<candle_core::Result<_>>()?,
             project: conv2d(ch, ch, 3, same, vb.pp("project"))?,
@@ -534,9 +551,11 @@ struct DepthHead {
 }
 
 impl DepthHead {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
+    /// The bin classifier stays F32: 256 logits through a ReLU and a normalization make the depth and its spread.
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        let vb = w.vb();
         Ok(DepthHead {
-            dec: Decoder::new(cfg, &vb)?,
+            dec: Decoder::new(cfg, w)?,
             classifier: linear(cfg.dpt_channels, cfg.depth_bins, vb.pp("depth_head"))?,
             centers: bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?,
             min_depth: cfg.min_depth as f64,
@@ -561,8 +580,8 @@ struct NormalsHead {
 }
 
 impl NormalsHead {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        Ok(NormalsHead { dec: Decoder::new(cfg, &vb)?, out: linear(cfg.dpt_channels, 3, vb.pp("normals_head"))? })
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        Ok(NormalsHead { dec: Decoder::new(cfg, w)?, out: linear(cfg.dpt_channels, 3, w.vb().pp("normals_head"))? })
     }
 
     fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
@@ -577,8 +596,8 @@ struct SegHead {
 }
 
 impl SegHead {
-    fn new(cfg: &TipsConfig, vb: VarBuilder) -> candle_core::Result<Self> {
-        Ok(SegHead { dec: Decoder::new(cfg, &vb)?, out: linear(cfg.dpt_channels, cfg.seg_classes, vb.pp("segmentation_head"))? })
+    fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
+        Ok(SegHead { dec: Decoder::new(cfg, w)?, out: linear(cfg.dpt_channels, cfg.seg_classes, w.vb().pp("segmentation_head"))? })
     }
 
     fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
@@ -649,6 +668,10 @@ pub struct TipsDepth {
     pub pyramid_grid: Option<InputGrid>,
     pub max_rel_spread: Option<f32>,
     pub flip_tta: bool,
+    /// `tipsv2-b14-dpt`, with the plan's tag when the encoder or the readout is quantized (SDS scopes, calibration).
+    mode: String,
+    quant: QuantPlan,
+    quant_stats: QuantStats,
 }
 
 struct RunOut {
@@ -672,7 +695,14 @@ impl TipsDepth {
         Self::load_with(dir, device, heads_from_env())
     }
 
+    /// [`TipsDepth::load_quant`] with the plan for `device` (`NOTO_QUANT`, else the measured default,
+    /// `noto_ml::QuantPlan::for_load`).
     pub fn load_with(dir: &Path, device: &Device, heads: SceneHeads) -> anyhow::Result<Self> {
+        Self::load_quant(dir, device, heads, &QuantPlan::for_load(device)?)
+    }
+
+    /// The checkpoint with the encoder and readout weights of `plan` quantized once from its F32 values.
+    pub fn load_quant(dir: &Path, device: &Device, heads: SceneHeads, plan: &QuantPlan) -> anyhow::Result<Self> {
         let weights = dir.join(WEIGHTS_FILE);
         if !weights.exists() {
             bail!(
@@ -684,7 +714,8 @@ impl TipsDepth {
         let config_path = dir.join(CONFIG_FILE);
         let cfg = if config_path.exists() { TipsConfig::from_file(&config_path)? } else { TipsConfig::default() };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
-        Self::from_var_builder_with(cfg, vb, device, heads).with_context(|| format!("loading {}", weights.display()))
+        let w = QWeights::with_plan(vb, &weights, Family::Tips, plan)?;
+        Self::build(cfg, &w, device, heads).with_context(|| format!("loading {}", weights.display()))
     }
 
     pub fn from_var_builder(cfg: TipsConfig, vb: VarBuilder, device: &Device) -> anyhow::Result<Self> {
@@ -692,17 +723,48 @@ impl TipsDepth {
     }
 
     pub fn from_var_builder_with(cfg: TipsConfig, vb: VarBuilder, device: &Device, heads: SceneHeads) -> anyhow::Result<Self> {
+        Self::build(cfg, &QWeights::plain(vb, Family::Tips), device, heads)
+    }
+
+    fn build(cfg: TipsConfig, w: &QWeights, device: &Device, heads: SceneHeads) -> anyhow::Result<Self> {
         cfg.validate()?;
-        let encoder = Encoder::new(&cfg, vb.pp("vision_encoder"))?;
-        let head = DepthHead::new(&cfg, vb.pp("depth_head"))?;
+        let vb = w.vb();
+        let encoder = Encoder::new(&cfg, &w.pp("vision_encoder"))?;
+        let head = DepthHead::new(&cfg, &w.pp("depth_head"))?;
         let has = |head: &str| vb.contains_tensor(&format!("{head}.project.weight"));
-        let normals_head = if heads.normals && has("normals_head") { Some(NormalsHead::new(&cfg, vb.pp("normals_head"))?) } else { None };
-        let seg_head = if heads.segmentation && has("segmentation_head") { Some(SegHead::new(&cfg, vb.pp("segmentation_head"))?) } else { None };
-        Ok(TipsDepth { cfg, encoder, head, normals_head, seg_head, device: device.clone(), input_grid: InputGrid::default(), pyramid_grid: None, max_rel_spread: None, flip_tta: false })
+        let normals_head = if heads.normals && has("normals_head") { Some(NormalsHead::new(&cfg, &w.pp("normals_head"))?) } else { None };
+        let seg_head = if heads.segmentation && has("segmentation_head") { Some(SegHead::new(&cfg, &w.pp("segmentation_head"))?) } else { None };
+        let quant = w.plan().clone();
+        let mode = format!("{MODE}{}", quant.mode_suffix(Family::Tips));
+        Ok(TipsDepth {
+            cfg,
+            encoder,
+            head,
+            normals_head,
+            seg_head,
+            device: device.clone(),
+            input_grid: InputGrid::default(),
+            pyramid_grid: None,
+            max_rel_spread: None,
+            flip_tta: false,
+            mode,
+            quant,
+            quant_stats: w.stats(),
+        })
     }
 
     pub fn config(&self) -> &TipsConfig {
         &self.cfg
+    }
+
+    /// The plan the weights run with.
+    pub fn quant_plan(&self) -> &QuantPlan {
+        &self.quant
+    }
+
+    /// What the load quantized (formats, bytes, time).
+    pub fn quant_stats(&self) -> &QuantStats {
+        &self.quant_stats
     }
 
     /// The grid a `width` × `height` frame runs on: the pyramid's while one is set, else `input_grid`.
@@ -851,7 +913,7 @@ fn model_input(rgb: &Rgb, width: u32, height: u32, device: &Device) -> anyhow::R
 
 impl DepthModel for TipsDepth {
     fn mode(&self) -> &str {
-        MODE
+        &self.mode
     }
 
     fn device(&self) -> String {

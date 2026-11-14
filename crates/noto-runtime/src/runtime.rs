@@ -653,6 +653,17 @@ impl Runtime {
         self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow)", None);
     }
 
+    /// The region tracker with each label's region kept to the item's size: R = max(the lexicon's tallest height for
+    /// it, 0.5 m) at the seed's depth through this camera (`noto_vision::ExtentClamp`), so a region does not run onto a
+    /// neighbour of the same colour and depth beyond the item.
+    pub fn use_region_tracker_clamped(&mut self) {
+        let radius_m = self.parser.lexicon().vision.iter().filter_map(|e| e.height_m.map(|(_, hi)| (e.id.clone(), hi.max(0.5)))).collect();
+        let focal_px = self.cam.width as f32 * 0.5 / (self.cam.fov_deg.to_radians() * 0.5).tan();
+        self.ml.tracker = Box::new(noto_vision::RegionTracker::default().with_extent(noto_vision::ExtentClamp { focal_px, radius_m }));
+        self.ml.sync_pyramid();
+        self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow), 물체 크기로 제한", None);
+    }
+
     pub fn set_gates(&mut self, gates: GateCfg) {
         self.cfg.gates = gates.clone();
         self.gates.set_cfg(gates);
