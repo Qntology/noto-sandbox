@@ -432,6 +432,7 @@ impl Runtime {
                 "locate_err_px": m.locate_err_px.map(r3),
                 "flags": m.flags,
                 "target": m.target.as_ref().map(|t| json!({"track": t.track_id, "label": t.label, "bearing": r3(t.rel_bearing_deg), "depth_range": t.depth_range_m.map(r3), "tri_range": t.tri_range_m.map(r3), "true_range": t.range_true_m.map(r3), "scale": t.depth_scale.map(r3)})),
+                "stage_ms": m.stage_ms,
             })),
             "decision": kf.decision.as_ref().map(|d| json!({"label": d.decision, "kind": d.kind, "residual": d.residual_deg.map(r3), "executed": d.executed, "ok": d.ok})),
             "sds": kf.sds.iter().map(|(k, v)| (k.clone(), json!(r3(*v)))).collect::<serde_json::Map<String, Value>>(),

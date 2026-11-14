@@ -53,6 +53,30 @@ opt-level = 3
 [profile.dev.package.noto-vision]
 opt-level = 3
 
+# The block encoder quantizes the models when they load (a weighted search per 32 weights).
+[profile.dev.package.noto-ml]
+opt-level = 3
+
+# candle's CPU matmul (and the convolutions the ROCm and Vulkan backends run on the host, im2col + matmul). Unoptimized,
+# one TIPSv2 DPT frame took 36 s in the test profile.
+[profile.dev.package.gemm]
+opt-level = 3
+
+[profile.dev.package.gemm-common]
+opt-level = 3
+
+[profile.dev.package.gemm-f32]
+opt-level = 3
+
+[profile.dev.package.gemm-f16]
+opt-level = 3
+
+[profile.dev.package.pulp]
+opt-level = 3
+
+[profile.dev.package.candle-transformers]
+opt-level = 3
+
 [profile.dev.package.noto-core]
 opt-level = 3
 

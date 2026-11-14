@@ -57,6 +57,8 @@ pub trait SemanticLocator: Send {
     fn locate(&mut self, rgb: &Rgb, labels: &[LabelPrompt]) -> Result<Vec<SemanticPoint>>;
     /// Runs the dense pass on the 1 : 2 : 4 pyramid's grid while `cfg` is set (`None`: the locator's own grid).
     fn set_pyramid(&mut self, _cfg: Option<&crate::pyramid::PyramidCfg>) {}
+    /// The camera of the frames to come (a perforated pass puts its dense band on the horizon).
+    fn set_camera(&mut self, _intr: Option<&crate::camera::Intrinsics>) {}
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
         frames.iter().map(|f| self.locate(f, labels)).collect()
     }
@@ -144,15 +146,20 @@ pub struct LocateCfg {
     /// The dense pass's patch grid: NaFlex's (fill the 256-patch budget) or the pyramid's (half of TIPSv2's grid).
     #[serde(default)]
     pub grid: DenseGrid,
+    /// Evaluate only some patches and open the rest around the peaks (`crate::perforate`); `None`: every patch.
+    #[serde(default)]
+    pub perforated: Option<crate::perforate::PerforatedCfg>,
 }
 
 impl Default for LocateCfg {
     fn default() -> Self {
-        LocateCfg { scoring: LocateScoring::PairProb, negative_weight: 0.5, background: Vec::new(), templates: Vec::new(), logit_scale: None, grid: DenseGrid::Naflex }
+        LocateCfg { scoring: LocateScoring::PairProb, negative_weight: 0.5, background: Vec::new(), templates: Vec::new(), logit_scale: None, grid: DenseGrid::Naflex, perforated: None }
     }
 }
 
 impl LocateCfg {
+    /// The settings a mode names. The model's own parts (`+q-<plan>`, `+fqkv`: how the vision tower was loaded, see
+    /// `Siglip2::mode_suffix`) are not settings of the locator and are skipped.
     pub fn from_mode(mode: &str, background: &[String], templates: &[String]) -> Option<LocateCfg> {
         let rest = mode.strip_prefix("siglip2-dense")?;
         let mut cfg = LocateCfg::default();
@@ -165,6 +172,9 @@ impl LocateCfg {
                 "z" => cfg.scoring = LocateScoring::ZScore,
                 "tpl" => cfg.templates = templates.to_vec(),
                 "pyr" => cfg.grid = DenseGrid::pyramid(),
+                p if p.starts_with("perf") => cfg.perforated = Some(crate::perforate::PerforatedCfg::from_tag(p)?),
+                "fqkv" => {}
+                p if p.starts_with("q-") => {}
                 _ => return None,
             }
         }
@@ -184,6 +194,10 @@ impl LocateCfg {
         if let DenseGrid::Pyramid { .. } = self.grid {
             m.push_str("+pyr");
         }
+        if let Some(p) = &self.perforated {
+            m.push('+');
+            m.push_str(&p.tag());
+        }
         m
     }
 }
@@ -201,6 +215,8 @@ pub struct SiglipLocator {
     cfg: LocateCfg,
     pyramid: Option<DenseGrid>,
     mode: String,
+    camera: Option<crate::camera::Intrinsics>,
+    last_perf: Vec<crate::perforate::PerfReport>,
 }
 
 impl SiglipLocator {
@@ -208,9 +224,11 @@ impl SiglipLocator {
         SiglipLocator::with_cfg(model, LocateCfg::default())
     }
 
+    /// The mode is the settings' (`LocateCfg::mode`) followed by the vision tower's load (`Siglip2::mode_suffix`), so a
+    /// quantized tower's calibration and SDS statistics stay apart from the F32 one's.
     pub fn with_cfg(model: Arc<noto_ml::Siglip2>, cfg: LocateCfg) -> SiglipLocator {
-        let mode = cfg.mode();
-        SiglipLocator { model, cache: HashMap::new(), negative_weight: cfg.negative_weight, cfg, pyramid: None, mode }
+        let mode = format!("{}{}", cfg.mode(), model.mode_suffix());
+        SiglipLocator { model, cache: HashMap::new(), negative_weight: cfg.negative_weight, cfg, pyramid: None, mode, camera: None, last_perf: Vec::new() }
     }
 
     pub fn cfg(&self) -> &LocateCfg {
@@ -224,6 +242,11 @@ impl SiglipLocator {
 
     pub fn model(&self) -> &Arc<noto_ml::Siglip2> {
         &self.model
+    }
+
+    /// What the perforated pass did on each frame of the last batch (empty without one).
+    pub fn last_perf(&self) -> &[crate::perforate::PerfReport] {
+        &self.last_perf
     }
 
     fn text_vectors(&mut self, phrases: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -350,15 +373,29 @@ impl SemanticLocator for SiglipLocator {
 
     fn set_pyramid(&mut self, cfg: Option<&crate::pyramid::PyramidCfg>) {
         self.pyramid = cfg.map(|p| DenseGrid::Pyramid { short_side: p.l1_short_side });
-        self.mode = self.effective_cfg().mode();
+        self.mode = format!("{}{}", self.effective_cfg().mode(), self.model.mode_suffix());
+    }
+
+    fn set_camera(&mut self, intr: Option<&crate::camera::Intrinsics>) {
+        self.camera = intr.copied();
     }
 
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
         let cfg = self.effective_cfg();
         let texts = self.label_texts(labels, &cfg)?;
         let images: Vec<image::DynamicImage> = frames.iter().map(|f| f.to_dynamic()).collect();
-        let dense = self.model.embed_dense_batch_grid(&images, cfg.grid)?;
         let (scale, bias) = self.model.logit_scale_bias();
+        self.last_perf.clear();
+        if let Some(perf) = &cfg.perforated {
+            let mut out = Vec::with_capacity(frames.len());
+            for (rgb, image) in frames.iter().zip(&images) {
+                let (heats, rep) = crate::perforate::perforated_heats(&self.model, image, &texts, &cfg, perf, self.camera.as_ref(), scale, bias)?;
+                self.last_perf.push(rep);
+                out.push(points_with_presence(rgb.width, rgb.height, heats));
+            }
+            return Ok(out);
+        }
+        let dense = self.model.embed_dense_batch_grid(&images, cfg.grid)?;
         Ok(frames.iter().zip(&dense).map(|(rgb, d)| points_with_presence(rgb.width, rgb.height, label_heats(d, &texts, &cfg, scale, bias))).collect())
     }
 }
@@ -440,12 +477,24 @@ mod tests {
             LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), templates: tpl.clone(), ..LocateCfg::default() },
             LocateCfg { scoring: LocateScoring::ZScore, ..LocateCfg::default() },
             LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), grid: DenseGrid::pyramid(), ..LocateCfg::default() },
+            LocateCfg { scoring: LocateScoring::Contrast, background: bg.clone(), grid: DenseGrid::pyramid(), perforated: Some(crate::perforate::PerforatedCfg::default()), ..LocateCfg::default() },
+            LocateCfg { grid: DenseGrid::pyramid(), perforated: Some(crate::perforate::PerforatedCfg { pattern: crate::perforate::PerfPattern::Checker, expand: None }), ..LocateCfg::default() },
         ] {
             assert_eq!(LocateCfg::from_mode(&cfg.mode(), &bg, &tpl), Some(cfg.clone()), "{}", cfg.mode());
         }
+        assert_eq!(
+            LocateCfg { grid: DenseGrid::pyramid(), perforated: Some(crate::perforate::PerforatedCfg::default()), ..LocateCfg::default() }.mode(),
+            "siglip2-dense+pyr+perf",
+            "a perforated pass is calibrated on its own"
+        );
         assert_eq!(LocateCfg::from_mode("stand-in(siglip2-like)", &bg, &tpl), None);
         assert_eq!(LocateCfg::from_mode("siglip2-dense+what", &bg, &tpl), None);
         assert_eq!(LocateCfg { grid: DenseGrid::pyramid(), ..LocateCfg::default() }.mode(), "siglip2-dense+pyr", "a pyramid grid is calibrated on its own");
+        // The vision tower's load (a quantization plan, the fused projection) is part of the locator's mode, not a setting.
+        let plain = LocateCfg::from_mode("siglip2-dense+bg+pyr", &bg, &tpl);
+        assert!(plain.is_some());
+        assert_eq!(LocateCfg::from_mode("siglip2-dense+bg+pyr+q-pyr", &bg, &tpl), plain);
+        assert_eq!(LocateCfg::from_mode("siglip2-dense+bg+pyr+q-custom-0a1b2c3d+fqkv", &bg, &tpl), plain);
         assert_eq!(apply_template("a photo of {}.", "a log"), "a photo of a log.");
     }
 }

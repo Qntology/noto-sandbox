@@ -82,8 +82,20 @@ struct Live {
 
 pub struct RegionTracker {
     pub cfg: RegionCfg,
+    /// The size each label's region may grow to (`with_extent`); `None`: only `max_area_frac` bounds it.
+    pub extent: Option<ExtentClamp>,
     tracks: Vec<Live>,
     next_id: u32,
+}
+
+/// How far a region may grow from its seed: no farther than `radius_m[label]` (m) on the item at the seed's depth,
+/// i.e. f·R/Z pixels each way — so a region cannot run onto a neighbour beyond the item's own size, however alike
+/// their colour and depth. A label without a radius, or a seed without depth, grows as before.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtentClamp {
+    /// The camera's focal length in frame pixels.
+    pub focal_px: f32,
+    pub radius_m: std::collections::HashMap<String, f32>,
 }
 
 impl Default for RegionTracker {
@@ -170,7 +182,20 @@ impl Work {
         (y * self.w + x) as usize
     }
 
-    fn grow(&self, seed: (u32, u32), cfg: &RegionCfg) -> (Mask, [f32; 3], bool) {
+    /// The box (x0, y0, x1, y1, work pixels) a region seeded at `seed` may fill: `half` work pixels each way.
+    fn bounds(&self, seed: (u32, u32), half: Option<f32>) -> [u32; 4] {
+        match half {
+            Some(r) if r.is_finite() => {
+                let r = r.max(1.0);
+                let (x, y) = (seed.0 as f32, seed.1 as f32);
+                [(x - r).max(0.0) as u32, (y - r).max(0.0) as u32, ((x + r) as u32).min(self.w - 1), ((y + r) as u32).min(self.h - 1)]
+            }
+            _ => [0, 0, self.w - 1, self.h - 1],
+        }
+    }
+
+    fn grow(&self, seed: (u32, u32), cfg: &RegionCfg, half: Option<f32>) -> (Mask, [f32; 3], bool) {
+        let [bx0, by0, bx1, by1] = self.bounds(seed, half);
         let mut mask = Mask::empty(self.w, self.h);
         let max_px = (cfg.max_area_frac * (self.w * self.h) as f32) as u32 + 1;
         let mut mean = self.rgb[self.idx(seed.0, seed.1)];
@@ -182,7 +207,7 @@ impl Work {
             let here = self.idx(x, y);
             let neigh = [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)];
             for (nx, ny) in neigh {
-                if nx >= self.w || ny >= self.h || mask.get(nx, ny) {
+                if nx >= self.w || ny >= self.h || mask.get(nx, ny) || nx < bx0 || nx > bx1 || ny < by0 || ny > by1 {
                     continue;
                 }
                 let j = self.idx(nx, ny);
@@ -266,7 +291,21 @@ impl Work {
 
 impl RegionTracker {
     pub fn new(cfg: RegionCfg) -> RegionTracker {
-        RegionTracker { cfg, tracks: Vec::new(), next_id: 1 }
+        RegionTracker { cfg, extent: None, tracks: Vec::new(), next_id: 1 }
+    }
+
+    /// This tracker with each label's region kept to the item's size (`ExtentClamp`).
+    pub fn with_extent(mut self, extent: ExtentClamp) -> RegionTracker {
+        self.extent = Some(extent);
+        self
+    }
+
+    /// The half-size, in work pixels, a `label` region seeded at `seed` may take (`None`: unbounded).
+    fn half(&self, work: &Work, label: &str, seed: (u32, u32), k: u32) -> Option<f32> {
+        let e = self.extent.as_ref()?;
+        let r = *e.radius_m.get(label)?;
+        let z = work.depth.as_ref()?[work.idx(seed.0, seed.1)];
+        (z.is_finite() && z > 0.0).then(|| e.focal_px * r / z / k as f32)
     }
 
     fn accept(&self, work: &Work, m: &Mask, capped: bool) -> bool {
@@ -336,7 +375,8 @@ impl MaskTracker for RegionTracker {
             if propagated && t.misses >= self.cfg.max_misses {
                 continue;
             }
-            let (mask, color, capped) = work.grow(seed, &self.cfg);
+            let half = self.half(&work, &t.label, seed, k);
+            let (mask, color, capped) = work.grow(seed, &self.cfg, half);
             if !self.accept(&work, &mask, capped) {
                 continue;
             }
@@ -366,7 +406,8 @@ impl MaskTracker for RegionTracker {
             }
             let around = work.local_median(p.px / kf, p.py / kf, 2);
             let Some((seed, _)) = work.best_seed(p.px / kf, p.py / kf, around, 2) else { continue };
-            let (mask, color, capped) = work.grow(seed, &self.cfg);
+            let half = self.half(&work, &p.label, seed, k);
+            let (mask, color, capped) = work.grow(seed, &self.cfg, half);
             if !self.accept(&work, &mask, capped) {
                 continue;
             }
@@ -434,6 +475,35 @@ mod tests {
             assert_eq!(t.update(&rgb2, Some(&depth2), &[]).unwrap().len(), 1);
         }
         assert!(t.update(&rgb2, Some(&depth2), &[]).unwrap().is_empty(), "dropped after two keyframes without support");
+    }
+
+    #[test]
+    fn the_item_size_keeps_a_region_off_a_touching_look_alike() {
+        // Two grey blocks side by side at the same depth (an item and a boulder touching it): the region runs over
+        // both; kept to the item's size at its depth it stays on the one the prompt is on.
+        let (w, h) = (80u32, 60u32);
+        let mut rgb = Vec::new();
+        let mut depth = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let block = (20..60).contains(&x) && (20..40).contains(&y);
+                rgb.extend_from_slice(&if block { [128, 128, 132] } else { [70, 130, 60] });
+                depth.push(if block { 4.0 } else { 6.0 + y as f32 * 0.01 });
+            }
+        }
+        let (rgb, depth) = (Rgb::new(w, h, rgb), DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth });
+        let prompt = [PointPrompt { label: "stone".into(), px: 30.0, py: 30.0, score: 0.8 }];
+        let free = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).update(&rgb, Some(&depth), &prompt).unwrap();
+        assert!(free[0].mask.area() >= 780, "both blocks (less the corners the median filter rounds): {}", free[0].mask.area());
+        // f = 80 px, R = 0.5 m at 4 m: 10 px each way from the seed.
+        let clamp = ExtentClamp { focal_px: 80.0, radius_m: [("stone".to_string(), 0.5)].into_iter().collect() };
+        let kept = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).with_extent(clamp.clone()).update(&rgb, Some(&depth), &prompt).unwrap();
+        let b = kept[0].bbox;
+        assert!(b[0] >= 20.0 && b[2] <= 41.5 && kept[0].mask.area() < 500, "{b:?} {}", kept[0].mask.area());
+        // A label with no size grows as before.
+        let other = [PointPrompt { label: "tree".into(), ..prompt[0].clone() }];
+        let tree = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).with_extent(clamp).update(&rgb, Some(&depth), &other).unwrap();
+        assert!(tree[0].mask.area() >= 780, "{}", tree[0].mask.area());
     }
 
     #[test]

@@ -485,6 +485,16 @@ pub enum LocateEngine {
     StandIn(LocateStandIn),
 }
 
+/// Where one keyframe's analysis spent its time, ms (depth 0 when a prefetched batch already ran it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct StageMs {
+    pub depth: f32,
+    pub align: f32,
+    pub locate: f32,
+    pub pyramid: f32,
+    pub track: f32,
+}
+
 pub struct MlFrame {
     pub depth: DepthMap,
     pub align: Option<AlignFit>,
@@ -497,6 +507,7 @@ pub struct MlFrame {
     pub range_true_m: Option<f32>,
     pub truth_entity: Option<String>,
     pub pyramid: Option<PyramidReport>,
+    pub stage_ms: StageMs,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -776,6 +787,13 @@ impl MlPipeline {
         let pre = self.pre.remove(&key).unwrap_or_default();
         self.pre_order.retain(|k| *k != key);
         let heads = scene_heads(&self.fix);
+        let mut ms = StageMs::default();
+        let lap = |t: &mut std::time::Instant| {
+            let v = t.elapsed().as_secs_f32() * 1000.0;
+            *t = std::time::Instant::now();
+            v
+        };
+        let mut t = std::time::Instant::now();
         let scene = match (pre.depth, &mut self.depth, truth) {
             // Two cameras: SGBM on the pair, metric, NaN where it could not match. No right image is an error, not a
             // reason to guess from the left one.
@@ -788,6 +806,7 @@ impl MlPipeline {
             (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
             (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
         };
+        ms.depth = lap(&mut t);
         let mut depth = scene.depth;
         let seg = scene.segmentation;
         let normals = scene.normals.filter(|_| self.fix.normals);
@@ -798,12 +817,18 @@ impl MlPipeline {
             (DepthEngine::Model(m), Some(cfg)) if m.stereo_rig().is_none() => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
         };
+        ms.align = lap(&mut t);
         let mut points = match (pre.points, &mut self.locate, truth) {
             (Some(p), LocateEngine::Model(_), _) => p,
-            (_, LocateEngine::Model(m), _) => m.locate(rgb, &self.labels)?,
+            (_, LocateEngine::Model(m), _) => {
+                // A perforated pass keeps its dense band on this camera's horizon.
+                m.set_camera(Some(intr));
+                m.locate(rgb, &self.labels)?
+            }
             (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
             (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
         };
+        ms.locate = lap(&mut t);
         let pyramid = self.fix.pyramid.map(|cfg| {
             let pyr = Pyramid::for_frame(rgb.width, rgb.height, &cfg);
             let view = noto_vision::pyramid::View { intr, pose, height };
@@ -817,8 +842,10 @@ impl MlPipeline {
             }
             rep
         });
+        ms.pyramid = lap(&mut t);
         let prompts = self.prompts_for(&points, Some(wanted), floor);
         let tracks = self.tracker.update(rgb, Some(&depth), &prompts)?;
+        ms.track = lap(&mut t);
         let pick = tracks
             .iter()
             .filter(|t| wanted.contains(&t.label))
@@ -894,7 +921,7 @@ impl MlPipeline {
                 }
             }
         }
-        Ok(MlFrame { depth, align, depth_metrics: depth_m, points, tracks, target, locate_err_px: loc_err, track_iou_truth: iou, range_true_m: range_true, truth_entity: entity, pyramid })
+        Ok(MlFrame { depth, align, depth_metrics: depth_m, points, tracks, target, locate_err_px: loc_err, track_iou_truth: iou, range_true_m: range_true, truth_entity: entity, pyramid, stage_ms: ms })
     }
 }
 
