@@ -113,8 +113,18 @@ pub fn present(m: &ModelSpec) -> bool {
 }
 
 /// Whether the eye needs this model: a stereo pair measures depth with SGBM and has no use for TIPSv2.
+/// `NOTO_SAM=1`: track masks with MobileSAM. Without it the masks come from region growing kept to each item's
+/// size (`Runtime::use_region_tracker_clamped`): on the RX 6600 SAM took 13.8 s of a 17 s keyframe (its depthwise
+/// convolutions go to the host one channel group at a time), region growing 7 ms
+/// (docs/research/ml-perforated.md, the hybrid section).
+pub const SAM_ENV: &str = "NOTO_SAM";
+
+pub fn sam_opt_in() -> bool {
+    std::env::var(SAM_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
 pub fn needed(m: &ModelSpec, stereo: bool) -> bool {
-    !(stereo && m.id == "tips")
+    !(stereo && m.id == "tips") && (m.id != "sam" || sam_opt_in())
 }
 
 pub fn missing(stereo: bool) -> Vec<&'static ModelSpec> {
@@ -407,7 +417,7 @@ pub async fn models_delete(state: App<'_>, id: String) -> Result<Value, String> 
                 "siglip2" => rt.use_oracle(),
                 "ttm" => rt.attach_ttm(None),
                 "tips" => rt.use_depth_stand_in(),
-                _ => rt.use_region_tracker(),
+                _ => rt.use_region_tracker_clamped(),
             }
             Ok(())
         })?;
@@ -495,7 +505,11 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
         } else {
             step("tips", &mut || rt.use_tips(&tips_dir(), &device))?;
         }
-        step("sam", &mut || rt.use_sam(&sam_dir(), &device))?;
+        if sam_opt_in() {
+            step("sam", &mut || rt.use_sam(&sam_dir(), &device))?;
+        } else {
+            rt.use_region_tracker_clamped();
+        }
         let v = rt.api_models_status()?;
         let dev = |k: &str| v["devices"][k].as_str().unwrap_or("-").to_string();
         let depth = if stereo { "sgbm" } else { "tips" };

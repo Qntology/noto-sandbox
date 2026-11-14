@@ -1295,7 +1295,13 @@ fn ml_ab_quests() {
     let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
     let bank = bank_dir();
     let mut rows: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
-    for arm in ["standin", "honest", "real_v0.9", "real_v1.0", "real_v1.3"] {
+    // `MLAB_QUEST_ARMS=real_v1.3`: only some arms. Each arm also reports where its keyframes spent their time.
+    let want: Vec<String> = std::env::var("MLAB_QUEST_ARMS").map(|v| v.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default();
+    let mut stage: BTreeMap<&str, BTreeMap<&str, Vec<f64>>> = BTreeMap::new();
+    for arm in ["standin", "honest", "real_v0.9", "real_v1.0", "real_v1.3", "real_v1.3_region", "real_v1.3_region_clamp"] {
+        if !want.is_empty() && !want.iter().any(|w| w == arm) {
+            continue;
+        }
         let siglip = arm.starts_with("real").then(|| {
             let mut s = noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
             s.set_position_antialias(arm != "real_v0.9");
@@ -1307,20 +1313,30 @@ fn ml_ab_quests() {
                 let mut rt = Runtime::new(cfg, LEX, None).expect("runtime");
                 match arm {
                     "honest" => rt.use_honest_stand_ins(),
-                    "real_v0.9" | "real_v1.0" | "real_v1.3" => {
+                    "real_v0.9" | "real_v1.0" | "real_v1.3" | "real_v1.3_region" | "real_v1.3_region_clamp" => {
                         match arm {
                             "real_v0.9" => rt.ml_pipeline_mut().fix = MlFixCfg::legacy(),
                             "real_v1.0" => rt.ml_pipeline_mut().fix.pyramid = None,
                             _ => {}
                         }
                         rt.use_tips(&tips_dir, &dev).expect("TIPS");
-                        rt.use_sam(&sam_dir, &dev).expect("SAM");
+                        // The region arms track without SAM: region growing, alone or kept to the item's size.
+                        match arm {
+                            "real_v1.3_region" => rt.use_region_tracker(),
+                            "real_v1.3_region_clamp" => rt.use_region_tracker_clamped(),
+                            _ => rt.use_sam(&sam_dir, &dev).expect("SAM"),
+                        }
                         rt.use_siglip(Arc::clone(siglip.as_ref().unwrap()), Some(&bank)).expect("SigLIP2");
                     }
                     _ => {}
                 }
                 let t = std::time::Instant::now();
                 let st = run_quest(&mut rt, cmd, seed, BaseKind::HumanFoot);
+                if let Some(d) = out_dir() {
+                    std::fs::create_dir_all(&d).unwrap();
+                    let k = cmds.iter().position(|c| c == cmd).unwrap_or(0);
+                    std::fs::write(d.join(format!("quest_{arm}_{k}_{seed}.json")), serde_json::to_string_pretty(&st).unwrap()).unwrap();
+                }
                 let dec = st["decide"]["keyframes"].as_array().cloned().unwrap_or_default();
                 let mut kinds: BTreeMap<String, u32> = BTreeMap::new();
                 for k in &dec {
@@ -1329,9 +1345,30 @@ fn ml_ab_quests() {
                     }
                 }
                 let tracked = dec.iter().filter(|k| !k["ml"]["target"].is_null()).count();
+                let book = stage.entry(arm).or_default();
+                for k in &dec {
+                    let Some(ms) = k["ml"]["stage_ms"].as_object() else { continue };
+                    let mut total = 0.0;
+                    for (name, v) in ms {
+                        let v = v.as_f64().unwrap_or(0.0);
+                        total += v;
+                        let key: &str = match name.as_str() {
+                            "depth" => "depth",
+                            "align" => "align",
+                            "locate" => "locate",
+                            "pyramid" => "pyramid",
+                            _ => "track",
+                        };
+                        book.entry(key).or_default().push(v);
+                    }
+                    book.entry("total").or_default().push(total);
+                    book.entry(if k["ml"]["target"].is_null() { "total_untracked" } else { "total_tracked" }).or_default().push(total);
+                }
                 let q = &st["ml_quest"];
                 let row = serde_json::json!({
                     "cmd": cmd, "seed": seed,
+                    "off_mask": dec.iter().filter(|k| k["ml"]["flags"].as_array().is_some_and(|f| f.iter().any(|x| x == "peak_off_mask"))).count(),
+                    "semantic_mismatch": dec.iter().filter(|k| k["decision"]["label"].as_str().is_some_and(|l| l.contains("semantic_mismatch"))).count(),
                     "game": st["game_quest"]["state"], "ml": q["state"], "failure": q["failure"]["code"],
                     "time_s": q["result"]["time_s"], "wasted": q["result"]["wasted_actions"], "precision": q["result"]["precision"],
                     "keyframes": dec.len(), "tracked": tracked, "decisions": kinds, "modes": st["modes"], "wall_s": t.elapsed().as_secs_f32(),
@@ -1348,6 +1385,14 @@ fn ml_ab_quests() {
         let time: Vec<f64> = r.iter().filter(|x| x["ml"] == "done").filter_map(|x| x["time_s"].as_f64()).collect();
         let mean_t = if time.is_empty() { f64::NAN } else { time.iter().sum::<f64>() / time.len() as f64 };
         println!("[MLAB-Q-SUM] {arm}: ML 패스 성공 {ok}/{} · 게임 패스 {game}/{} · 헛수고 {wasted} · 성공한 퀘스트 평균 {mean_t:.0} s", r.len(), r.len());
+    }
+    for (arm, b) in &stage {
+        let m = |k: &str| b.get(k).filter(|v| !v.is_empty()).map_or("-".to_string(), |v| format!("{:.0}", v.iter().sum::<f64>() / v.len() as f64));
+        let n = |k: &str| b.get(k).map_or(0, |v| v.len());
+        println!(
+            "[MLAB-Q-MS] {arm}: 키프레임 {} (표적 추적 중 {}) · 평균 ms — 깊이 {} · 지면 정렬 {} · 의미 위치 {} · 피라미드 {} · 추적 {} · 합 {} (추적 중 {} · 아닐 때 {})",
+            n("total"), n("total_tracked"), m("depth"), m("align"), m("locate"), m("pyramid"), m("track"), m("total"), m("total_tracked"), m("total_untracked")
+        );
     }
     println!("[MLAB-SUM] 퀘스트 {:.0} s", t0.elapsed().as_secs_f32());
 }
@@ -1858,6 +1903,108 @@ fn ml_perforated() {
         println!("[MLP] 장면별 기록 {}", d.join("mlp.jsonl").display());
     }
     println!("[MLP-SUM] {:.0} s", t0.elapsed().as_secs_f32());
+}
+
+/// Where a keyframe's analysis spends its time with the models the app loads (`MlFixCfg::v1`, the device's default
+/// quantization): the robot walks up to a log and to a parcel from 6.4 m in 0.4 m steps, and each keyframe goes
+/// through the whole analysis (depth, ground fit, semantic layer, pyramid gates, mask tracker). Stage times per
+/// keyframe, split by whether the target was tracked.
+///
+///   cargo test --test ml_ab -- --ignored --nocapture ml_stage_times
+#[test]
+#[ignore]
+fn ml_stage_times() {
+    let dev = device();
+    let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
+    let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
+    let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
+    let siglip = Arc::new(noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2"));
+    let steps: usize = env_list("MLST_STEPS", &[12usize])[0];
+    // `MLST_TRACKERS=sam,region,region_clamp`: the mask tracker each pass runs with.
+    let trackers: Vec<String> = std::env::var("MLST_TRACKERS").unwrap_or_else(|_| "region,region_clamp".into()).split(',').map(|x| x.trim().to_string()).collect();
+    for tracker in &trackers {
+    let mut book: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for label in ["log", "parcel"] {
+        let mut rt = Runtime::new(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), ..RuntimeConfig::default() }, LEX, None).expect("runtime");
+        rt.use_tips(&tips_dir, &dev).expect("TIPS");
+        match tracker.as_str() {
+            "sam" => rt.use_sam(&sam_dir, &dev).expect("SAM"),
+            "region" => rt.use_region_tracker(),
+            _ => rt.use_region_tracker_clamped(),
+        }
+        rt.use_siglip(Arc::clone(&siglip), Some(&bank_dir())).expect("SigLIP2");
+        let mut w = base_world(7, TerrainKind::Open, BaseKind::HumanFoot);
+        w.nodes.clear();
+        w.drops.clear();
+        let (x0, z0, yaw) = (w.agent.x, w.agent.z, w.agent.yaw);
+        place(&mut w, label, 9001, x0 + 6.8 * yaw.cos(), z0 + 6.8 * yaw.sin());
+        let cam = Camera::default();
+        let wanted = vec![label.to_string()];
+        for k in 0..steps {
+            w.agent.x = x0 + 0.4 * k as f32 * yaw.cos();
+            w.agent.z = z0 + 0.4 * k as f32 * yaw.sin();
+            let frame = w.render(&cam);
+            let rgb = Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+            let truth = KeyTruth::capture(&w, &frame);
+            let t = std::time::Instant::now();
+            let out = rt.ml_pipeline_mut().analyse(&rgb, &intrinsics(&w, &cam), &odometry(&w, &cam), Some(&truth), &wanted, &|_| 0.0, None).expect("analyse");
+            let wall = t.elapsed().as_secs_f64() * 1e3;
+            let ms = out.stage_ms;
+            let tracked = out.target.is_some();
+            println!(
+                "[MLST] {tracker} {label} {k:2} ({:.1} m) {} | 깊이 {:.0} · 지면 정렬 {:.0} · 의미 위치 {:.0} · 피라미드 {:.0} · 추적 {:.0} · 전체 {:.0} ms",
+                6.8 - 0.4 * k as f32,
+                if tracked { "추적" } else { "  - " },
+                ms.depth, ms.align, ms.locate, ms.pyramid, ms.track, wall
+            );
+            let side = if tracked { "tracked" } else { "untracked" };
+            for (name, v) in [("depth", ms.depth), ("align", ms.align), ("locate", ms.locate), ("pyramid", ms.pyramid), ("track", ms.track)] {
+                book.entry(format!("{side}/{name}")).or_default().push(v as f64);
+            }
+            book.entry(format!("{side}/wall")).or_default().push(wall);
+        }
+    }
+    for side in ["untracked", "tracked"] {
+        let m = |k: &str| book.get(&format!("{side}/{k}")).filter(|v| !v.is_empty()).map_or("-".to_string(), |v| format!("{:.0}", v.iter().sum::<f64>() / v.len() as f64));
+        let n = book.get(&format!("{side}/wall")).map_or(0, |v| v.len());
+        println!("[MLST-SUM] {tracker} {side} {n} 키프레임 · 평균 ms — 깊이 {} · 지면 정렬 {} · 의미 위치 {} · 피라미드 {} · 추적 {} · 전체 {}", m("depth"), m("align"), m("locate"), m("pyramid"), m("track"), m("wall"));
+    }
+    }
+}
+
+/// The mask and depth models on the GPU device against the CPU, one keyframe: MobileSAM's image encoder (its
+/// depthwise convolutions are grouped convolutions, which candle splits into one convolution per channel group and the
+/// fork's ROCm backend runs each on the host) and TIPSv2's prediction with all its heads.
+///
+///   cargo test --test ml_ab -- --ignored --nocapture ml_device_split
+#[test]
+#[ignore]
+fn ml_device_split() {
+    let dev = device();
+    let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
+    let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
+    let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
+    let scene = scenes().into_iter().find(|s| s.target == Some("log") && s.dist_m == 4.0).unwrap();
+    let shot = shoot(&mut bases, &scene);
+    for (name, d) in [("gpu", dev.clone()), ("cpu", candle_core::Device::Cpu)] {
+        let sam = noto_vision::SamModel::load(&sam_dir, &d).expect("SAM");
+        let mut ms = Vec::new();
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = sam.encode_batch(&[&shot.rgb]).expect("encode");
+            ms.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("[MLDEV] SAM 인코더 {name} ({}): {:.0} · {:.0} · {:.0} ms", noto_ml::device_label(&d), ms[0], ms[1], ms[2]);
+        let mut tips = TipsDepth::load_with(&tips_dir, &d, noto_vision::SceneHeads::ALL).expect("TIPS");
+        tips.set_pyramid(Some(&noto_vision::PyramidCfg::default()));
+        let mut ms = Vec::new();
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let _ = tips.infer_scene(&shot.rgb, noto_vision::SceneHeads::ALL).expect("tips");
+            ms.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("[MLDEV] TIPSv2 깊이 · 분할 · 법선 {name}: {:.0} · {:.0} ms", ms[0], ms[1]);
+    }
 }
 
 /// The tile scan with every tile cropped and encoded (the default) against coarse tiles pooled from one dense pass

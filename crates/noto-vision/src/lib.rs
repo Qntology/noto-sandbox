@@ -31,5 +31,5 @@ pub use pyramid::{cell_geometry, gate_points, snap_points, CellGateCfg, CellGeo,
 pub use tips::{ade_name, InputGrid, TipsConfig, TipsDepth, ADE_SKY};
 pub use sam::{SamCfg, SamModel, SamTracker, SamVariant};
 pub use stereo::{sgbm, stereo_grid, SgbmCfg, SgbmDepth, StereoOut, StereoRig, StereoStats};
-pub use track::{MaskTracker, PointPrompt, RegionCfg, RegionTracker, TrackedMask};
+pub use track::{ExtentClamp, MaskTracker, PointPrompt, RegionCfg, RegionTracker, TrackedMask};
 pub use triangulate::{plan_step, triangulate, Bearing, Fix, TriCfg, TriError, TriStep};

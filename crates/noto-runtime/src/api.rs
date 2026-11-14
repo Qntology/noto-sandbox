@@ -976,7 +976,7 @@ impl Runtime {
         };
         match (which, enabled) {
             ("tips", false) => self.use_depth_stand_in(),
-            ("sam", false) => self.use_region_tracker(),
+            ("sam", false) => self.use_region_tracker_clamped(),
             (w, true) => {
                 let device = sel.backend.device(sel.ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", sel.backend.name()))?;
                 if w == "tips" {

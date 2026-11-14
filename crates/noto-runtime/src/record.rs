@@ -49,6 +49,8 @@ pub struct MlView {
     /// The 1 : 2 : 4 grids this keyframe ran on and what the cross-layer checks changed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pyramid: Option<noto_vision::PyramidReport>,
+    /// Where the analysis spent its time (`ml::StageMs`).
+    pub stage_ms: crate::ml::StageMs,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -180,6 +180,7 @@ impl Runtime {
             features: feats,
             flags: fl,
             pyramid: frame.pyramid,
+            stage_ms: frame.stage_ms,
         };
         let ov = overlay(&frame, kf.intr.width, kf.intr.height, wanted);
         kf.ml_webp = encode_webp(&ov.data, ov.width, ov.height, 70.0).ok().map(|e| e.bytes);

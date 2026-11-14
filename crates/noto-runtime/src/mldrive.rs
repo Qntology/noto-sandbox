@@ -84,7 +84,13 @@ pub(crate) struct MlTask {
     pub blind: u32,
     look_cd: u32,
     deliver_retry: bool,
+    /// Places the robot found no route to (within picking reach either): a sighting there is not the target
+    /// to go for — the item lies beyond the walkable ground, or the semantic peak sits on something out of reach.
+    unreachable: Vec<(f32, f32)>,
 }
+
+/// How near a remembered unreachable place a sighting is taken to be the same unreachable thing, m.
+const UNREACHABLE_RADIUS_M: f32 = 1.0;
 
 enum Flow {
     Continue,
@@ -194,6 +200,7 @@ impl Runtime {
             blind: 0,
             look_cd: 0,
             deliver_retry: false,
+            unreachable: Vec::new(),
         })
     }
 
@@ -414,6 +421,34 @@ impl Runtime {
                     }
                     Flow::Continue
                 }
+                // An approach stops `reach` short of the estimate; when no route ends near that stand-off point (the
+                // item lies against something, or the footprint does not fit there), go for any place within picking
+                // reach of the item itself once before giving the move up. Without it the next keyframe decided the
+                // same refused move again, until the decision budget ran out.
+                Err(ActionError::NoPath)
+                    if t.phase == MlPhase::Look
+                        && matches!(a, Action::MoveTo { reach_m, .. } if reach_m < PICKUP_REACH_M - 0.1)
+                        && matches!(t.queue.front(), Some(Action::Face { .. })) =>
+                {
+                    if let Some(Action::Face { x, z }) = t.queue.front().cloned() {
+                        t.queue.push_front(Action::MoveTo { x, z, reach_m: PICKUP_REACH_M - 0.1 });
+                    }
+                    self.mark_executed(t, format!("{label} 거부(no_path) → 물건까지 손 닿는 거리로"), true);
+                    Flow::Continue
+                }
+                // The move into picking reach of the item was refused as well: no way to get there. Remember the
+                // place, drop the track and the estimate, and look for the item elsewhere (a sighting there is
+                // ignored from now on), instead of deciding the same move every keyframe until the budget runs out.
+                Err(ActionError::NoPath) if t.phase == MlPhase::Look && matches!(a, Action::MoveTo { reach_m, .. } if (reach_m - (PICKUP_REACH_M - 0.1)).abs() < 1e-3) => {
+                    if let Action::MoveTo { x, z, .. } = a {
+                        t.unreachable.push((x, z));
+                    }
+                    t.decider.reset();
+                    self.ml.reset();
+                    t.queue.clear();
+                    self.mark_executed(t, format!("{label} 거부(no_path) → 갈 수 없는 곳으로 기억, 다른 곳을 찾음"), false);
+                    Flow::Continue
+                }
                 Err(e) if t.phase == MlPhase::Look => {
                     t.decider.move_failed();
                     t.queue.clear();
@@ -509,7 +544,12 @@ impl Runtime {
         let tp = ttm.as_deref().map(TtmPredictor);
         let extra: Vec<&dyn Predictor> = tp.iter().map(|p| p as &dyn Predictor).collect();
         let holonomic = self.world.hand.base.holonomic;
-        let mut rep = t.decider.observe(&kf.pose, out.sighting, holonomic, &extra, self.depth_scale(&label));
+        let sighting = out.sighting.filter(|s| {
+            let r = s.depth_range_m.unwrap_or(f32::INFINITY);
+            let at = (s.pose.x + r * s.heading.cos(), s.pose.z + r * s.heading.sin());
+            !(r.is_finite() && t.unreachable.iter().any(|u| (u.0 - at.0).hypot(u.1 - at.1) < UNREACHABLE_RADIUS_M))
+        });
+        let mut rep = t.decider.observe(&kf.pose, sighting, holonomic, &extra, self.depth_scale(&label));
         let off_mask = kf.ml.as_ref().map_or(false, |m| m.flags.iter().any(|f| f == "peak_off_mask"));
         if matches!(rep.decision, Decision::Arrive { .. }) && off_mask {
             t.decider.reset();
@@ -522,7 +562,7 @@ impl Runtime {
             self.sds.record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", true);
         }
 
-        if let (Some(fix), Some(s)) = (&rep.fix, &out.sighting) {
+        if let (Some(fix), Some(s)) = (&rep.fix, &sighting) {
             if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(fix, s)) {
                 let scope = Scope::new(Track::Depth, &self.ml.depth_mode(), &label);
                 self.sds.record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
