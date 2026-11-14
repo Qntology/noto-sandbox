@@ -1705,6 +1705,161 @@ fn ml_quant_screen() {
     println!("[MLQ-SUM] {:.0} s", t0.elapsed().as_secs_f32());
 }
 
+/// The perforated L1 pass (`noto_vision::perforate`) against the full dense pass on the harness's keyframes, with the
+/// model as the app loads it (`LoadOpts::for_device`; `NOTO_QUANT` to change): peak and presence AP, the calibrated
+/// gate's ECE (Platt on the fit seeds, 15 bins on the eval seeds), peaks in the true box and their distance to the
+/// object, far small objects (stone, coal, iron ore, parcel at 7 m) on their own, the peak cell and heat next to the
+/// full pass's, the tokens the encoder ran and the time of a pass.
+///
+///   MLP_ARMS=checker,fovea,checker-x,fovea-x  MLAB_OUT=<dir> (one JSON line per arm and keyframe, `mlp.jsonl`)
+#[test]
+#[ignore]
+fn ml_perforated() {
+    use noto_ml::preprocess::DenseGrid;
+    use noto_vision::perforate::{perforated_heats, PerfPattern, PerforatedCfg};
+    use noto_vision::ExpandCfg;
+
+    let t0 = std::time::Instant::now();
+    let dev = device();
+    let lex = Lexicon::from_json(LEX).unwrap();
+    let prompting = VisionPrompting::from_lexicon_json(LEX).unwrap();
+    let labels: Vec<LabelPrompt> = MlPipeline::stand_in(&lex, 7).labels().to_vec();
+    let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
+    let model = Arc::new(noto_ml::Siglip2::load_with(&sig_dir, &dev, &noto_ml::LoadOpts::for_device(&dev).unwrap()).expect("SigLIP2"));
+    let cfg = LocateCfg { scoring: LocateScoring::Contrast, background: prompting.background.clone(), grid: DenseGrid::pyramid(), ..LocateCfg::default() };
+    let texts = noto_vision::SiglipLocator::with_cfg(Arc::clone(&model), cfg.clone()).label_texts(&labels, &cfg).unwrap();
+    let (scale, bias) = model.logit_scale_bias();
+    let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
+    let shots: Vec<(Scene, Shot)> = scenes().iter().map(|s| (s.clone(), shoot(&mut bases, s))).collect();
+    drop(bases);
+    println!("[MLP] 장치 {} · SigLIP2 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_ml::device_label(&dev), model.quant_plan().tag, shots.len(), t0.elapsed().as_secs_f32());
+
+    let arm_cfg = |name: &str| -> Option<PerforatedCfg> {
+        let x = |pattern| PerforatedCfg { pattern, expand: Some(ExpandCfg::default()) };
+        match name {
+            "checker" => Some(PerforatedCfg { pattern: PerfPattern::Checker, expand: None }),
+            "fovea" => Some(PerforatedCfg { pattern: PerfPattern::Fovea, expand: None }),
+            "checker-x" => Some(x(PerfPattern::Checker)),
+            "fovea-x" => Some(x(PerfPattern::Fovea)),
+            "fovea-x1" => Some(PerforatedCfg { pattern: PerfPattern::Fovea, expand: Some(ExpandCfg { rounds: 1, ..ExpandCfg::default() }) }),
+            "fovea-x-wide" => Some(PerforatedCfg { pattern: PerfPattern::Fovea, expand: Some(ExpandCfg { seed_min: 0.08, seeds_per_label: 3, ..ExpandCfg::default() }) }),
+            other => panic!("unknown arm {other}"),
+        }
+    };
+    let arms: Vec<String> = std::env::var("MLP_ARMS")
+        .unwrap_or_else(|_| "checker,fovea,checker-x,fovea-x,fovea-x1,fovea-x-wide".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    struct Out {
+        points: Vec<SemanticPoint>,
+        ms: f64,
+        first: usize,
+        tokens: usize,
+        evaluated: usize,
+        cells: usize,
+        seeds: usize,
+    }
+    let run = |perf: Option<PerforatedCfg>| -> Vec<Out> {
+        shots
+            .iter()
+            .map(|(_, shot)| {
+                let image = shot.rgb.to_dynamic();
+                let t = std::time::Instant::now();
+                let (heats, rep) = match &perf {
+                    None => {
+                        let d = model.embed_dense_batch_grid(&[image], cfg.grid).unwrap().pop().unwrap();
+                        let n = d.grid_h * d.grid_w;
+                        (label_heats(&d, &texts, &cfg, scale, bias), noto_vision::PerfReport { cells: n, first: n, seeds: 0, opened: 0, tokens_run: n })
+                    }
+                    Some(p) => perforated_heats(&model, &image, &texts, &cfg, p, Some(&shot.intr), scale, bias).unwrap(),
+                };
+                let points = points_with_presence(shot.rgb.width, shot.rgb.height, heats);
+                Out { points, ms: t.elapsed().as_secs_f64() * 1e3, first: rep.first, tokens: rep.tokens_run, evaluated: rep.first + rep.opened, cells: rep.cells, seeds: rep.seeds }
+            })
+            .collect()
+    };
+    // The first frames warm the device up; time the full pass again after the arms so both sides see a warm device.
+    let _ = run(None);
+    let full = run(None);
+    let far_small = |scene: &Scene, label: &str| scene.dist_m >= 7.0 && ["stone", "coal", "iron_ore", "parcel"].contains(&label);
+    let rows: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let score = |name: &str, o: &[Out]| {
+        let mut b = Book::default();
+        for (k, (scene, shot)) in shots.iter().enumerate() {
+            let mut labels_row = Vec::new();
+            b.add("ms", o[k].ms as f32);
+            b.add("first_frac", o[k].first as f32 / o[k].cells as f32);
+            b.add("evaluated_frac", o[k].evaluated as f32 / o[k].cells as f32);
+            b.add("tokens_frac", o[k].tokens as f32 / o[k].cells as f32);
+            b.add("seeds", o[k].seeds as f32);
+            for label in TARGETS {
+                let Some(present) = presence(shot, label) else { continue };
+                let p = o[k].points.iter().find(|p| p.label == label);
+                let q = full[k].points.iter().find(|p| p.label == label);
+                let (peak, pres) = p.map_or((0.0, 0.0), |p| (p.score, p.presence));
+                b.pair("peak", peak, present);
+                b.pair("presence", pres, present);
+                b.pair(if scene.fit() { "peak_fit" } else { "peak_eval" }, peak, present);
+                if far_small(scene, label) {
+                    b.pair("far_small_peak", peak, present);
+                }
+                if let (Some(p), Some(q)) = (p, q) {
+                    b.flag("same_peak_cell", p.heat.argmax().map(|x| (x.0, x.1)) == q.heat.argmax().map(|x| (x.0, x.1)));
+                    b.add("abs_dpeak", (p.score - q.score).abs());
+                    b.add("abs_dpresence", (p.presence - q.presence).abs());
+                }
+                let in_box = p.map(|p| peak_in_box(shot, p));
+                if present {
+                    if let Some(p) = p {
+                        b.flag("peak_in_box", peak_in_box(shot, p));
+                        if far_small(scene, label) {
+                            b.flag("far_small_in_box", peak_in_box(shot, p));
+                        }
+                        if let Some(e) = locate_err(shot, p) {
+                            b.add("locate_err_px", e);
+                        }
+                    }
+                }
+                labels_row.push(serde_json::json!([label, present, peak, pres, in_box]));
+            }
+            rows.lock().unwrap().push(serde_json::json!({"plan": name, "scene": scene.id(), "fit": scene.fit(), "labels": labels_row}).to_string());
+        }
+        let f = |k: &str| b.mean(k).map_or("-".into(), |(v, _)| format!("{v:.4}"));
+        let o3 = |x: Option<f32>| x.map_or("-".into(), |v| format!("{v:.4}"));
+        let (pa, pp, pos, n) = b.rank("peak");
+        let (_, rp, _, _) = b.rank("presence");
+        let (_, fp, fpos, fnn) = b.rank("far_small_peak");
+        let ece = match (b.pairs.get("peak_fit"), b.pairs.get("peak_eval")) {
+            (Some((fs, fh)), Some((es, eh))) => noto_vision::calib::platt_fit(fs, fh).and_then(|(a, c)| {
+                let probs: Vec<f32> = es.iter().map(|s| 1.0 / (1.0 + (-(a * s + c)).exp())).collect();
+                noto_vision::calib::ece(&probs, eh, noto_vision::calib::ECE_BINS)
+            }),
+            _ => None,
+        };
+        println!(
+            "[MLP] {name} | 첫 패스 칸 {} · 평가한 칸 {} · 인코더 토큰 {} · 시드 {} | peak AUROC {} AP {} · presence AP {} (양성 {pos}/{n}) · 보정 ECE {} · 상자 안 피크 {} · 위치 오차 {} px | 먼 작은 물체 AP {} (양성 {fpos}/{fnn}) · 상자 안 {} | 전체 패스 대비 같은 피크 칸 {} · |Δpeak| {} · |Δpresence| {} | ms {} (중앙 {})",
+            f("first_frac"), f("evaluated_frac"), f("tokens_frac"), f("seeds"), o3(pa), o3(pp), o3(rp), o3(ece), f("peak_in_box"), f("locate_err_px"), o3(fp), f("far_small_in_box"),
+            f("same_peak_cell"), f("abs_dpeak"), f("abs_dpresence"), f("ms"), b.median("ms").map_or("-".into(), |v| format!("{v:.1}")),
+        );
+    };
+    score("full", &full);
+    for name in &arms {
+        let o = run(arm_cfg(name));
+        score(name, &o);
+    }
+    let again = run(None);
+    score("full (again)", &again);
+    if let Some(d) = out_dir() {
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("mlp.jsonl"), rows.lock().unwrap().join("\n")).unwrap();
+        println!("[MLP] 장면별 기록 {}", d.join("mlp.jsonl").display());
+    }
+    println!("[MLP-SUM] {:.0} s", t0.elapsed().as_secs_f32());
+}
+
 /// The tile scan with every tile cropped and encoded (the default) against coarse tiles pooled from one dense pass
 /// (`EmbeddingCfg::dense`: the L1 pass gives the L0 tiles; with `crop_finest` the finest level is still cropped): the
 /// candidates' AUROC (score against a same-label object within 1 m), the gate's precision, recall, false passes per

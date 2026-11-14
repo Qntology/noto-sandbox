@@ -15,7 +15,7 @@ pub mod vocab;
 pub use classify::{classify, Anchors, DictEntry, Dictionary, Prediction};
 pub use config::Siglip2Config;
 pub use device::{device_label, preferred, probe_backends, select, trim_idle_pool, Backend, BackendStatus, BatchPolicy, Selection};
-pub use model::{DenseEmbedding, LoadOpts, Siglip2};
+pub use model::{DenseEmbedding, LoadOpts, Siglip2, SparseDense};
 pub use parallel::{BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};
 pub use quant::{QLinear, QType, QWeights, QuantPlan, QuantStats};
 pub use vocab::{VocabPolicy, VocabStats};

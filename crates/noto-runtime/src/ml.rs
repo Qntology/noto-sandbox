@@ -800,7 +800,11 @@ impl MlPipeline {
         };
         let mut points = match (pre.points, &mut self.locate, truth) {
             (Some(p), LocateEngine::Model(_), _) => p,
-            (_, LocateEngine::Model(m), _) => m.locate(rgb, &self.labels)?,
+            (_, LocateEngine::Model(m), _) => {
+                // A perforated pass keeps its dense band on this camera's horizon.
+                m.set_camera(Some(intr));
+                m.locate(rgb, &self.labels)?
+            }
             (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
             (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
         };

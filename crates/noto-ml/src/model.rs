@@ -12,7 +12,7 @@ use crate::preprocess::{preprocess, preprocess_grid, DenseGrid, NaflexInput};
 use crate::quant::{Family, QWeights, QuantPlan, QuantStats};
 use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
-use crate::vision::VisionTower;
+use crate::vision::{SparsePass, VisionTower};
 use crate::vocab::{MappedRows, TokenTable, VocabPolicy, VocabStats};
 
 /// `NOTO_FUSED_QKV=1`: the vision tower's query, key and value projections as one GEMM.
@@ -49,6 +49,27 @@ pub struct DenseEmbedding {
     pub vectors: Vec<Vec<f32>>,
     pub attention: Vec<f32>,
     pub pooled: Vec<f32>,
+}
+
+/// A dense pass over some cells of the patch grid (`Siglip2::embed_dense_sparse`, more cells with `open_cells`): the
+/// unit vector of every cell evaluated so far (row-major, `None` for a hole) and the pooled embedding over them.
+#[derive(Clone, Debug)]
+pub struct SparseDense {
+    pub grid_h: usize,
+    pub grid_w: usize,
+    pub vectors: Vec<Option<Vec<f32>>>,
+    pub pooled: Vec<f32>,
+    /// Tokens that went through the encoder, over all passes (a cell computed again counts again).
+    pub tokens_run: usize,
+    input: NaflexInput,
+    pass: SparsePass,
+}
+
+impl SparseDense {
+    /// Cells with a vector.
+    pub fn evaluated(&self) -> usize {
+        self.vectors.iter().filter(|v| v.is_some()).count()
+    }
 }
 
 pub struct Siglip2 {
@@ -311,6 +332,48 @@ impl Siglip2 {
         Ok(out.into_iter().map(|d| d.expect("every input is in one chunk")).collect())
     }
 
+    /// The (grid_h, grid_w) of the dense pass on `grid` for a `width` × `height` image.
+    pub fn dense_grid(&self, width: u32, height: u32, grid: DenseGrid) -> (usize, usize) {
+        grid.grid_for(width, height, self.config.patch_size, self.config.max_patches)
+    }
+
+    /// The dense pass over the cells `cells` of `grid`'s grid only (row-major, see `dense_grid`): the other patches are
+    /// left out of the encoder (not blacked out), each evaluated patch keeps its own cell's position. With every cell
+    /// in order the vectors are `embed_dense_batch_grid`'s.
+    pub fn embed_dense_sparse(&self, image: &DynamicImage, grid: DenseGrid, cells: &[u32]) -> Result<SparseDense> {
+        let (gh, gw) = self.dense_grid(image.width(), image.height(), grid);
+        let input = preprocess_grid(image, &self.config, gh, gw);
+        let pass = self.vision.forward_sparse(&input, cells)?;
+        let mut sd = SparseDense { grid_h: gh, grid_w: gw, vectors: vec![None; gh * gw], pooled: Vec::new(), tokens_run: cells.len(), input, pass };
+        self.fill_sparse(&mut sd, None)?;
+        Ok(sd)
+    }
+
+    /// Evaluates `cells` on top of the cells `sd` has: they attend to everything evaluated so far, whose features stay
+    /// (a cell listed again is computed anew with its new neighbours). The pooled embedding is taken over all of them.
+    pub fn open_cells(&self, sd: &mut SparseDense, cells: &[u32]) -> Result<()> {
+        if cells.is_empty() {
+            return Ok(());
+        }
+        let more = self.vision.extend_sparse(&sd.input, &sd.pass, cells)?;
+        sd.tokens_run += cells.len();
+        sd.pass = self.vision.merge_sparse(&sd.pass, &more)?;
+        self.fill_sparse(sd, Some(&more))
+    }
+
+    /// The vectors of `fresh`'s cells (all of the pass's when `None`) and the pooled embedding over the whole pass.
+    fn fill_sparse(&self, sd: &mut SparseDense, fresh: Option<&SparsePass>) -> Result<()> {
+        let pooled = self.vision.head_pooled(&sd.pass.tokens)?;
+        let src = fresh.unwrap_or(&sd.pass);
+        let dense = l2_normalize(&self.vision.head_dense(&src.tokens)?)?.squeeze(0)?.to_vec2::<f32>()?;
+        for (c, v) in src.cells.iter().zip(dense) {
+            sd.vectors[*c as usize] = Some(v);
+        }
+        sd.pooled = l2_normalize(&pooled)?.flatten_all()?.to_vec1()?;
+        trim_idle_pool(&self.device);
+        Ok(())
+    }
+
     pub fn embed_dense(&self, image: &DynamicImage) -> Result<DenseEmbedding> {
         let input = preprocess(image, &self.config);
         let (dense, attn, pooled) = self.vision.forward_dense(&input)?;
@@ -467,6 +530,41 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
             Rgb([(x * 7 % 256) as u8, (y * 13 % 256) as u8, 128])
         }))
+    }
+
+    #[test]
+    fn a_sparse_pass_over_every_cell_is_the_dense_pass_and_opened_cells_leave_the_first_ones_alone() {
+        let m = tiny_model();
+        let img = test_image(24, 16);
+        let grid = DenseGrid::Pyramid { short_side: 3 };
+        let full = m.embed_dense_batch_grid(&[img.clone()], grid).unwrap().pop().unwrap();
+        let (gh, gw) = m.dense_grid(24, 16, grid);
+        assert_eq!((gh, gw), (full.grid_h, full.grid_w));
+        let n = (gh * gw) as u32;
+        let all: Vec<u32> = (0..n).collect();
+        let sd = m.embed_dense_sparse(&img, grid, &all).unwrap();
+        let vecs: Vec<Vec<f32>> = sd.vectors.iter().map(|v| v.clone().unwrap()).collect();
+        assert_eq!(vecs, full.vectors, "every cell in order is the dense pass, bit for bit");
+        assert_eq!(sd.pooled, full.pooled);
+
+        let (even, odd): (Vec<u32>, Vec<u32>) = all.iter().partition(|c| *c % 2 == 0);
+        let mut sd = m.embed_dense_sparse(&img, grid, &even).unwrap();
+        assert_eq!(sd.evaluated(), even.len());
+        assert!(odd.iter().all(|c| sd.vectors[*c as usize].is_none()));
+        assert_ne!(sd.vectors[0].as_ref().unwrap(), &full.vectors[0], "the holes are absent, so the context differs");
+        let before = sd.vectors.clone();
+        m.open_cells(&mut sd, &odd).unwrap();
+        assert_eq!(sd.evaluated(), n as usize);
+        assert_eq!(sd.tokens_run, n as usize);
+        for c in &even {
+            assert_eq!(sd.vectors[*c as usize], before[*c as usize], "opening cells keeps the earlier cells' features");
+        }
+        // Every cell again, nothing left as context: the dense pass once more.
+        m.open_cells(&mut sd, &all).unwrap();
+        let vecs: Vec<Vec<f32>> = sd.vectors.iter().map(|v| v.clone().unwrap()).collect();
+        assert_eq!(vecs, full.vectors);
+        assert_eq!(sd.pooled, full.pooled);
+        assert!(m.embed_dense_sparse(&img, grid, &[n]).is_err(), "a cell outside the grid");
     }
 
     #[test]

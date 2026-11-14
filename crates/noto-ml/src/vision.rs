@@ -5,7 +5,7 @@ use candle_core::{Device, Result, Tensor};
 use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
 
 use crate::config::Siglip2Config;
-use crate::encoder::{to_candle, EncoderLayer, Mlp};
+use crate::encoder::{to_candle, EncoderLayer, LayerKv, Mlp};
 use crate::preprocess::NaflexInput;
 use crate::quant::{Family, QLinear, QWeights};
 
@@ -276,4 +276,107 @@ impl VisionTower {
     pub fn forward_batch(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
         self.head.forward(&self.batch_tokens(inputs)?)
     }
+
+    /// The patches of `input` at `cells` (row-major grid cells) through the patch projection, each with its own cell's
+    /// position embedding.
+    fn cell_tokens(&self, input: &NaflexInput, cells: &[u32]) -> Result<Tensor> {
+        let (gh, gw, pd) = (input.grid_h, input.grid_w, input.patch_dim);
+        let n = gh * gw;
+        let mut flat = Vec::with_capacity(cells.len() * pd);
+        for &c in cells {
+            let c = c as usize;
+            if c >= n {
+                candle_core::bail!("cell {c} is outside the {gh}x{gw} grid");
+            }
+            flat.extend_from_slice(&input.patches[c * pd..(c + 1) * pd]);
+        }
+        let patches = Tensor::from_vec(flat, (1, cells.len(), pd), &self.device)?;
+        let rows = Tensor::from_slice(cells, cells.len(), &self.device)?;
+        let pos = self.positions(gh, gw)?.index_select(&rows, 1)?;
+        self.patch_proj.forward(&patches)?.broadcast_add(&pos)
+    }
+
+    /// The encoder over some of the grid's patches only: the tokens of `cells` attend to each other and nothing else
+    /// (the holes are not black patches, they are absent). With every cell in grid order this is `forward_dense`'s pass.
+    pub fn forward_sparse(&self, input: &NaflexInput, cells: &[u32]) -> Result<SparsePass> {
+        let mut x = self.cell_tokens(input, cells)?;
+        let mut kv = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let (y, layer_kv) = layer.forward_kv(&x, None)?;
+            x = y;
+            kv.push(layer_kv);
+        }
+        Ok(SparsePass { cells: cells.to_vec(), tokens: self.post_ln.forward(&x)?, kv })
+    }
+
+    /// Opens more cells on top of `first`: the tokens of `cells` attend, at every layer, to each other and to `first`'s
+    /// tokens (their keys and values as `first` computed them). A cell of `first` listed again is computed anew (with the
+    /// opened ones around it) and leaves the context. `first`'s other tokens keep their features.
+    pub fn extend_sparse(&self, input: &NaflexInput, first: &SparsePass, cells: &[u32]) -> Result<SparsePass> {
+        let again: std::collections::HashSet<u32> = cells.iter().copied().collect();
+        let keep: Vec<u32> = first.cells.iter().enumerate().filter(|(_, c)| !again.contains(c)).map(|(i, _)| i as u32).collect();
+        let context: Option<Vec<LayerKv>> = if keep.len() == first.cells.len() {
+            None
+        } else if keep.is_empty() {
+            Some(Vec::new())
+        } else {
+            let rows = Tensor::from_slice(&keep, keep.len(), &self.device)?;
+            Some(first.kv.iter().map(|kv| kv.select(&rows)).collect::<Result<_>>()?)
+        };
+        let mut x = self.cell_tokens(input, cells)?;
+        let mut kv = Vec::with_capacity(self.layers.len());
+        for (i, layer) in self.layers.iter().enumerate() {
+            let ctx = match &context {
+                None => Some(&first.kv[i]),
+                Some(v) => v.get(i),
+            };
+            let (y, layer_kv) = layer.forward_kv(&x, ctx)?;
+            x = y;
+            kv.push(layer_kv);
+        }
+        Ok(SparsePass { cells: cells.to_vec(), tokens: self.post_ln.forward(&x)?, kv })
+    }
+
+    /// `first` with `second` (an `extend_sparse` of it) folded in: the cells `second` computed anew take their new
+    /// tokens, keys and values, so a further `extend_sparse` attends to every cell opened so far.
+    pub fn merge_sparse(&self, first: &SparsePass, second: &SparsePass) -> Result<SparsePass> {
+        let again: std::collections::HashSet<u32> = second.cells.iter().copied().collect();
+        let keep: Vec<u32> = first.cells.iter().enumerate().filter(|(_, c)| !again.contains(c)).map(|(i, _)| i as u32).collect();
+        let mut cells: Vec<u32> = keep.iter().map(|&i| first.cells[i as usize]).collect();
+        cells.extend_from_slice(&second.cells);
+        if keep.is_empty() {
+            return Ok(SparsePass { cells, tokens: second.tokens.clone(), kv: second.kv.clone() });
+        }
+        let rows = Tensor::from_slice(&keep, keep.len(), &self.device)?;
+        let tokens = Tensor::cat(&[&first.tokens.index_select(&rows, 1)?, &second.tokens], 1)?;
+        let kv = first
+            .kv
+            .iter()
+            .zip(&second.kv)
+            .map(|(a, b)| {
+                let a = a.select(&rows)?;
+                Ok(LayerKv { k: Tensor::cat(&[&a.k, &b.k], 2)?, v: Tensor::cat(&[&a.v, &b.v], 2)? })
+            })
+            .collect::<Result<_>>()?;
+        Ok(SparsePass { cells, tokens, kv })
+    }
+
+    /// The head's per-token value path (dense features) on some tokens (1, n, d).
+    pub fn head_dense(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.head.dense(tokens)
+    }
+
+    /// The head's pooled embedding of some tokens (1, n, d).
+    pub fn head_pooled(&self, tokens: &Tensor) -> Result<Tensor> {
+        self.head.forward(tokens)
+    }
+}
+
+/// An encoder pass over some cells of a patch grid (`VisionTower::forward_sparse` / `extend_sparse`): the cells, their
+/// tokens after the last layer (1, cells, hidden), and every layer's keys and values for a later pass to attend to.
+#[derive(Clone, Debug)]
+pub struct SparsePass {
+    pub cells: Vec<u32>,
+    pub tokens: Tensor,
+    kv: Vec<LayerKv>,
 }
