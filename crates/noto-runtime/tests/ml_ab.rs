@@ -846,7 +846,16 @@ fn ml_ab_benchmark() {
     let mut tips = TipsDepth::load(&PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR")), &dev).expect("TIPS");
     let sam = Arc::new(SamModel::load(&PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR")), &dev).expect("SAM"));
     let (scale, bias) = siglip.logit_scale_bias();
-    println!("[MLAB] 장치 {} · SigLIP2 exp(t) {scale:.1}, b {bias:.2} (짝 확률 0.5인 코사인 {:.3})", noto_ml::device_label(&dev), -bias / scale);
+    // A quantized SigLIP2 runs its locator under `<settings>+q-<plan>` (`SiglipLocator`): the fitted table carries the
+    // same mode, so the runtime finds it only for the model it was fitted on.
+    let msuf = siglip.mode_suffix();
+    println!(
+        "[MLAB] 장치 {} · SigLIP2 exp(t) {scale:.1}, b {bias:.2} (짝 확률 0.5인 코사인 {:.3}) · 양자화 SigLIP2 {:?} · TIPS {:?}",
+        noto_ml::device_label(&dev),
+        -bias / scale,
+        siglip.quant_plan().tag,
+        tips.quant_plan().tag
+    );
     let mut scenes = scenes();
     scenes.sort_by_key(|s| !s.fit());
     let n_fit = scenes.iter().filter(|s| s.fit()).count();
@@ -903,7 +912,7 @@ fn ml_ab_benchmark() {
     if let Some(t) = &shipped {
         let dense = t.iter().find(|x| x.mode.starts_with("siglip2-dense")).unwrap().clone();
         let scan_t = t.iter().find(|x| x.mode == noto_runtime::embedding::SCAN_CALIB_MODE).unwrap().clone();
-        let vk = (1..variants.len()).find(|k| variants[*k].1.mode() == dense.mode).unwrap_or_else(|| panic!("no locator variant scores like the shipped table {}", dense.mode));
+        let vk = (1..variants.len()).find(|k| format!("{}{msuf}", variants[*k].1.mode()) == dense.mode).unwrap_or_else(|| panic!("no locator variant of this model scores like the shipped table {}", dense.mode));
         println!("[MLAB] 실린 보정 사용: 위치 {} · {} / 스캔 라벨 {}개", dense.mode, dense.statistic, scan_t.labels.len());
         scan_cal.set_calibration(Some(scan_t.clone()));
         tables = vec![dense, scan_t];
@@ -936,7 +945,7 @@ fn ml_ab_benchmark() {
                 let (best_ap, vk, vstat) = best.expect("a locator statistic");
                 let (vname, vcfg) = variants[vk].clone();
                 println!("[MLAB] 게이트 통계: {vname} · {vstat} (맞춤 시드 AP {best_ap:.3})");
-                let mut table = CalibTable { mode: vcfg.mode(), statistic: vstat.into(), note: format!("ml_ab.rs 맞춤 시드, 정밀도 {CALIB_PRECISION} (없으면 FPR {CALIB_FPR})"), ..CalibTable::default() };
+                let mut table = CalibTable { mode: format!("{}{msuf}", vcfg.mode()), statistic: vstat.into(), note: format!("ml_ab.rs 맞춤 시드, 정밀도 {CALIB_PRECISION} (없으면 FPR {CALIB_FPR})"), ..CalibTable::default() };
                 for l in TARGETS {
                     if let Some((sc, h)) = book.pairs.get(&format!("{vname}/fit/{vstat}/{l}")) {
                         if let Some(c) = fit_label(sc, h, CALIB_PRECISION, CALIB_FPR) {
@@ -1250,9 +1259,10 @@ fn a5_arms(lex: &Lexicon, prompting: &VisionPrompting, table: &CalibTable, vk: u
     let vcfg = LocateCfg::from_mode(&table.mode, &prompting.background, &prompting.templates).expect("a dense locator mode");
     let mut fix = MlFixCfg::v1(prompting);
     fix.locate = vcfg.clone();
-    let mut x = arm("A5", lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(sam))), d, p, "tipsv2-b14-dpt", &vcfg.mode(), fix.clone());
+    // The arms' locator runs under the table's mode (the model's quantization suffix included), as the runtime's would.
+    let mut x = arm("A5", lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(sam))), d, p, "tipsv2-b14-dpt", &table.mode, fix.clone());
     x.pipe.calib = vec![table.clone()];
-    let mut y = arm("A5region", lex, Src::Model, Src::Model, Box::new(RegionTracker::default()), d, p, "tipsv2-b14-dpt", &vcfg.mode(), fix);
+    let mut y = arm("A5region", lex, Src::Model, Src::Model, Box::new(RegionTracker::default()), d, p, "tipsv2-b14-dpt", &table.mode, fix);
     y.pipe.calib = vec![table.clone()];
     (x, y, vk)
 }
@@ -1411,6 +1421,382 @@ fn ml_port_dump() {
     });
     std::fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&meta).unwrap()).unwrap();
     println!("[MLAB] 비교 입력 {}", dir.display());
+}
+
+/// The pyramid plans the screen compares (`MLQ_PLANS`, `|`-separated `NOTO_QUANT` specs): the F32 load again (it
+/// must give the reference's numbers), the instruction's pyramid, everything at Q8_0, then one group at a time at its
+/// pyramid tier so that each group's cost shows on its own.
+fn screen_plans() -> Vec<String> {
+    match std::env::var("MLQ_PLANS") {
+        Ok(v) => v.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Err(_) => [
+            "f32",
+            "pyramid",
+            "q8",
+            "f32;sv.head=q8_0",
+            "f32;sv.attn.edge=q8_0",
+            "f32;sv.mlp.edge=q8_0",
+            "f32;sv.attn.mid=q6k",
+            "f32;sv.fc2.mid=q6k",
+            "f32;sv.fc1.mid=q4k",
+            "f32;st=q8_0",
+            "f32;st.attn.mid=q6k,st.fc2.mid=q6k,st.fc1.mid=q4k",
+            "f32;tv.readout=q8_0",
+            "f32;tv.attn.edge=q8_0",
+            "f32;tv.mlp.edge=q8_0",
+            "f32;tv.attn.mid=q6k",
+            "f32;tv.fc2.mid=q6k",
+            "f32;tv.fc1.mid=q4k",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    }
+}
+
+struct LocOut {
+    dense: Vec<Vec<f32>>,
+    pooled: Vec<f32>,
+    points: Vec<SemanticPoint>,
+    ms: f64,
+}
+
+struct DepOut {
+    raw: DepthMap,
+    spread: DepthMap,
+    ms: f64,
+}
+
+fn cos(a: &[f32], b: &[f32]) -> f32 {
+    let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        ab += (*x as f64) * (*y as f64);
+        aa += (*x as f64).powi(2);
+        bb += (*y as f64).powi(2);
+    }
+    (ab / (aa.sqrt() * bb.sqrt()).max(1e-30)) as f32
+}
+
+fn quantile(mut v: Vec<f32>, q: f32) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    Some(v[((v.len() - 1) as f32 * q).round() as usize])
+}
+
+/// Per-plan fidelity of the quantized models on the harness's keyframes, against the truth and against the F32 model:
+/// L1 presence AUROC / AP and peaks in the true box, the dense vectors and the peak cell next to the F32 ones; L2 AbsRel
+/// and δ1 (raw and flat-ground aligned, truth ≤ 10 m), the spread flagging > 25 % errors, the depth next to the F32
+/// depth; the time of a pass and the bytes of the linear weights. The F32 models are loaded once; a plan's models are
+/// quantized from the F32 files when they load, one plan at a time.
+///
+///   MLAB_SEEDS=2,4 MLAB_DISTS=2,4,7 MLAB_TILTS=0 SIGLIP2_DIR=... TIPS_DIR=... cargo test --test ml_ab -- --ignored --nocapture ml_quant_screen
+#[test]
+#[ignore]
+fn ml_quant_screen() {
+    use noto_ml::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
+    use noto_ml::preprocess::DenseGrid;
+
+    let t0 = std::time::Instant::now();
+    let dev = device();
+    let lex = Lexicon::from_json(LEX).unwrap();
+    let prompting = VisionPrompting::from_lexicon_json(LEX).unwrap();
+    let labels: Vec<LabelPrompt> = MlPipeline::stand_in(&lex, 7).labels().to_vec();
+    let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
+    let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
+    let cfg = LocateCfg { scoring: LocateScoring::Contrast, background: prompting.background.clone(), grid: DenseGrid::pyramid(), ..LocateCfg::default() };
+    let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
+    let scenes = scenes();
+    let shots: Vec<(Scene, Shot)> = scenes.iter().map(|s| (s.clone(), shoot(&mut bases, s))).collect();
+    drop(bases);
+    println!("[MLQ] 장치 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_ml::device_label(&dev), shots.len(), t0.elapsed().as_secs_f32());
+
+    // `MLQ_FUSED=1`: the plans' vision towers run their Q, K and V as one GEMM (the reference keeps three).
+    let fused = std::env::var("MLQ_FUSED").is_ok_and(|v| v.trim() == "1");
+    let load_sig = |plan: &QuantPlan, fused_qkv: bool| -> Arc<Siglip2> {
+        let t = std::time::Instant::now();
+        let m = Siglip2::load_with(&sig_dir, &dev, &LoadOpts { quant: plan.clone(), vocab: VocabPolicy::Active, fused_qkv }).expect("SigLIP2");
+        println!("[MLQ]   SigLIP2 {:?}{}: {} · 올리기 {:.1} s", plan.tag, if fused_qkv { " fused QKV" } else { "" }, m.quant_stats().summary(), t.elapsed().as_secs_f32());
+        Arc::new(m)
+    };
+    let load_tips = |plan: &QuantPlan| -> TipsDepth {
+        let t = std::time::Instant::now();
+        let mut m = TipsDepth::load_quant(&tips_dir, &dev, noto_vision::SceneHeads::NONE, plan).expect("TIPS");
+        m.set_readout_gelu_tanh(true);
+        println!("[MLQ]   TIPS {:?} ({}): {} · 올리기 {:.1} s", plan.tag, noto_vision::DepthModel::mode(&m), m.quant_stats().summary(), t.elapsed().as_secs_f32());
+        m
+    };
+    let run_loc = |m: &Arc<Siglip2>| -> Vec<LocOut> {
+        let texts = noto_vision::SiglipLocator::with_cfg(Arc::clone(m), cfg.clone()).label_texts(&labels, &cfg).unwrap();
+        let (scale, bias) = m.logit_scale_bias();
+        shots
+            .iter()
+            .map(|(_, shot)| {
+                let t = std::time::Instant::now();
+                let d = m.embed_dense_batch_grid(&[shot.rgb.to_dynamic()], cfg.grid).unwrap().pop().unwrap();
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                let points = points_with_presence(shot.rgb.width, shot.rgb.height, label_heats(&d, &texts, &cfg, scale, bias));
+                LocOut { dense: d.vectors, pooled: d.pooled, points, ms }
+            })
+            .collect()
+    };
+    let run_tips = |m: &TipsDepth| -> Vec<DepOut> {
+        shots
+            .iter()
+            .map(|(_, shot)| {
+                let t = std::time::Instant::now();
+                let (raw, spread) = m.predict_batch_spread(&[&shot.rgb]).unwrap().pop().unwrap();
+                DepOut { raw, spread, ms: t.elapsed().as_secs_f64() * 1e3 }
+            })
+            .collect()
+    };
+    // `MLAB_OUT`: one JSON line per plan and keyframe (label scores and hits, depth errors), for paired bootstrap
+    // intervals of the differences (scripts outside the harness).
+    let out = out_dir();
+    if let Some(d) = &out {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let rows: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let score = |name: &str, loc: Option<&[LocOut]>, dep: Option<&[DepOut]>, rl: &[LocOut], rd: &[DepOut]| {
+        let mut b = Book::default();
+        for (k, (scene, shot)) in shots.iter().enumerate() {
+            let mut row = serde_json::json!({"plan": name, "scene": scene.id(), "fit": scene.fit()});
+            if let Some(loc) = loc {
+                let labels: Vec<serde_json::Value> = TARGETS
+                    .iter()
+                    .filter_map(|l| {
+                        let present = presence(shot, l)?;
+                        let p = loc[k].points.iter().find(|p| p.label == *l);
+                        Some(serde_json::json!([l, present, p.map_or(0.0, |p| p.score), p.map_or(0.0, |p| p.presence), p.map(|p| peak_in_box(shot, p))]))
+                    })
+                    .collect();
+                row["labels"] = labels.into();
+            }
+            if let Some(dep) = dep {
+                let e = depth_eval(&dep[k].raw, &shot.truth, 10.0, shot.target_raw);
+                let mut g = dep[k].raw.clone();
+                let ge = noto_vision::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).and_then(|_| depth_eval(&g, &shot.truth, 10.0, shot.target_raw));
+                row["depth"] = serde_json::json!([e.as_ref().map(|e| e.absrel), e.as_ref().map(|e| e.delta1), ge.as_ref().map(|e| e.absrel), ge.as_ref().map(|e| e.delta1)]);
+            }
+            rows.lock().unwrap().push(row.to_string());
+            if let Some(loc) = loc {
+                let (o, r) = (&loc[k], &rl[k]);
+                b.add("ms_dense", o.ms as f32);
+                let cs: Vec<f32> = o.dense.iter().zip(&r.dense).map(|(a, c)| cos(a, c)).collect();
+                b.add("dense_cos", cs.iter().sum::<f32>() / cs.len().max(1) as f32);
+                b.add("dense_cos_min", cs.iter().copied().fold(1.0, f32::min));
+                b.add("pooled_cos", cos(&o.pooled, &r.pooled));
+                for label in TARGETS {
+                    let Some(present) = presence(shot, label) else { continue };
+                    let p = o.points.iter().find(|p| p.label == label);
+                    let q = r.points.iter().find(|p| p.label == label);
+                    let (peak, pres) = p.map_or((0.0, 0.0), |p| (p.score, p.presence));
+                    b.pair("peak", peak, present);
+                    b.pair("presence", pres, present);
+                    b.pair(if shots[k].0.fit() { "peak_fit" } else { "peak_eval" }, peak, present);
+                    if let (Some(p), Some(q)) = (p, q) {
+                        b.flag("same_peak_cell", p.heat.argmax().map(|x| (x.0, x.1)) == q.heat.argmax().map(|x| (x.0, x.1)));
+                        b.add("abs_dpresence", (p.presence - q.presence).abs());
+                        b.add("abs_dpeak", (p.score - q.score).abs());
+                    }
+                    if present {
+                        if let Some(p) = p {
+                            b.flag("peak_in_box", peak_in_box(shot, p));
+                        }
+                    }
+                }
+            }
+            if let Some(dep) = dep {
+                let (o, r) = (&dep[k], &rd[k]);
+                b.add("ms_tips", o.ms as f32);
+                if let Some(e) = depth_eval(&o.raw, &shot.truth, 10.0, shot.target_raw) {
+                    b.add("absrel", e.absrel);
+                    b.add("delta1", e.delta1);
+                    if let Some(t) = e.target {
+                        b.add("target_absrel", t);
+                    }
+                }
+                let mut g = o.raw.clone();
+                if noto_vision::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).is_some() {
+                    if let Some(e) = depth_eval(&g, &shot.truth, 10.0, shot.target_raw) {
+                        b.add("ground_absrel", e.absrel);
+                        b.add("ground_delta1", e.delta1);
+                    }
+                }
+                let mut dev_px = Vec::new();
+                for y in (0..shot.truth.height).step_by(4) {
+                    for x in (0..shot.truth.width).step_by(4) {
+                        let t = shot.truth.depth[(y * shot.truth.width + x) as usize];
+                        let p = o.raw.at_scaled(x as f32 + 0.5, y as f32 + 0.5, shot.truth.width, shot.truth.height);
+                        let sd = o.spread.at_scaled(x as f32 + 0.5, y as f32 + 0.5, shot.truth.width, shot.truth.height);
+                        let rp = r.raw.at_scaled(x as f32 + 0.5, y as f32 + 0.5, shot.truth.width, shot.truth.height);
+                        if t.is_finite() && t <= 10.0 && p > 0.0 && rp > 0.0 {
+                            b.pair("spread_flags_err", sd / p, (p - t).abs() / t > 0.25);
+                            dev_px.push((p - rp).abs() / rp);
+                        }
+                    }
+                }
+                if let Some(m) = quantile(dev_px.clone(), 0.5) {
+                    b.add("dev_med", m);
+                }
+                if let Some(m) = quantile(dev_px, 0.95) {
+                    b.add("dev_p95", m);
+                }
+            }
+        }
+        let f = |k: &str| b.mean(k).map_or("-".into(), |(v, _)| format!("{v:.4}"));
+        let (pa, pp, pos, n) = b.rank("peak");
+        let (ra, rp, _, _) = b.rank("presence");
+        let (sa, _, _, _) = b.rank("spread_flags_err");
+        // The calibrated gate's ECE: a Platt fit of the peak on the fit seeds, its probabilities on the eval seeds (15 bins).
+        let ece = match (b.pairs.get("peak_fit"), b.pairs.get("peak_eval")) {
+            (Some((fs, fh)), Some((es, eh))) => noto_vision::calib::platt_fit(fs, fh).and_then(|(a, c)| {
+                let probs: Vec<f32> = es.iter().map(|s| 1.0 / (1.0 + (-(a * s + c)).exp())).collect();
+                noto_vision::calib::ece(&probs, eh, noto_vision::calib::ECE_BINS)
+            }),
+            _ => None,
+        };
+        let o3 = |x: Option<f32>| x.map_or("-".into(), |v| format!("{v:.4}"));
+        println!(
+            "[MLQ] {name} | L1 peak AUROC {} AP {} · presence AUROC {} AP {} (양성 {pos}/{n}) · 보정 ECE {} · 상자 안 피크 {} | F32 대비 dense cos {} (최소 {}) · pooled cos {} · 같은 피크 칸 {} · |Δpresence| {} · |Δpeak| {} | L2 AbsRel {} δ1 {} 목표 {} · 평면 정렬 AbsRel {} δ1 {} · spread AUROC {} | F32 대비 깊이 편차 중앙 {} · p95 {} | ms dense {} · tips {}",
+            o3(pa), o3(pp), o3(ra), o3(rp), o3(ece), f("peak_in_box"), f("dense_cos"), f("dense_cos_min"), f("pooled_cos"), f("same_peak_cell"), f("abs_dpresence"), f("abs_dpeak"),
+            f("absrel"), f("delta1"), f("target_absrel"), f("ground_absrel"), f("ground_delta1"), o3(sa), f("dev_med"), f("dev_p95"), f("ms_dense"), f("ms_tips"),
+        );
+    };
+
+    // `MLQ_MODELS=sig` or `tips` screens one model (TIPS runs its DPT convolutions on the host here, ~half a minute a
+    // frame, so its plans are screened on fewer frames).
+    let models = std::env::var("MLQ_MODELS").unwrap_or_default();
+    let (want_sig, want_tips) = (models != "tips", models != "sig");
+    let f32_plan = QuantPlan::f32();
+    let ref_loc = if want_sig {
+        let sig_ref = load_sig(&f32_plan, false);
+        let out = run_loc(&sig_ref);
+        let vs = sig_ref.vocab_stats();
+        println!("[MLQ] 텍스트 토큰 표 (장면의 라벨 문구만): 장치에 {} / {} 행 ({:.2} MB, 쓰는 중에 더한 행 {})", vs.rows_on_device, vs.vocab, vs.device_bytes as f64 / 1e6, vs.added_on_demand);
+        let dict = noto_ml::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
+        let texts = noto_runtime::vocab_texts(LEX, Some(&dict)).unwrap();
+        let (added, unk) = sig_ref.prime_vocab(&texts.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+        let vs = sig_ref.vocab_stats();
+        println!("[MLQ] 사전 · 템플릿 · 어미 문장 {}개로 미리 올림: +{added}행 → 장치에 {} 행 ({:.2} MB, 전체 표 {:.1} MB) · <unk> {unk}개", texts.len(), vs.rows_on_device, vs.device_bytes as f64 / 1e6, vs.vocab as f64 * 768.0 * 4.0 / 1e6);
+        out
+    } else {
+        Vec::new()
+    };
+    let ref_dep = if want_tips { run_tips(&load_tips(&f32_plan)) } else { Vec::new() };
+    score("ref (F32)", want_sig.then_some(&ref_loc[..]), want_tips.then_some(&ref_dep[..]), &ref_loc, &ref_dep);
+    for spec in screen_plans() {
+        let plan = QuantPlan::parse(&spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+        let sig = want_sig && (plan.is_f32() || plan.touches("sv") || plan.touches("st"));
+        let tips = want_tips && (plan.is_f32() || plan.touches("tv"));
+        if !sig && !tips {
+            continue;
+        }
+        let loc = sig.then(|| run_loc(&load_sig(&plan, fused)));
+        let dep = tips.then(|| run_tips(&load_tips(&plan)));
+        score(&format!("{spec} [{}]", plan.tag), loc.as_deref(), dep.as_deref(), &ref_loc, &ref_dep);
+    }
+    if let Some(d) = &out {
+        let name = format!("mlq_{}.jsonl", if models.is_empty() { "all" } else { &models });
+        std::fs::write(d.join(&name), rows.lock().unwrap().join("\n")).unwrap();
+        println!("[MLQ] 장면별 기록 {}", d.join(name).display());
+    }
+    println!("[MLQ-SUM] {:.0} s", t0.elapsed().as_secs_f32());
+}
+
+/// The tile scan with every tile cropped and encoded (the default) against coarse tiles pooled from one dense pass
+/// (`EmbeddingCfg::dense`: the L1 pass gives the L0 tiles; with `crop_finest` the finest level is still cropped): the
+/// candidates' AUROC (score against a same-label object within 1 m), the gate's precision, recall, false passes per
+/// scan and position error, and the time of a scan. Raw tile scores on both sides (each would get its own calibration).
+#[test]
+#[ignore]
+fn ml_scan_dense() {
+    use noto_runtime::embedding::DenseTileCfg;
+    let t0 = std::time::Instant::now();
+    let dev = device();
+    let lex = Lexicon::from_json(LEX).unwrap();
+    let sig = Arc::new(noto_ml::Siglip2::load(&PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR")), &dev).expect("SigLIP2"));
+    let phrases = noto_runtime::BankedPhrases::new(Arc::clone(&sig), None);
+    let image: Arc<dyn noto_ml::ImageEmbedder + Send + Sync> = sig.clone();
+    let m = Arc::clone(&sig);
+    let calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync> = Arc::new(move |c| m.pair_probability(c));
+    let arm = |dense: DenseTileCfg| EmbeddingPerception::new_with(&lex, &phrases, Arc::clone(&image), Arc::clone(&calibrate), "gpu", EmbeddingCfg { dense, ..EmbeddingCfg::default() }, None).unwrap();
+    let mut arms = [
+        ("crop", arm(DenseTileCfg { enabled: false, crop_finest: true })),
+        ("dense+crop_finest", arm(DenseTileCfg { enabled: true, crop_finest: true })),
+        ("dense_all", arm(DenseTileCfg { enabled: true, crop_finest: false })),
+    ];
+    let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
+    let mut book = Book::default();
+    let mut times: BTreeMap<&str, f64> = BTreeMap::new();
+    let scenes = scenes();
+    for s in &scenes {
+        let shot = shoot(&mut bases, s);
+        for (name, rec) in arms.iter_mut() {
+            let name: &str = name;
+            let t = std::time::Instant::now();
+            let r = record_scan(&mut book, name, &shot, rec);
+            *times.entry(name).or_default() += t.elapsed().as_secs_f64();
+            for c in &r.cands {
+                book.pair(format!("{name}/cand"), c.score, c.tp);
+            }
+        }
+    }
+    for (name, _) in &arms {
+        let (au, ap, pos, n) = book.rank(&format!("{name}/cand"));
+        let f = |k: &str| book.mean(&format!("{name}/scan/{k}")).map_or("-".into(), |(v, n)| format!("{v:.3} (n {n})"));
+        println!(
+            "[MLS] {name}: 후보 AUROC {} AP {} (참 {pos}/{n}) · 게이트 정밀도 {} · 재현율 {} · 스캔당 틀린 통과 {} · 위치 오차 {} m · 스캔 {:.0} ms",
+            au.map_or("-".into(), |v| format!("{v:.3}")),
+            ap.map_or("-".into(), |v| format!("{v:.3}")),
+            f("precision"),
+            f("recall"),
+            f("false_per_scan"),
+            f("pos_err_m"),
+            times[name] * 1e3 / scenes.len().max(1) as f64
+        );
+    }
+    println!("[MLS-SUM] 장면 {}개 · {:.0} s", scenes.len(), t0.elapsed().as_secs_f32());
+}
+
+/// The active token table against the whole one on the real checkpoint: every priming text (lexicon, templates,
+/// dictionary, endings) and a few free-form commands embed to the same bits, the tokenizer gives no `<unk>`, and the
+/// device holds a sliver of the table.
+#[test]
+#[ignore]
+fn ml_vocab_check() {
+    use noto_ml::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
+    let dev = device();
+    let dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
+    let dict = noto_ml::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
+    let mut texts = noto_runtime::vocab_texts(LEX, Some(&dict)).unwrap();
+    let primed = texts.len();
+    let commands = ["원목 3개를 창고로 가져와 주세요", "택배 상자를 베이스캠프에 내려놔", "bring two logs to the warehouse", "철광석을 찾아서 캐 와줘", "빨간 지게차 옆 팔레트로 가"];
+    let load = |vocab| Siglip2::load_with(&dir, &dev, &LoadOpts { quant: QuantPlan::f32(), vocab, fused_qkv: false }).expect("SigLIP2");
+    let active = load(VocabPolicy::Active);
+    let (added, unk) = active.prime_vocab(&texts.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
+    let before = active.vocab_stats();
+    texts.extend(commands.iter().map(|s| s.to_string()));
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let t = std::time::Instant::now();
+    let a = active.embed_texts(&refs).unwrap();
+    let ta = t.elapsed().as_secs_f32();
+    let after = active.vocab_stats();
+    assert_eq!(active.fingerprint(), load(VocabPolicy::Active).fingerprint());
+    let full = load(VocabPolicy::Full);
+    assert_eq!(active.fingerprint(), full.fingerprint(), "the phrase bank does not see the table's policy");
+    let t = std::time::Instant::now();
+    let f = full.embed_texts(&refs).unwrap();
+    let tf = t.elapsed().as_secs_f32();
+    let same = a.iter().zip(&f).filter(|(x, y)| x == y).count();
+    let fs = full.vocab_stats();
+    println!(
+        "[MLV] 미리 올린 문장 {primed}개: +{added}행 · <unk> {unk}개 · 장치에 {} / {} 행 ({:.2} MB, 전체 표 {:.1} MB) · 명령 5개 뒤 {} 행 (쓰는 중에 더한 행 {}) · 같은 비트의 벡터 {same}/{} · 임베딩 {ta:.1} s (전체 표 {tf:.1} s)",
+        before.rows_on_device, before.vocab, before.device_bytes as f64 / 1e6, fs.device_bytes as f64 / 1e6, after.rows_on_device, after.added_on_demand, texts.len()
+    );
+    assert_eq!(unk, 0, "the full tokenizer leaves nothing unknown");
+    assert_eq!(same, texts.len(), "the active rows are the full table's rows");
 }
 
 #[test]

@@ -9,9 +9,38 @@ use crate::config::Siglip2Config;
 use crate::device::{device_family, trim_idle_pool, BatchPolicy};
 use crate::parallel::{fnv1a, FNV_OFFSET};
 use crate::preprocess::{preprocess, preprocess_grid, DenseGrid, NaflexInput};
+use crate::quant::{Family, QWeights, QuantPlan, QuantStats};
 use crate::text::TextTower;
 use crate::tokenizer::TextTokenizer;
 use crate::vision::VisionTower;
+use crate::vocab::{MappedRows, TokenTable, VocabPolicy, VocabStats};
+
+/// `NOTO_FUSED_QKV=1`: the vision tower's query, key and value projections as one GEMM.
+pub const FUSED_QKV_ENV: &str = "NOTO_FUSED_QKV";
+const TOKEN_TABLE: &str = "text_model.embeddings.token_embedding.weight";
+
+/// How a checkpoint is put on the device.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LoadOpts {
+    /// The pyramid tiers of the linear weights (F32 by default).
+    pub quant: QuantPlan,
+    /// The token table: only the rows in use on the device (default) or the whole table.
+    pub vocab: VocabPolicy,
+    /// One GEMM for the vision tower's Q, K and V (the text tower keeps its three, so phrase vectors do not move).
+    pub fused_qkv: bool,
+}
+
+impl LoadOpts {
+    /// The options for `device`: `NOTO_QUANT` (else the measured default, [`QuantPlan::for_load`]), `NOTO_VOCAB` and
+    /// `NOTO_FUSED_QKV`.
+    pub fn for_device(device: &Device) -> Result<LoadOpts> {
+        Ok(LoadOpts {
+            quant: QuantPlan::for_load(device)?,
+            vocab: VocabPolicy::from_env(),
+            fused_qkv: std::env::var(FUSED_QKV_ENV).is_ok_and(|v| v.trim() == "1"),
+        })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DenseEmbedding {
@@ -33,10 +62,19 @@ pub struct Siglip2 {
     policy: BatchPolicy,
     checkpoint: u64,
     fingerprint: u64,
+    /// The plan the weights were loaded with (after [`QuantPlan::for_device`]).
+    quant: QuantPlan,
+    quant_stats: QuantStats,
+    fused_qkv: bool,
 }
 
 impl Siglip2 {
+    /// [`Siglip2::load_with`] the options for `device` ([`LoadOpts::for_device`]).
     pub fn load(dir: &Path, device: &Device) -> Result<Self> {
+        Self::load_with(dir, device, &LoadOpts::for_device(device)?)
+    }
+
+    pub fn load_with(dir: &Path, device: &Device, opts: &LoadOpts) -> Result<Self> {
         let weights = dir.join("model.safetensors");
         if !weights.exists() {
             return Err(anyhow!(
@@ -51,15 +89,23 @@ impl Siglip2 {
         } else {
             Siglip2Config::default()
         };
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], DType::F32, device)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
         let tokenizer = TextTokenizer::from_file(
             &dir.join("tokenizer.json"),
             config.text_pad_id,
             config.text_max_len,
         )?;
-        let mut model = Self::from_var_builder(config, vb, device, Some(tokenizer))?;
+        let tokens = match opts.vocab {
+            VocabPolicy::Full => None,
+            VocabPolicy::Active => Some(TokenTable::active(MappedRows::open(&weights, TOKEN_TABLE, config.text_vocab, config.text_hidden)?, device)),
+        };
+        let w = QWeights::with_plan(vb, &weights, Family::Siglip2, &opts.quant)?;
+        let mut model = Self::build(config, w, device, Some(tokenizer), tokens, opts.fused_qkv)?;
         model.checkpoint = checkpoint_fingerprint(dir, &model.config);
-        model.fingerprint = device_salt(model.checkpoint, device, &model.policy);
+        model.fingerprint = text_salt(device_salt(model.checkpoint, device, &model.policy), &model.quant);
+        // The tokens every text has (padding, the tokenizer's added ones) go on the device now.
+        let base: Vec<&str> = vec![""];
+        model.prime_vocab(&base)?;
         Ok(model)
     }
 
@@ -69,13 +115,19 @@ impl Siglip2 {
         device: &Device,
         tokenizer: Option<TextTokenizer>,
     ) -> Result<Self> {
-        let vision = VisionTower::new(&config, vb.pp("vision_model"))?;
-        let text = TextTower::new(&config, vb.pp("text_model"))?;
-        let logit_scale = read_scalar(&vb, "logit_scale").unwrap_or(0.0);
-        let logit_bias = read_scalar(&vb, "logit_bias").unwrap_or(0.0);
+        Self::build(config, QWeights::plain(vb, Family::Siglip2), device, tokenizer, None, false)
+    }
+
+    fn build(config: Siglip2Config, w: QWeights, device: &Device, tokenizer: Option<TextTokenizer>, tokens: Option<TokenTable>, fused_qkv: bool) -> Result<Self> {
+        let vision = VisionTower::with_weights(&config, &w.pp("vision_model"), fused_qkv)?;
+        let text = TextTower::with_weights(&config, &w.pp("text_model"), tokens, false)?;
+        let vb = w.vb();
+        let logit_scale = read_scalar(vb, "logit_scale").unwrap_or(0.0);
+        let logit_bias = read_scalar(vb, "logit_bias").unwrap_or(0.0);
         let policy = BatchPolicy::for_device(device);
         let checkpoint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
-        let fingerprint = device_salt(checkpoint, device, &policy);
+        let quant = w.plan().clone();
+        let fingerprint = text_salt(device_salt(checkpoint, device, &policy), &quant);
         Ok(Siglip2 {
             config,
             vision,
@@ -87,7 +139,46 @@ impl Siglip2 {
             policy,
             checkpoint,
             fingerprint,
+            quant,
+            quant_stats: w.stats(),
+            fused_qkv,
         })
+    }
+
+    /// The plan the weights run with.
+    pub fn quant_plan(&self) -> &QuantPlan {
+        &self.quant
+    }
+
+    /// What the load quantized (formats, bytes, time).
+    pub fn quant_stats(&self) -> &QuantStats {
+        &self.quant_stats
+    }
+
+    /// The part of the dense locator's mode that keeps a quantized or fused vision tower's statistics and calibration
+    /// apart from the F32 one's (`""` for the F32 tower).
+    pub fn mode_suffix(&self) -> String {
+        let mut s = self.quant.mode_suffix(Family::Siglip2);
+        if self.fused_qkv {
+            s.push_str("+fqkv");
+        }
+        s
+    }
+
+    /// The token table on the device.
+    pub fn vocab_stats(&self) -> VocabStats {
+        self.text.vocab_stats()
+    }
+
+    /// Tokenizes `texts` and puts their token rows on the device ahead of use (an active table; nothing for the whole
+    /// one). Returns the rows added and the number of `<unk>` tokens the texts produced.
+    pub fn prime_vocab(&self, texts: &[&str]) -> Result<(usize, usize)> {
+        let Some(tok) = self.tokenizer.as_ref() else { return Ok((0, 0)) };
+        let (ids, mask) = tok.encode(texts)?;
+        let mut used: Vec<u32> = ids.iter().zip(&mask).filter(|(_, m)| **m > 0.0).map(|(i, _)| *i).collect();
+        used.push(self.config.text_pad_id);
+        let unk = tok.unk_id().map_or(0, |u| used.iter().filter(|i| **i == u).count());
+        Ok((self.text.prime(&used)?, unk))
     }
 
     pub fn batch_policy(&self) -> BatchPolicy {
@@ -103,7 +194,7 @@ impl Siglip2 {
     }
 
     pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
-        self.fingerprint = device_salt(self.checkpoint, &self.device, &policy);
+        self.fingerprint = text_salt(device_salt(self.checkpoint, &self.device, &policy), &self.quant);
         self.policy = policy;
     }
 
@@ -243,9 +334,8 @@ impl Siglip2 {
         }
         let len = self.config.text_max_len;
         if !self.policy.fixed_shape {
-            let ids_t = Tensor::from_slice(ids, (rows, len), &self.device)?;
             let mask_t = Tensor::from_slice(mask, (rows, len), &self.device)?;
-            let emb = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?;
+            let emb = l2_normalize(&self.text.forward_ids(ids, (rows, len), &mask_t)?)?;
             trim_idle_pool(&self.device);
             return Ok(emb.to_vec2()?);
         }
@@ -259,9 +349,8 @@ impl Siglip2 {
                 i.extend_from_slice(&ids[start * len..(start + 1) * len]);
                 m.extend_from_slice(&mask[start * len..(start + 1) * len]);
             }
-            let ids_t = Tensor::from_vec(i, (b, len), &self.device)?;
             let mask_t = Tensor::from_vec(m, (b, len), &self.device)?;
-            let emb: Vec<Vec<f32>> = l2_normalize(&self.text.forward(&ids_t, &mask_t)?)?.to_vec2()?;
+            let emb: Vec<Vec<f32>> = l2_normalize(&self.text.forward_ids(&i, (b, len), &mask_t)?)?.to_vec2()?;
             out.extend(emb.into_iter().take(n));
         }
         trim_idle_pool(&self.device);
@@ -307,6 +396,21 @@ fn device_salt(h: u64, device: &Device, policy: &BatchPolicy) -> u64 {
     } else {
         h
     }
+}
+
+/// The fingerprint keys the phrase bank, whose vectors only the text tower makes: its quantized groups enter it (an F32
+/// text tower keeps the F32 fingerprint, whatever the vision tower runs with or how many token rows are on the device).
+fn text_salt(h: u64, plan: &QuantPlan) -> u64 {
+    if !plan.touches("st") {
+        return h;
+    }
+    let text: Vec<(&String, &crate::quant::QType)> = plan.groups.iter().filter(|(g, _)| g.starts_with("st.")).collect();
+    let mut h = fnv1a(h, b"text-quant");
+    for (g, q) in text {
+        h = fnv1a(h, g.as_bytes());
+        h = fnv1a(h, q.name().as_bytes());
+    }
+    h
 }
 
 fn sigmoid(x: f32) -> f32 {

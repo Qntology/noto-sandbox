@@ -5579,6 +5579,7 @@ dependencies = [
  "candle-core",
  "candle-nn",
  "candle-rocm",
+ "half",
  "image",
  "rayon",
  "serde",

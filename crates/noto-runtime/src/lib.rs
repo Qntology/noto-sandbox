@@ -22,6 +22,7 @@ pub mod stereo;
 pub mod testrun;
 pub mod views;
 pub mod vision;
+pub mod vocab;
 
 pub use config::{CameraCfg, GateCfg, NoiseCfg, RuntimeConfig};
 pub use embedding::{BankedPhrases, EmbeddingCfg, EmbeddingPerception, SiglipPhrases};
@@ -32,6 +33,7 @@ pub use record::{RecordCfg, Recording};
 pub use testrun::{TestCfg, TestPhase, TestSession};
 pub use vision::{DriftRate, Memory, VisionCfg, VisionMark};
 pub use runtime::{label_ko, Detection, EvalCounters, EvalSummary, FrameOut, FrameView, Runtime, ScanReport, Submission, TsView};
+pub use vocab::vocab_texts;
 
 pub fn world_terrain_kind(id: &str) -> Result<world_sim::TerrainKind, String> {
     world_sim::TerrainKind::from_id(id).ok_or_else(|| format!("알 수 없는 지형 '{id}' (open 또는 rugged)"))

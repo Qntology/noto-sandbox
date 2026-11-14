@@ -153,6 +153,8 @@ impl Default for LocateCfg {
 }
 
 impl LocateCfg {
+    /// The settings a mode names. The model's own parts (`+q-<plan>`, `+fqkv`: how the vision tower was loaded, see
+    /// `Siglip2::mode_suffix`) are not settings of the locator and are skipped.
     pub fn from_mode(mode: &str, background: &[String], templates: &[String]) -> Option<LocateCfg> {
         let rest = mode.strip_prefix("siglip2-dense")?;
         let mut cfg = LocateCfg::default();
@@ -165,6 +167,8 @@ impl LocateCfg {
                 "z" => cfg.scoring = LocateScoring::ZScore,
                 "tpl" => cfg.templates = templates.to_vec(),
                 "pyr" => cfg.grid = DenseGrid::pyramid(),
+                "fqkv" => {}
+                p if p.starts_with("q-") => {}
                 _ => return None,
             }
         }
@@ -208,8 +212,10 @@ impl SiglipLocator {
         SiglipLocator::with_cfg(model, LocateCfg::default())
     }
 
+    /// The mode is the settings' (`LocateCfg::mode`) followed by the vision tower's load (`Siglip2::mode_suffix`), so a
+    /// quantized tower's calibration and SDS statistics stay apart from the F32 one's.
     pub fn with_cfg(model: Arc<noto_ml::Siglip2>, cfg: LocateCfg) -> SiglipLocator {
-        let mode = cfg.mode();
+        let mode = format!("{}{}", cfg.mode(), model.mode_suffix());
         SiglipLocator { model, cache: HashMap::new(), negative_weight: cfg.negative_weight, cfg, pyramid: None, mode }
     }
 
@@ -350,7 +356,7 @@ impl SemanticLocator for SiglipLocator {
 
     fn set_pyramid(&mut self, cfg: Option<&crate::pyramid::PyramidCfg>) {
         self.pyramid = cfg.map(|p| DenseGrid::Pyramid { short_side: p.l1_short_side });
-        self.mode = self.effective_cfg().mode();
+        self.mode = format!("{}{}", self.effective_cfg().mode(), self.model.mode_suffix());
     }
 
     fn locate_batch(&mut self, frames: &[&Rgb], labels: &[LabelPrompt]) -> Result<Vec<Vec<SemanticPoint>>> {
@@ -446,6 +452,11 @@ mod tests {
         assert_eq!(LocateCfg::from_mode("stand-in(siglip2-like)", &bg, &tpl), None);
         assert_eq!(LocateCfg::from_mode("siglip2-dense+what", &bg, &tpl), None);
         assert_eq!(LocateCfg { grid: DenseGrid::pyramid(), ..LocateCfg::default() }.mode(), "siglip2-dense+pyr", "a pyramid grid is calibrated on its own");
+        // The vision tower's load (a quantization plan, the fused projection) is part of the locator's mode, not a setting.
+        let plain = LocateCfg::from_mode("siglip2-dense+bg+pyr", &bg, &tpl);
+        assert!(plain.is_some());
+        assert_eq!(LocateCfg::from_mode("siglip2-dense+bg+pyr+q-pyr", &bg, &tpl), plain);
+        assert_eq!(LocateCfg::from_mode("siglip2-dense+bg+pyr+q-custom-0a1b2c3d+fqkv", &bg, &tpl), plain);
         assert_eq!(apply_template("a photo of {}.", "a log"), "a photo of a log.");
     }
 }
