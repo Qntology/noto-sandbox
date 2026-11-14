@@ -15,6 +15,7 @@ pub mod grasp;
 pub mod material;
 pub mod push;
 pub mod reach;
+pub mod retarget;
 
 pub const SAMPLE_S: f32 = 0.02;
 
