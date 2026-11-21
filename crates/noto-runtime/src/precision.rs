@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use noto_sds::{Scope, SdsStore, Track};
 use noto_ts::ttm::TtmForecaster;
-use noto_ts::{forecast, temporal_gate, Forecast, GateConfig, HistoryMse, Predictor, TemporalOutcome, TemporalVerdict, TtmPredictor};
+use noto_ts::{forecast, Forecast, GateConfig, HistoryMse, Predictor, TemporalOutcome, TemporalVerdict, TtmPredictor};
 use serde::Serialize;
 
 use crate::config::GateCfg;
@@ -474,7 +474,10 @@ impl PrecisionGates {
                     let past = past_errors(sds, &c.label);
                     let sd = self.own(sds.adaptive_baseline_scoped(&vscope, "score_all"), &vscope).map(|b| b.1);
                     let gcfg = GateConfig { widen_sd: self.cfg.temporal_widen_sd, min_history: need };
-                    let (v, f) = with_extra(&self.ttm, |extra| (temporal_gate(&hist, c.score as f64, sd, extra, &past, &gcfg), forecast(&hist, 1, extra, &past)));
+                    let (v, f) = with_extra(&self.ttm, |extra| {
+                        let (v, f) = noto_ts::temporal_gate_with_forecast(&hist, c.score as f64, sd, extra, &past, &gcfg);
+                        (v, f.unwrap_or_else(|| forecast(&hist, 1, extra, &past)))
+                    });
                     let fscope = Scope::new(Track::Forecast, &c.label, "");
                     for w in &f.weights {
                         sds.record_baseline(&fscope, &format!("fusion_mse:{}", w.method), w.rmse * w.rmse);

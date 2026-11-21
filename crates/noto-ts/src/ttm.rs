@@ -418,20 +418,21 @@ impl Gate {
 #[derive(Debug, Clone)]
 enum Norm {
     Layer(LayerNorm),
-    Batch { w: Tensor, b: Tensor, mean: Tensor, var: Tensor, eps: f64 },
+    /// Pre-folded inference BatchNorm: `scale = w / sqrt(var + eps)`, `bias = b - mean * scale`.
+    Batch { scale: Tensor, bias: Tensor },
 }
 
 impl Norm {
     fn load(cfg: &TtmConfig, d: usize, vb: VarBuilder) -> Result<Self> {
         if cfg.norm_mlp.to_lowercase().contains("batch") {
             let bv = vb.pp("norm").pp("batchnorm");
-            Ok(Norm::Batch {
-                w: bv.get(d, "weight")?,
-                b: bv.get(d, "bias")?,
-                mean: bv.get(d, "running_mean")?,
-                var: bv.get(d, "running_var")?,
-                eps: cfg.norm_eps,
-            })
+            let w = bv.get(d, "weight")?;
+            let b = bv.get(d, "bias")?;
+            let mean = bv.get(d, "running_mean")?;
+            let var = bv.get(d, "running_var")?;
+            let scale = w.broadcast_div(&(var + cfg.norm_eps)?.sqrt()?)?;
+            let bias = b.broadcast_sub(&mean.broadcast_mul(&scale)?)?;
+            Ok(Norm::Batch { scale, bias })
         } else {
             Ok(Norm::Layer(candle_nn::layer_norm(d, cfg.norm_eps, vb.pp("norm"))?))
         }
@@ -440,10 +441,7 @@ impl Norm {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Norm::Layer(l) => x.apply(l),
-            Norm::Batch { w, b, mean, var, eps } => {
-                let denom = (var + *eps)?.sqrt()?;
-                x.broadcast_sub(mean)?.broadcast_div(&denom)?.broadcast_mul(w)?.broadcast_add(b)
-            }
+            Norm::Batch { scale, bias } => x.broadcast_mul(scale)?.broadcast_add(bias),
         }
     }
 }
@@ -575,6 +573,34 @@ struct FftTokens {
 }
 
 #[derive(Debug, Clone)]
+struct CpuLinear {
+    w: Vec<Vec<f32>>,
+    b: Vec<f32>,
+}
+
+impl CpuLinear {
+    fn load(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
+        let w = vb.get((out_dim, in_dim), "weight")?.to_vec2::<f32>()?;
+        let b = vb.get(out_dim, "bias")?.to_vec1::<f32>()?;
+        Ok(Self { w, b })
+    }
+
+    fn forward_vec(&self, x: &[f32]) -> Vec<f32> {
+        self.w
+            .iter()
+            .zip(&self.b)
+            .map(|(row, &bias)| {
+                let mut acc = bias;
+                for (&w, &v) in row.iter().zip(x.iter()) {
+                    acc += w * v;
+                }
+                acc
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
 struct MqHead {
     dw_w: Vec<f32>,
     dw_b: f32,
@@ -582,8 +608,8 @@ struct MqHead {
     in_b: f32,
     pw1_w: Vec<f32>,
     pw1_b: Vec<f32>,
-    pool: Option<Linear>,
-    flat: Option<(Linear, Linear)>,
+    pool: Option<CpuLinear>,
+    flat: Option<(CpuLinear, CpuLinear)>,
     pw2_w: Vec<Vec<f32>>,
     pw2_b: Vec<f32>,
     hidden: usize,
@@ -613,14 +639,14 @@ impl MqHead {
         let pw2_b = vb.get(q, "pw2.bias")?.to_vec1::<f32>()?;
         let (pool, flat) = if use_cond {
             if cfg.mq_cond_path == "pool" {
-                (Some(candle_nn::linear(decoder_d_model, h, vb.pp("dec_proj"))?), None)
+                (Some(CpuLinear::load(decoder_d_model, h, vb.pp("dec_proj"))?), None)
             } else {
                 let md = cfg.mq_decoder_d_model;
                 (
                     None,
                     Some((
-                        candle_nn::linear(decoder_d_model, md, vb.pp("dec_tok_proj"))?,
-                        candle_nn::linear(num_patches * md, h, vb.pp("dec_flat_to_hidden"))?,
+                        CpuLinear::load(decoder_d_model, md, vb.pp("dec_tok_proj"))?,
+                        CpuLinear::load(num_patches * md, h, vb.pp("dec_flat_to_hidden"))?,
                     )),
                 )
             }
@@ -674,11 +700,26 @@ impl MqHead {
             .map(|j| x2.iter().map(|a| gelu(self.pw1_w[j] as f64 * a + self.pw1_b[j] as f64)).collect())
             .collect();
         if self.use_cond {
+            let dec_rows: Vec<Vec<f32>> = dec.to_vec2::<f32>()?;
             let cond: Vec<f32> = if let Some(p) = &self.pool {
-                dec.mean(0)?.unsqueeze(0)?.apply(p)?.flatten_all()?.to_vec1::<f32>()?
+                let n = dec_rows.len().max(1) as f32;
+                let d = dec_rows.first().map_or(0, Vec::len);
+                let mut avg = vec![0.0f32; d];
+                for row in &dec_rows {
+                    for (a, &v) in avg.iter_mut().zip(row.iter()) {
+                        *a += v;
+                    }
+                }
+                for a in &mut avg {
+                    *a /= n;
+                }
+                p.forward_vec(&avg)
             } else if let Some((tok, fl)) = &self.flat {
-                let dt = dec.apply(tok)?.flatten_all()?.unsqueeze(0)?;
-                dt.apply(fl)?.flatten_all()?.to_vec1::<f32>()?
+                let mut flat_in = Vec::with_capacity(dec_rows.len() * tok.b.len());
+                for row in &dec_rows {
+                    flat_in.extend_from_slice(&tok.forward_vec(row));
+                }
+                fl.forward_vec(&flat_in)
             } else {
                 vec![0.0; self.hidden]
             };
@@ -696,6 +737,9 @@ impl MqHead {
         }
         let o: Vec<Vec<f64>> = (0..self.num_q)
             .map(|qi| {
+                if qi == 0 && !self.q50_median {
+                    return Vec::new();
+                }
                 (0..t)
                     .map(|i| {
                         let mut s = self.pw2_b[qi] as f64;

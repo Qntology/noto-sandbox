@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context};
 use candle_core::{DType, Device, Module, Tensor, D};
 use candle_nn::{
-    conv2d, conv2d_no_bias, conv_transpose2d, layer_norm, linear, Conv2d, Conv2dConfig, ConvTranspose2d,
-    ConvTranspose2dConfig, LayerNorm, Linear, VarBuilder,
+    conv2d, conv2d_no_bias, linear, Conv2d, Conv2dConfig, Linear, VarBuilder,
 };
+use rayon::prelude::*;
 
+use noto_ml::device::{accel_op_ok, cpu_packed_enabled, AccelOp};
+use noto_ml::encoder::FastLayerNorm;
 use noto_ml::quant::{Family, QLinear, QWeights, QuantPlan, QuantStats};
 use noto_ml::vision::antialias_bilinear_weights;
 
@@ -260,6 +264,7 @@ struct Attention {
     proj: QLinear,
     heads: usize,
     head_dim: usize,
+    cpu_packed: bool,
 }
 
 impl Attention {
@@ -270,17 +275,73 @@ impl Attention {
             proj: w.pp("proj").linear(d, d).map_err(to_candle)?,
             heads: cfg.heads,
             head_dim: d / cfg.heads,
+            cpu_packed: w.is_cpu_packed(),
         })
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let (b, n, d) = x.dims3()?;
         let qkv = self.qkv.forward(x)?;
+        let scale = (self.head_dim as f64).powf(-0.5);
+
+        // Fastpath 1: CPU packed 64-key streaming attention (zero transposes, zero [B,H,N,N] score alloc).
+        if self.cpu_packed && x.device().is_cpu() && x.dtype() == DType::F32 {
+            let qkv_3 = qkv.reshape((b, n, 3, d))?;
+            let q_c = qkv_3.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
+            let k_c = qkv_3.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
+            let v_c = qkv_3.narrow(2, 2, 1)?.squeeze(2)?.contiguous()?;
+            let (qs, ql) = q_c.storage_and_layout();
+            let (ks, kl) = k_c.storage_and_layout();
+            let (vs, vl) = v_c.storage_and_layout();
+            if let (
+                candle_core::Storage::Cpu(candle_core::CpuStorage::F32(qv)),
+                candle_core::Storage::Cpu(candle_core::CpuStorage::F32(kv)),
+                candle_core::Storage::Cpu(candle_core::CpuStorage::F32(vv)),
+            ) = (&*qs, &*ks, &*vs)
+            {
+                let cfg = noto_cpu_kernels::CpuStreamAttnCfg {
+                    num_heads: self.heads,
+                    num_kv_heads: self.heads,
+                    head_dim: self.head_dim,
+                    scale: scale as f32,
+                    causal: false,
+                    past_offset: 0,
+                };
+                let mut ctx = vec![0.0f32; b * n * d];
+                let (q0, k0, v0) = (ql.start_offset(), kl.start_offset(), vl.start_offset());
+                for bi in 0..b {
+                    noto_cpu_kernels::stream_attention_f32(
+                        &qv[q0 + bi * n * d..q0 + (bi + 1) * n * d],
+                        &kv[k0 + bi * n * d..k0 + (bi + 1) * n * d],
+                        &vv[v0 + bi * n * d..v0 + (bi + 1) * n * d],
+                        n,
+                        n,
+                        &cfg,
+                        &mut ctx[bi * n * d..(bi + 1) * n * d],
+                    );
+                }
+                let ctx_t = Tensor::from_vec(ctx, (b, n, d), x.device())?;
+                return self.proj.forward(&ctx_t);
+            }
+        }
+
+        // Fastpath 2: GPU FlashAttention in (b, n, heads, head_dim) layout (zero transpose copies).
+        if accel_op_ok(x.device(), AccelOp::FlashAttn) {
+            let qkv_4 = qkv.reshape((b, n, 3, self.heads, self.head_dim))?;
+            let q = qkv_4.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
+            let k = qkv_4.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
+            let v = qkv_4.narrow(2, 2, 1)?.squeeze(2)?.contiguous()?;
+            let fa_cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale as f32);
+            let ctx = candle_nn::flash_attn::flash_attn_with_config(&q, &k, &v, &fa_cfg)?.reshape((b, n, d))?;
+            return self.proj.forward(&ctx);
+        }
+
+        let qkv_4 = qkv.reshape((b, n, 3, self.heads, self.head_dim))?;
         let split = |i: usize| -> candle_core::Result<Tensor> {
-            qkv.narrow(D::Minus1, i * d, d)?.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
+            qkv_4.narrow(2, i, 1)?.squeeze(2)?.transpose(1, 2)?.contiguous()
         };
         let (q, k, v) = (split(0)?, split(1)?, split(2)?);
-        let scores = (q.matmul(&k.transpose(2, 3)?)? * (self.head_dim as f64).powf(-0.5))?;
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale, 0.0)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?.transpose(1, 2)?.contiguous()?.reshape((b, n, d))?;
         self.proj.forward(&ctx)
@@ -288,10 +349,10 @@ impl Attention {
 }
 
 struct Block {
-    norm1: LayerNorm,
+    norm1: FastLayerNorm,
     attn: Attention,
     ls1: Tensor,
-    norm2: LayerNorm,
+    norm2: FastLayerNorm,
     fc1: QLinear,
     fc2: QLinear,
     ls2: Tensor,
@@ -303,11 +364,12 @@ impl Block {
         let (d, eps) = (cfg.hidden, cfg.layer_norm_eps);
         let vb = w.vb();
         let mlp = w.pp("mlp");
+        let packed = w.is_cpu_packed();
         Ok(Block {
-            norm1: layer_norm(d, eps, vb.pp("norm1"))?,
+            norm1: FastLayerNorm::new(d, eps, vb.pp("norm1"), packed)?,
             attn: Attention::new(cfg, &w.pp("attn"))?,
             ls1: vb.pp("ls1").get(d, "gamma")?,
-            norm2: layer_norm(d, eps, vb.pp("norm2"))?,
+            norm2: FastLayerNorm::new(d, eps, vb.pp("norm2"), packed)?,
             fc1: mlp.pp("fc1").linear(d, cfg.mlp_hidden).map_err(to_candle)?,
             fc2: mlp.pp("fc2").linear(cfg.mlp_hidden, d).map_err(to_candle)?,
             ls2: vb.pp("ls2").get(d, "gamma")?,
@@ -329,12 +391,15 @@ struct Tap {
 }
 
 struct Encoder {
-    patch_embed: Conv2d,
+    /// Non-overlapping stride=patch_size Conv2d(3, d, p, s=p) stored as a Linear(3*p*p, d) so every
+    /// backend runs native GEMM instead of host conv2d fallback.
+    patch_proj: QLinear,
     cls_token: Tensor,
     register_tokens: Option<Tensor>,
     pos_embed: Tensor,
+    pos_cache: Mutex<HashMap<(usize, usize), Tensor>>,
     blocks: Vec<Block>,
-    norm: LayerNorm,
+    norm: FastLayerNorm,
     side: usize,
     hidden: usize,
     patch_size: usize,
@@ -344,22 +409,30 @@ struct Encoder {
 impl Encoder {
     fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
         let vb = w.vb();
-        let (d, side) = (cfg.hidden, cfg.position_side());
-        let patch_cfg = Conv2dConfig { stride: cfg.patch_size, ..Default::default() };
+        let (d, side, p) = (cfg.hidden, cfg.position_side(), cfg.patch_size);
+        let proj_vb = vb.pp("patch_embed").pp("proj");
+        let pw = proj_vb.get((d, 3, p, p), "weight")?.reshape((d, 3 * p * p))?;
+        let pb = proj_vb.get(d, "bias")?;
+        let patch_proj = if w.is_cpu_packed() {
+            QLinear::from_dense_packed(&pw, Some(&pb))?
+        } else {
+            QLinear::Dense(Linear::new(pw, Some(pb)))
+        };
         let register_tokens = match cfg.register_tokens {
             0 => None,
             r => Some(vb.get((1, r, d), "register_tokens")?),
         };
         Ok(Encoder {
-            patch_embed: conv2d(3, d, cfg.patch_size, patch_cfg, vb.pp("patch_embed").pp("proj"))?,
+            patch_proj,
             cls_token: vb.get((1, 1, d), "cls_token")?,
             register_tokens,
             pos_embed: vb.get((1, 1 + side * side, d), "pos_embed")?,
+            pos_cache: Mutex::new(HashMap::new()),
             blocks: (0..cfg.layers).map(|i| Block::new(cfg, &w.pp(format!("blocks.{i}")))).collect::<candle_core::Result<_>>()?,
-            norm: layer_norm(d, cfg.layer_norm_eps, vb.pp("norm"))?,
+            norm: FastLayerNorm::new(d, cfg.layer_norm_eps, vb.pp("norm"), w.is_cpu_packed())?,
             side,
             hidden: d,
-            patch_size: cfg.patch_size,
+            patch_size: p,
             tap_blocks: cfg.tap_blocks,
         })
     }
@@ -369,20 +442,33 @@ impl Encoder {
         if (rows, cols) == (side, side) {
             return Ok(self.pos_embed.clone());
         }
+        let key = (rows, cols);
+        if let Some(cached) = self.pos_cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+            return Ok(cached.clone());
+        }
         let dev = self.pos_embed.device();
         let wy = Tensor::from_vec(antialias_bilinear_weights(side, rows), (rows, side), dev)?;
         let wx = Tensor::from_vec(antialias_bilinear_weights(side, cols), (cols, side), dev)?;
         let table = self.pos_embed.narrow(1, 1, side * side)?.reshape((side, side * d))?;
         let by_rows = wy.matmul(&table)?.reshape((rows, side, d))?;
         let grid = wx.broadcast_matmul(&by_rows)?.reshape((1, rows * cols, d))?;
-        Tensor::cat(&[&self.pos_embed.narrow(1, 0, 1)?, &grid], 1)
+        let res = Tensor::cat(&[&self.pos_embed.narrow(1, 0, 1)?, &grid], 1)?;
+        self.pos_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, res.clone());
+        Ok(res)
     }
 
     fn taps(&self, pixels: &Tensor) -> candle_core::Result<Vec<Tap>> {
         let (b, _, h, w) = pixels.dims4()?;
-        let (rows, cols, d) = (h / self.patch_size, w / self.patch_size, self.hidden);
+        let p = self.patch_size;
+        let (rows, cols, d) = (h / p, w / p, self.hidden);
         let n = rows * cols;
-        let patches = self.patch_embed.forward(pixels)?.flatten_from(2)?.transpose(1, 2)?;
+        // Exact equivalence to stride=p Conv2d(3, d, p, s=p): (b, 3, rows, p, cols, p) -> (b, rows*cols, 3*p*p) -> Linear.
+        let patch_in = pixels
+            .reshape((b, 3, rows, p, cols, p))?
+            .permute((0, 2, 4, 1, 3, 5))?
+            .contiguous()?
+            .reshape((b, n, 3 * p * p))?;
+        let patches = self.patch_proj.forward(&patch_in)?;
         let cls = self.cls_token.broadcast_as((b, 1, d))?;
         let mut x = Tensor::cat(&[&cls, &patches], 1)?.broadcast_add(&self.positions(rows, cols)?)?;
         let registers = match &self.register_tokens {
@@ -411,37 +497,81 @@ impl Encoder {
     }
 }
 
+/// Non-overlapping `ConvTranspose2d(ch, ch, k=s, s=s, pad=0)` implemented as a native GEMM + pixel-shuffle
+/// so every backend (CUDA, ROCm, Vulkan, Metal, CPU) runs on device without conv_transpose2d fallback.
+struct PixelShuffleUp {
+    proj: Linear,
+    bias: Tensor,
+    ch: usize,
+    scale: usize,
+}
+
+impl PixelShuffleUp {
+    fn new(ch: usize, scale: usize, vb: VarBuilder) -> candle_core::Result<Self> {
+        // ConvTranspose2d weight shape is (c_in=ch, c_out=ch, scale, scale);
+        // transpose to (c_out * scale * scale, c_in) for row-major Linear(ch -> ch*scale*scale).
+        let w = vb
+            .get((ch, ch, scale, scale), "weight")?
+            .permute((1, 2, 3, 0))?
+            .contiguous()?
+            .reshape((ch * scale * scale, ch))?;
+        let bias = vb.get(ch, "bias")?.reshape((1, ch, 1, 1))?;
+        Ok(PixelShuffleUp { proj: Linear::new(w, None), bias, ch, scale })
+    }
+
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let (b, _, h, w) = x.dims4()?;
+        let s = self.scale;
+        let ch = self.ch;
+        let x_hwc = x.permute((0, 2, 3, 1))?.contiguous()?;
+        let y = self
+            .proj
+            .forward(&x_hwc)?
+            .reshape((b, h, w, ch, s, s))?
+            .permute((0, 3, 1, 4, 2, 5))?
+            .contiguous()?
+            .reshape((b, ch, h * s, w * s))?;
+        y.broadcast_add(&self.bias)
+    }
+}
+
 struct ReassembleLevel {
     readout: QLinear,
-    out_projection: Conv2d,
+    /// 1x1 `out_projection` stored as Linear(d -> ch) and applied directly on (b, n, d) before NCHW reshape.
+    out_projection: Linear,
+    out_channels: usize,
     resize: Resize,
     gelu_tanh: bool,
 }
 
 enum Resize {
-    Up(ConvTranspose2d),
+    Up(PixelShuffleUp),
     Keep,
     Down(Conv2d),
 }
 
 impl ReassembleLevel {
     /// The readout projection may be quantized (a plan's `tv.readout`); the 1×1 projection and the resampling
-    /// convolutions stay F32 (candle has no quantized convolution).
+    /// layers stay F32.
     fn new(level: usize, cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
         let vb = w.vb();
         let (d, ch) = (cfg.hidden, cfg.post_process_channels[level]);
         let resize_vb = vb.pp("resize_layers").pp(level);
         let resize = match LEVEL_SCALES[level] {
-            LevelScale::Up(s) => Resize::Up(conv_transpose2d(ch, ch, s, ConvTranspose2dConfig { stride: s, ..Default::default() }, resize_vb)?),
+            LevelScale::Up(s) => Resize::Up(PixelShuffleUp::new(ch, s, resize_vb)?),
             LevelScale::Keep => Resize::Keep,
             LevelScale::Down(s) => {
                 let down = Conv2dConfig { stride: s, padding: SAME_PAD_3X3, ..Default::default() };
                 Resize::Down(conv2d(ch, ch, DOWN_KERNEL, down, resize_vb)?)
             }
         };
+        let out_vb = vb.pp("out_projections").pp(level);
+        let out_w = out_vb.get((ch, d, 1, 1), "weight")?.reshape((ch, d))?;
+        let out_b = out_vb.get(ch, "bias")?;
         Ok(ReassembleLevel {
             readout: w.pp("readout_projects").pp(level).linear(2 * d, d).map_err(to_candle)?,
-            out_projection: conv2d(d, ch, 1, Conv2dConfig::default(), vb.pp("out_projections").pp(level))?,
+            out_projection: Linear::new(out_w, Some(out_b)),
+            out_channels: ch,
             resize,
             gelu_tanh: cfg.readout_gelu_tanh,
         })
@@ -452,8 +582,8 @@ impl ReassembleLevel {
         let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
         let x = self.readout.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?;
         let x = if self.gelu_tanh { x.gelu()? } else { x.gelu_erf()? };
-        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, d, tap.rows, tap.cols))?;
         let x = self.out_projection.forward(&x)?;
+        let x = x.transpose(1, 2)?.contiguous()?.reshape((b, self.out_channels, tap.rows, tap.cols))?;
         match &self.resize {
             Resize::Up(up) => up.forward(&x),
             Resize::Keep => Ok(x),
@@ -482,15 +612,21 @@ impl ResidualUnit {
 struct FusionBlock {
     residual_unit: Option<ResidualUnit>,
     main_unit: ResidualUnit,
-    out_conv: Conv2d,
+    /// 1x1 `out_conv` executed as a direct `[ch, ch] @ [b, ch, h*w]` GEMM without host conv2d fallback.
+    out_w: Tensor,
+    out_b: Tensor,
 }
 
 impl FusionBlock {
     fn new(ch: usize, has_skip: bool, vb: VarBuilder) -> candle_core::Result<Self> {
+        let out_vb = vb.pp("out_conv");
+        let out_w = out_vb.get((ch, ch, 1, 1), "weight")?.reshape((ch, ch))?;
+        let out_b = out_vb.get(ch, "bias")?.reshape((1, ch, 1, 1))?;
         Ok(FusionBlock {
             residual_unit: if has_skip { Some(ResidualUnit::new(ch, vb.pp("residual_unit"))?) } else { None },
             main_unit: ResidualUnit::new(ch, vb.pp("main_unit"))?,
-            out_conv: conv2d(ch, ch, 1, Conv2dConfig::default(), vb.pp("out_conv"))?,
+            out_w,
+            out_b,
         })
     }
 
@@ -502,9 +638,11 @@ impl FusionBlock {
             x = (x + unit.forward(&skip)?)?;
         }
         let x = self.main_unit.forward(&x)?;
-        let (_, _, h, w) = x.dims4()?;
-        let x = x.upsample_bilinear2d(h * FUSION_UPSAMPLE, w * FUSION_UPSAMPLE, true)?;
-        self.out_conv.forward(&x)
+        let (b, ch, h, w) = x.dims4()?;
+        let (oh, ow) = (h * FUSION_UPSAMPLE, w * FUSION_UPSAMPLE);
+        let x = x.upsample_bilinear2d(oh, ow, true)?;
+        let y = self.out_w.broadcast_matmul(&x.reshape((b, ch, oh * ow))?)?.reshape((b, ch, oh, ow))?;
+        y.broadcast_add(&self.out_b)
     }
 }
 
@@ -546,7 +684,8 @@ impl Decoder {
 struct DepthHead {
     dec: Decoder,
     classifier: Linear,
-    centers: Tensor,
+    centers_col: Tensor,
+    centers_pair: Tensor,
     min_depth: f64,
 }
 
@@ -554,10 +693,15 @@ impl DepthHead {
     /// The bin classifier stays F32: 256 logits through a ReLU and a normalization make the depth and its spread.
     fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
         let vb = w.vb();
+        let centers = bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?;
+        let centers_col = centers.reshape((cfg.depth_bins, 1))?;
+        let centers_sq = centers.sqr()?.reshape((cfg.depth_bins, 1))?;
+        let centers_pair = Tensor::cat(&[&centers_col, &centers_sq], 1)?;
         Ok(DepthHead {
             dec: Decoder::new(cfg, w)?,
             classifier: linear(cfg.dpt_channels, cfg.depth_bins, vb.pp("depth_head"))?,
-            centers: bin_centers(cfg.min_depth, cfg.max_depth, cfg.depth_bins, vb.device())?,
+            centers_col,
+            centers_pair,
             min_depth: cfg.min_depth as f64,
         })
     }
@@ -566,10 +710,10 @@ impl DepthHead {
         let out = self.dec.forward(taps)?.relu()?;
         let logits = self.classifier.forward(&out.permute((0, 2, 3, 1))?.contiguous()?)?;
         if spread {
-            let (mean, sd) = decode_bins_spread(&logits, &self.centers, self.min_depth)?;
+            let (mean, sd) = decode_bins_spread(&logits, &self.centers_pair, self.min_depth)?;
             Ok((mean.unsqueeze(1)?, Some(sd.unsqueeze(1)?)))
         } else {
-            Ok((decode_bins(&logits, &self.centers, self.min_depth)?.unsqueeze(1)?, None))
+            Ok((decode_bins(&logits, &self.centers_col, self.min_depth)?.unsqueeze(1)?, None))
         }
     }
 }
@@ -641,17 +785,23 @@ fn bin_centers(min: f32, max: f32, bins: usize, device: &Device) -> candle_core:
     Tensor::from_vec(centers, bins, device)
 }
 
-fn decode_bins(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<Tensor> {
+fn decode_bins(logits: &Tensor, centers_col: &Tensor, min_depth: f64) -> candle_core::Result<Tensor> {
     let p = (logits.relu()? + min_depth)?;
     let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
-    p.broadcast_mul(centers)?.sum(D::Minus1)
+    let col = if centers_col.rank() == 1 {
+        centers_col.reshape((centers_col.dim(0)?, 1))?
+    } else {
+        centers_col.clone()
+    };
+    p.broadcast_matmul(&col)?.squeeze(D::Minus1)
 }
 
-fn decode_bins_spread(logits: &Tensor, centers: &Tensor, min_depth: f64) -> candle_core::Result<(Tensor, Tensor)> {
+fn decode_bins_spread(logits: &Tensor, centers_pair: &Tensor, min_depth: f64) -> candle_core::Result<(Tensor, Tensor)> {
     let p = (logits.relu()? + min_depth)?;
     let p = p.broadcast_div(&p.sum_keepdim(D::Minus1)?)?;
-    let mean = p.broadcast_mul(centers)?.sum(D::Minus1)?;
-    let second = p.broadcast_mul(&centers.sqr()?)?.sum(D::Minus1)?;
+    let moments = p.broadcast_matmul(centers_pair)?;
+    let mean = moments.narrow(D::Minus1, 0, 1)?.squeeze(D::Minus1)?;
+    let second = moments.narrow(D::Minus1, 1, 1)?.squeeze(D::Minus1)?;
     let var = (second - mean.sqr()?)?.relu()?;
     Ok((mean, var.sqrt()?))
 }
@@ -714,8 +864,11 @@ impl TipsDepth {
         let config_path = dir.join(CONFIG_FILE);
         let cfg = if config_path.exists() { TipsConfig::from_file(&config_path)? } else { TipsConfig::default() };
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&weights], DType::F32, device)? };
-        let w = QWeights::with_plan(vb, &weights, Family::Tips, plan)?;
-        Self::build(cfg, &w, device, heads).with_context(|| format!("loading {}", weights.display()))
+        let packed = plan.is_f32() && cpu_packed_enabled(device);
+        let w = QWeights::with_plan(vb, &weights, Family::Tips, plan)?.with_cpu_packed(packed);
+        let built = Self::build(cfg, &w, device, heads).with_context(|| format!("loading {}", weights.display()))?;
+        w.flush_cache();
+        Ok(built)
     }
 
     pub fn from_var_builder(cfg: TipsConfig, vb: VarBuilder, device: &Device) -> anyhow::Result<Self> {
@@ -735,7 +888,10 @@ impl TipsDepth {
         let normals_head = if heads.normals && has("normals_head") { Some(NormalsHead::new(&cfg, &w.pp("normals_head"))?) } else { None };
         let seg_head = if heads.segmentation && has("segmentation_head") { Some(SegHead::new(&cfg, &w.pp("segmentation_head"))?) } else { None };
         let quant = w.plan().clone();
-        let mode = format!("{MODE}{}", quant.mode_suffix(Family::Tips));
+        let mut mode = format!("{MODE}{}", quant.mode_suffix(Family::Tips));
+        if w.is_cpu_packed() {
+            mode.push_str("+cpupack");
+        }
         Ok(TipsDepth {
             cfg,
             encoder,
@@ -830,8 +986,8 @@ impl TipsDepth {
             let (cols, rows) = self.grid_for(w, h);
             for chunk in idx.chunks((policy.image_rows(cols * rows) / views).max(1)) {
                 let b = chunk.len();
-                let inputs = chunk.iter().map(|&i| model_input(frames[i], (cols * p) as u32, (rows * p) as u32, &self.device)).collect::<anyhow::Result<Vec<_>>>()?;
-                let mut pixels = Tensor::cat(&inputs, 0)?;
+                let (in_w, in_h) = ((cols * p) as u32, (rows * p) as u32);
+                let mut pixels = model_input_batch(chunk, frames, in_w, in_h, &self.device)?;
                 if views > 1 {
                     pixels = Tensor::cat(&[&pixels, &flip_w(&pixels)?], 0)?;
                 }
@@ -846,18 +1002,52 @@ impl TipsDepth {
                 let seg = match (&self.seg_head, want.segmentation) {
                     (Some(head), true) => {
                         let logits = merge_views(head.forward(&taps)?, b, views, None)?;
-                        let sky = candle_nn::ops::softmax(&logits, 1)?.narrow(1, ADE_SKY, 1)?.squeeze(1)?.contiguous()?;
+                        let m = logits.max_keepdim(1)?;
+                        let shifted = logits.broadcast_sub(&m)?;
+                        let lse = shifted.exp()?.sum_keepdim(1)?.log()?;
+                        let sky = shifted.narrow(1, ADE_SKY, 1)?.broadcast_sub(&lse)?.exp()?.squeeze(1)?.contiguous()?;
                         Some((logits.argmax(1)?, sky))
                     }
                     _ => None,
                 };
+                // Bulk D2H transfer once per output tensor instead of 5*B separate GPU syncs.
+                let frame_px = (w * h) as usize;
+                let depth_all: Vec<f32> = depth.flatten_all()?.to_vec1()?;
+                let sd_all: Option<Vec<f32>> = match &sd {
+                    Some(t) => Some(t.flatten_all()?.to_vec1()?),
+                    None => None,
+                };
+                let normals_all: Option<(usize, usize, Vec<f32>)> = match &normals {
+                    Some(t) => {
+                        let (_, _, nh, nw) = t.dims4()?;
+                        let v: Vec<f32> = t.permute((0, 2, 3, 1))?.contiguous()?.flatten_all()?.to_vec1()?;
+                        Some((nh, nw, v))
+                    }
+                    None => None,
+                };
+                let seg_all: Option<(usize, usize, Vec<u32>, Vec<f32>)> = match &seg {
+                    Some((labels, sky)) => {
+                        let (_, sh, sw) = labels.dims3()?;
+                        let l_all: Vec<u32> = labels.flatten_all()?.to_vec1()?;
+                        let s_all: Vec<f32> = sky.flatten_all()?.to_vec1()?;
+                        Some((sh, sw, l_all, s_all))
+                    }
+                    None => None,
+                };
                 for (k, &i) in chunk.iter().enumerate() {
-                    let mut map = DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth.get(k)?.flatten_all()?.to_vec1()? };
-                    clamp_metric(&mut map, self.cfg.max_depth);
-                    let sd = match &sd {
-                        Some(t) => Some(DepthMap { width: w, height: h, kind: DepthKind::Metric, data: t.get(k)?.flatten_all()?.to_vec1()? }),
-                        None => None,
+                    let mut map = DepthMap {
+                        width: w,
+                        height: h,
+                        kind: DepthKind::Metric,
+                        data: depth_all[k * frame_px..(k + 1) * frame_px].to_vec(),
                     };
+                    clamp_metric(&mut map, self.cfg.max_depth);
+                    let sd = sd_all.as_ref().map(|v| DepthMap {
+                        width: w,
+                        height: h,
+                        kind: DepthKind::Metric,
+                        data: v[k * frame_px..(k + 1) * frame_px].to_vec(),
+                    });
                     if let (Some(limit), Some(s)) = (self.max_rel_spread, &sd) {
                         for (d, e) in map.data.iter_mut().zip(&s.data) {
                             if *e > limit * *d {
@@ -865,24 +1055,23 @@ impl TipsDepth {
                             }
                         }
                     }
-                    let normals = match &normals {
-                        Some(t) => {
-                            let n = t.get(k)?;
-                            let (_, nh, nw) = n.dims3()?;
-                            let v: Vec<f32> = n.permute((1, 2, 0))?.contiguous()?.flatten_all()?.to_vec1()?;
-                            Some(NormalMap { width: nw as u32, height: nh as u32, data: v.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect() })
+                    let normals = normals_all.as_ref().map(|(nh, nw, v)| {
+                        let stride = nh * nw * 3;
+                        NormalMap {
+                            width: *nw as u32,
+                            height: *nh as u32,
+                            data: v[k * stride..(k + 1) * stride].chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
                         }
-                        None => None,
-                    };
-                    let seg = match &seg {
-                        Some((labels, sky)) => {
-                            let l = labels.get(k)?;
-                            let (sh, sw) = l.dims2()?;
-                            let labels: Vec<u32> = l.flatten_all()?.to_vec1()?;
-                            Some(SegMap { width: sw as u32, height: sh as u32, labels: labels.into_iter().map(|c| c.min(255) as u8).collect(), sky: sky.get(k)?.flatten_all()?.to_vec1()? })
+                    });
+                    let seg = seg_all.as_ref().map(|(sh, sw, l_all, s_all)| {
+                        let stride = sh * sw;
+                        SegMap {
+                            width: *sw as u32,
+                            height: *sh as u32,
+                            labels: l_all[k * stride..(k + 1) * stride].iter().map(|&c| c.min(255) as u8).collect(),
+                            sky: s_all[k * stride..(k + 1) * stride].to_vec(),
                         }
-                        None => None,
-                    };
+                    });
                     out[i] = Some(RunOut { depth: map, spread: if want_spread { sd } else { None }, normals, seg });
                 }
             }
@@ -892,23 +1081,56 @@ impl TipsDepth {
     }
 }
 
-fn model_input(rgb: &Rgb, width: u32, height: u32, device: &Device) -> anyhow::Result<Tensor> {
+fn u8_to_unit_lut() -> &'static [f32; 256] {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = i as f32 / 255.0;
+        }
+        t
+    })
+}
+
+fn rgb_to_chw_f32(rgb: &Rgb, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
     let resized;
     let data: &[u8] = if (rgb.width, rgb.height) == (width, height) {
         &rgb.data
     } else {
-        let src = image::RgbImage::from_raw(rgb.width, rgb.height, rgb.data.clone()).context("RGB buffer does not match its size")?;
+        let src = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(rgb.width, rgb.height, rgb.data.as_slice())
+            .context("RGB buffer does not match its size")?;
         resized = image::imageops::resize(&src, width, height, image::imageops::FilterType::Triangle);
         resized.as_raw()
     };
+    let lut = u8_to_unit_lut();
     let plane = (width * height) as usize;
     let mut chw = vec![0f32; 3 * plane];
+    let (r_plane, rest) = chw.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
     for (i, px) in data.chunks_exact(3).enumerate() {
-        for c in 0..3 {
-            chw[c * plane + i] = px[c] as f32 / 255.0;
-        }
+        r_plane[i] = lut[px[0] as usize];
+        g_plane[i] = lut[px[1] as usize];
+        b_plane[i] = lut[px[2] as usize];
     }
-    Ok(Tensor::from_vec(chw, (1, 3, height as usize, width as usize), device)?)
+    Ok(chw)
+}
+
+fn model_input_batch(chunk: &[usize], frames: &[&Rgb], width: u32, height: u32, device: &Device) -> anyhow::Result<Tensor> {
+    let b = chunk.len();
+    if b == 1 {
+        let chw = rgb_to_chw_f32(frames[chunk[0]], width, height)?;
+        return Ok(Tensor::from_vec(chw, (1, 3, height as usize, width as usize), device)?);
+    }
+    let per_frame: Vec<Vec<f32>> = chunk
+        .par_iter()
+        .map(|&i| rgb_to_chw_f32(frames[i], width, height))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let frame_len = 3 * (width * height) as usize;
+    let mut flat = Vec::with_capacity(b * frame_len);
+    for f in per_frame {
+        flat.extend_from_slice(&f);
+    }
+    Ok(Tensor::from_vec(flat, (b, 3, height as usize, width as usize), device)?)
 }
 
 impl DepthModel for TipsDepth {

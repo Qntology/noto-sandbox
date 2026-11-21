@@ -129,14 +129,17 @@ impl SamModel {
     fn input(&self, rgb: &Rgb) -> Result<Tensor> {
         let s = Self::scale(rgb.width, rgb.height);
         let (w, h) = (((rgb.width as f32 * s).round() as u32).clamp(1, IMAGE_SIZE as u32), ((rgb.height as f32 * s).round() as u32).clamp(1, IMAGE_SIZE as u32));
-        let src = image::RgbImage::from_raw(rgb.width, rgb.height, rgb.data.clone()).context("RGB buffer does not match its size")?;
+        let src = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(rgb.width, rgb.height, rgb.data.as_slice())
+            .context("RGB buffer does not match its size")?;
         let resized = image::imageops::resize(&src, w, h, image::imageops::FilterType::Triangle);
         let plane = (w * h) as usize;
         let mut chw = vec![0f32; 3 * plane];
+        let (r_plane, rest) = chw.split_at_mut(plane);
+        let (g_plane, b_plane) = rest.split_at_mut(plane);
         for (i, px) in resized.as_raw().chunks_exact(3).enumerate() {
-            for c in 0..3 {
-                chw[c * plane + i] = px[c] as f32;
-            }
+            r_plane[i] = px[0] as f32;
+            g_plane[i] = px[1] as f32;
+            b_plane[i] = px[2] as f32;
         }
         let t = Tensor::from_vec(chw, (3, h as usize, w as usize), &self.device)?.broadcast_sub(&self.mean)?.broadcast_div(&self.std)?;
         Ok(t.pad_with_zeros(1, 0, IMAGE_SIZE - h as usize)?.pad_with_zeros(2, 0, IMAGE_SIZE - w as usize)?)
@@ -293,6 +296,9 @@ impl SamTracker {
     fn remember(&mut self, key: u64, emb: Tensor) {
         if self.cache.insert(key, emb).is_none() {
             self.order.push_back(key);
+        } else {
+            self.order.retain(|&k| k != key);
+            self.order.push_back(key);
         }
         while self.order.len() > self.cfg.cache_frames.max(1) {
             if let Some(old) = self.order.pop_front() {
@@ -303,8 +309,10 @@ impl SamTracker {
 
     fn embedding(&mut self, rgb: &Rgb) -> Result<Tensor> {
         let key = image_key(rgb);
-        if let Some(e) = self.cache.get(&key) {
-            return Ok(e.clone());
+        if let Some(e) = self.cache.get(&key).cloned() {
+            self.order.retain(|&k| k != key);
+            self.order.push_back(key);
+            return Ok(e);
         }
         let e = self.model.encode_batch(&[rgb])?.pop().expect("one embedding per frame");
         self.encoded += 1;

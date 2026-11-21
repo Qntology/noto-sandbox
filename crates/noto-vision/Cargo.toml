@@ -15,6 +15,7 @@ candle-core = { workspace = true }
 candle-nn = { workspace = true }
 candle-transformers = { workspace = true }
 noto-ml = { path = "../noto-ml" }
+noto-cpu-kernels = { path = "../noto-cpu-kernels" }
 noto-ts = { path = "../noto-ts" }
 noto-core = { path = "../noto-core" }
 

@@ -269,8 +269,8 @@ pub fn perforated_heats(
     let first = first_cells(cols, rows, perf.pattern, horizon.map(|i| horizon_row(i, rows)));
     let mut sd = model.embed_dense_sparse(image, cfg.grid, &first)?;
     let mut rep = PerfReport { cells: gh * gw, first: first.len(), ..PerfReport::default() };
+    let (mut heats, mut presence) = evaluated_heats(&sd, texts, cfg, scale, bias);
     if let Some(x) = &perf.expand {
-        let (mut heats, _) = evaluated_heats(&sd, texts, cfg, scale, bias);
         let seed_cells = seeds(&heats, cols, rows, x);
         rep.seeds = seed_cells.len();
         for round in 0..x.rounds {
@@ -281,12 +281,13 @@ pub fn perforated_heats(
             }
             model.open_cells(&mut sd, &add)?;
             rep.opened += add.len();
-            heats = evaluated_heats(&sd, texts, cfg, scale, bias).0;
+            let next = evaluated_heats(&sd, texts, cfg, scale, bias);
+            heats = next.0;
+            presence = next.1;
         }
     }
     rep.tokens_run = sd.tokens_run;
     let open: Vec<bool> = sd.vectors.iter().map(Option::is_some).collect();
-    let (mut heats, presence) = evaluated_heats(&sd, texts, cfg, scale, bias);
     for h in heats.iter_mut() {
         fill_holes(h, &open, cols, rows);
     }

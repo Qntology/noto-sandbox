@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/noto-core",
+    "crates/noto-cpu-kernels",
     "crates/noto-ml",
     "crates/noto-data",
     "crates/world-sim",
@@ -35,8 +36,8 @@ candle-nn = "0.11.0"
 candle-transformers = "0.11.0"
 
 [patch.crates-io]
-candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "2191c7ad898d866c4db5380ea1fc13a98f435e0c" }
-candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "2191c7ad898d866c4db5380ea1fc13a98f435e0c" }
+candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
+candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463" }
 
 [profile.dev.package.candle-core]
 opt-level = 3
@@ -78,6 +79,12 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.noto-core]
+opt-level = 3
+
+[profile.dev.package.noto-cpu-kernels]
+opt-level = 3
+
+[profile.dev.package.noto-ts]
 opt-level = 3
 
 [profile.release]

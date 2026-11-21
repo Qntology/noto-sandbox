@@ -334,7 +334,11 @@ impl RegionTracker {
 
 impl MaskTracker for RegionTracker {
     fn mode(&self) -> &str {
-        "region-grow"
+        if self.extent.is_some() {
+            "region-grow+clamp"
+        } else {
+            "region-grow"
+        }
     }
 
     fn reset(&mut self) {
@@ -493,11 +497,15 @@ mod tests {
         }
         let (rgb, depth) = (Rgb::new(w, h, rgb), DepthMap { width: w, height: h, kind: DepthKind::Metric, data: depth });
         let prompt = [PointPrompt { label: "stone".into(), px: 30.0, py: 30.0, score: 0.8 }];
-        let free = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).update(&rgb, Some(&depth), &prompt).unwrap();
+        let mut free_tracker = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() });
+        assert_eq!(free_tracker.mode(), "region-grow");
+        let free = free_tracker.update(&rgb, Some(&depth), &prompt).unwrap();
         assert!(free[0].mask.area() >= 780, "both blocks (less the corners the median filter rounds): {}", free[0].mask.area());
         // f = 80 px, R = 0.5 m at 4 m: 10 px each way from the seed.
         let clamp = ExtentClamp { focal_px: 80.0, radius_m: [("stone".to_string(), 0.5)].into_iter().collect() };
-        let kept = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).with_extent(clamp.clone()).update(&rgb, Some(&depth), &prompt).unwrap();
+        let mut kept_tracker = RegionTracker::new(RegionCfg { downscale: 1, ..RegionCfg::default() }).with_extent(clamp.clone());
+        assert_eq!(kept_tracker.mode(), "region-grow+clamp");
+        let kept = kept_tracker.update(&rgb, Some(&depth), &prompt).unwrap();
         let b = kept[0].bbox;
         assert!(b[0] >= 20.0 && b[2] <= 41.5 && kept[0].mask.area() < 500, "{b:?} {}", kept[0].mask.area());
         // A label with no size grows as before.

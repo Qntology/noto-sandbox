@@ -15,7 +15,8 @@ half = "2"
 tokenizers = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
-candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "2191c7ad898d866c4db5380ea1fc13a98f435e0c", optional = true }
+noto-cpu-kernels = { path = "../noto-cpu-kernels" }
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "881b3c807a2fedff0e1fa9e9a80ee16cc0e93463", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"], optional = true }

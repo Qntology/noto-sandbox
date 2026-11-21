@@ -764,7 +764,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=2191c7ad898d866c4db5380ea1fc13a98f435e0c#2191c7ad898d866c4db5380ea1fc13a98f435e0c"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=881b3c807a2fedff0e1fa9e9a80ee16cc0e93463#881b3c807a2fedff0e1fa9e9a80ee16cc0e93463"
 dependencies = [
  "ash",
  "byteorder",
@@ -824,7 +824,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=2191c7ad898d866c4db5380ea1fc13a98f435e0c#2191c7ad898d866c4db5380ea1fc13a98f435e0c"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=881b3c807a2fedff0e1fa9e9a80ee16cc0e93463#881b3c807a2fedff0e1fa9e9a80ee16cc0e93463"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "candle-rocm"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=2191c7ad898d866c4db5380ea1fc13a98f435e0c#2191c7ad898d866c4db5380ea1fc13a98f435e0c"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=881b3c807a2fedff0e1fa9e9a80ee16cc0e93463#881b3c807a2fedff0e1fa9e9a80ee16cc0e93463"
 dependencies = [
  "candle-core",
 ]
@@ -3555,7 +3555,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 [[package]]
 name = "hip-runtime"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=2191c7ad898d866c4db5380ea1fc13a98f435e0c#2191c7ad898d866c4db5380ea1fc13a98f435e0c"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=881b3c807a2fedff0e1fa9e9a80ee16cc0e93463#881b3c807a2fedff0e1fa9e9a80ee16cc0e93463"
 dependencies = [
  "hip-sys",
 ]
@@ -3563,7 +3563,7 @@ dependencies = [
 [[package]]
 name = "hip-sys"
 version = "0.2.0"
-source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=2191c7ad898d866c4db5380ea1fc13a98f435e0c#2191c7ad898d866c4db5380ea1fc13a98f435e0c"
+source = "git+https://github.com/Qntology/candle-rocm-vulkan?rev=881b3c807a2fedff0e1fa9e9a80ee16cc0e93463#881b3c807a2fedff0e1fa9e9a80ee16cc0e93463"
 
 [[package]]
 name = "html5ever"
@@ -5558,6 +5558,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "noto-cpu-kernels"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "noto-data"
 version = "0.1.0"
 dependencies = [
@@ -5581,6 +5588,7 @@ dependencies = [
  "candle-rocm",
  "half",
  "image",
+ "noto-cpu-kernels",
  "rayon",
  "serde",
  "serde_json",
@@ -5680,6 +5688,7 @@ dependencies = [
  "candle-transformers",
  "image",
  "noto-core",
+ "noto-cpu-kernels",
  "noto-ml",
  "noto-ts",
  "rayon",

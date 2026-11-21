@@ -173,7 +173,7 @@ impl LocateCfg {
                 "tpl" => cfg.templates = templates.to_vec(),
                 "pyr" => cfg.grid = DenseGrid::pyramid(),
                 p if p.starts_with("perf") => cfg.perforated = Some(crate::perforate::PerforatedCfg::from_tag(p)?),
-                "fqkv" => {}
+                "fqkv" | "cpupack" | "fa" => {}
                 p if p.starts_with("q-") => {}
                 _ => return None,
             }
@@ -250,7 +250,12 @@ impl SiglipLocator {
     }
 
     fn text_vectors(&mut self, phrases: &[String]) -> Result<Vec<Vec<f32>>> {
-        let missing: Vec<&str> = phrases.iter().filter(|p| !self.cache.contains_key(*p)).map(String::as_str).collect();
+        let mut seen = std::collections::HashSet::new();
+        let missing: Vec<&str> = phrases
+            .iter()
+            .filter(|p| !self.cache.contains_key(*p) && seen.insert(p.as_str()))
+            .map(String::as_str)
+            .collect();
         if !missing.is_empty() {
             let v = self.model.embed_texts(&missing)?;
             for (p, e) in missing.iter().zip(v) {
@@ -264,16 +269,36 @@ impl SiglipLocator {
         if templates.is_empty() {
             return self.text_vectors(phrases);
         }
-        let mut out = Vec::with_capacity(phrases.len());
-        for p in phrases {
-            let forms: Vec<String> = templates.iter().map(|t| apply_template(t, p)).collect();
-            let v = self.text_vectors(&forms)?;
-            out.push(mean_unit(&v).unwrap_or_default());
-        }
-        Ok(out)
+        let all_forms: Vec<String> = phrases
+            .iter()
+            .flat_map(|p| templates.iter().map(move |t| apply_template(t, p)))
+            .collect();
+        let all_vecs = self.text_vectors(&all_forms)?;
+        let n_tpl = templates.len();
+        Ok(all_vecs.chunks(n_tpl).map(|chunk| mean_unit(chunk).unwrap_or_default()).collect())
     }
 
     pub fn label_texts(&mut self, labels: &[LabelPrompt], cfg: &LocateCfg) -> Result<LabelTexts> {
+        // Warm all missing (label/negative/background × template) phrases in a single batched `embed_texts` call.
+        let mut batch_strings: Vec<String> = Vec::new();
+        let push_forms = |out: &mut Vec<String>, phrases: &[String]| {
+            if cfg.templates.is_empty() {
+                out.extend(phrases.iter().cloned());
+            } else {
+                for p in phrases {
+                    for t in &cfg.templates {
+                        out.push(apply_template(t, p));
+                    }
+                }
+            }
+        };
+        for l in labels {
+            push_forms(&mut batch_strings, &l.prompts);
+            push_forms(&mut batch_strings, &l.negatives);
+        }
+        push_forms(&mut batch_strings, &cfg.background);
+        let _ = self.text_vectors(&batch_strings)?;
+
         let mut out = LabelTexts::default();
         for l in labels {
             let pos = self.phrase_vectors(&l.prompts, &cfg.templates)?;
@@ -295,7 +320,11 @@ pub fn apply_template(template: &str, phrase: &str) -> String {
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    if a.len() == b.len() {
+        noto_cpu_kernels::dot_f32_simd(a, b)
+    } else {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
 }
 
 pub fn label_heats(dense: &noto_ml::DenseEmbedding, texts: &LabelTexts, cfg: &LocateCfg, logit_scale: f32, logit_bias: f32) -> Vec<(String, Heat, f32)> {

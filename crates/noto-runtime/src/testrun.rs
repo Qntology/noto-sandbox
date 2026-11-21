@@ -328,16 +328,31 @@ impl Runtime {
         let prev_pass = std::mem::replace(&mut self.pass, "game".into());
         let run = t.game.as_ref().map(|g| g.run_id.clone()).unwrap_or_default();
         let prev_run = std::mem::replace(&mut self.run_id, run);
+        let mut decoded: HashMap<usize, Rgb> = HashMap::new();
         if let Some(g) = t.game.as_ref() {
-            let rgbs: Vec<Rgb> = (t.perceive_next..end).filter_map(|i| g.keyframes.get(i).and_then(|k| k.rgb().ok())).collect();
-            let refs: Vec<&Rgb> = rgbs.iter().collect();
-            if let Err(e) = self.ml.prefetch(&refs) {
+            let mut intrs: Vec<(usize, noto_vision::Intrinsics)> = Vec::new();
+            for i in t.perceive_next..end {
+                if let Some(k) = g.keyframes.get(i) {
+                    if let Ok(rgb) = k.rgb() {
+                        decoded.insert(i, rgb);
+                        intrs.push((i, k.intr));
+                    }
+                }
+            }
+            let refs: Vec<(&Rgb, Option<&noto_vision::Intrinsics>)> = intrs
+                .iter()
+                .filter_map(|(i, intr)| decoded.get(i).map(|rgb| (rgb, Some(intr))))
+                .collect();
+            if let Err(e) = self.ml.prefetch_with_cameras(&refs) {
                 t.notes.push(format!("일괄 추론 실패, 키프레임마다 다시 계산: {e}"));
             }
         }
         for i in t.perceive_next..end {
             let Some(mut kf) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)).map(|k| std::mem::replace(k, placeholder(k))) else { continue };
-            let res = self.ml_analyse(&mut kf, &wanted, None);
+            let res = match decoded.remove(&i) {
+                Some(rgb) => self.ml_analyse_with_rgb(&mut kf, &rgb, &wanted, None),
+                None => self.ml_analyse(&mut kf, &wanted, None),
+            };
             if let Ok(out) = res {
                 if let Some(s) = out.sighting {
                     let rays = t.rays.entry(s.track_id).or_default();

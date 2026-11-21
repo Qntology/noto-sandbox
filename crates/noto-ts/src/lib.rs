@@ -10,7 +10,7 @@ pub mod ttm;
 mod ttm_predictor;
 
 pub use fusion::{forecast, Band, EwmaPredictor, Forecast, HistoryMse, HoltPredictor, LastPredictor, MethodWeight, Predictor};
-pub use gate::{temporal_gate, GateConfig, TemporalOutcome, TemporalVerdict};
+pub use gate::{temporal_gate, temporal_gate_with_forecast, GateConfig, TemporalOutcome, TemporalVerdict};
 pub use holt::{holt_damped, HoltFit};
 #[cfg(feature = "granite")]
 pub use ttm_predictor::TtmPredictor;
