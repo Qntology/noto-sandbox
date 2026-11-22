@@ -290,7 +290,11 @@ impl Mlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = fast_gelu_tanh(&self.fc1.forward(x)?, self.cpu_packed)?;
+        let h = if self.fc1.is_cpu_packed() || matches!(x.device(), candle_core::Device::Cuda(_) | candle_core::Device::Rocm(_)) {
+            self.fc1.forward_gelu(x, false)?
+        } else {
+            fast_gelu_tanh(&self.fc1.forward(x)?, self.cpu_packed)?
+        };
         self.fc2.forward(&h)
     }
 }

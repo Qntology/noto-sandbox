@@ -567,6 +567,9 @@ enum FftEmbed {
 struct FftTokens {
     k: usize,
     max_bins: usize,
+    context_length: usize,
+    cos_lut: Vec<f64>,
+    sin_lut: Vec<f64>,
     embed: FftEmbed,
     one: Option<(Linear, usize)>,
     ignore_dc: bool,
@@ -860,9 +863,20 @@ impl Predictor {
                     candle_nn::linear(dim, dim, fv.pp("freq_index_mlp").pp(2))?,
                 )
             };
+            let sl = sc.context_length.max(1);
+            let mut cos_lut = Vec::with_capacity(sl);
+            let mut sin_lut = Vec::with_capacity(sl);
+            for m in 0..sl {
+                let a = -2.0 * std::f64::consts::PI * (m as f64) / (sl as f64);
+                cos_lut.push(a.cos());
+                sin_lut.push(a.sin());
+            }
             Some(FftTokens {
                 k,
                 max_bins,
+                context_length: sl,
+                cos_lut,
+                sin_lut,
                 embed,
                 one,
                 ignore_dc: cfg.fft_ignore_dc,
@@ -992,19 +1006,35 @@ impl Predictor {
             x = Tensor::cat(&[&r.unsqueeze(0)?.unsqueeze(0)?, &x], 2)?;
         }
         if let Some(f) = &self.fft {
-            let raw: Vec<f64> = scaled[..sl].to_vec();
+            let raw = &scaled[..sl];
             let bins = f.max_bins;
+            let use_lut = sl == f.context_length;
             let mut mag: Vec<(usize, f64)> = (0..bins)
                 .map(|kf| {
+                    if f.ignore_dc && kf == 0 {
+                        return (0, 0.0);
+                    }
                     let mut re = 0.0;
                     let mut im = 0.0;
-                    for (tt, v) in raw.iter().enumerate() {
-                        let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / sl as f64;
-                        re += v * a.cos();
-                        im += v * a.sin();
+                    if use_lut {
+                        let step = kf % sl;
+                        let mut idx = 0usize;
+                        for &v in raw {
+                            re += v * f.cos_lut[idx];
+                            im += v * f.sin_lut[idx];
+                            idx += step;
+                            if idx >= sl {
+                                idx -= sl;
+                            }
+                        }
+                    } else {
+                        for (tt, &v) in raw.iter().enumerate() {
+                            let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / sl as f64;
+                            re += v * a.cos();
+                            im += v * a.sin();
+                        }
                     }
-                    let m = (re * re + im * im).sqrt();
-                    (kf, if f.ignore_dc && kf == 0 { 0.0 } else { m })
+                    (kf, (re * re + im * im).sqrt())
                 })
                 .collect();
             mag.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
@@ -1080,8 +1110,9 @@ fn sincos_pe(n: usize, d: usize, device: &Device) -> Result<Tensor> {
 
 fn lower_median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    s[(s.len() - 1) / 2]
+    let mid = (s.len() - 1) / 2;
+    let (_, val, _) = s.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    *val
 }
 
 pub fn robust_lowess_like(x: &[f64], frac: f64, iters: usize) -> Vec<f64> {

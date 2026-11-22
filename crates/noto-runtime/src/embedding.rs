@@ -231,9 +231,18 @@ impl Recognizer for EmbeddingPerception {
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {
         let f = input.frame;
         let (w, h) = (f.width as u32, f.height as u32);
-        let enc = encode_webp(&f.rgb, w, h, self.cfg.webp_quality).map_err(|e| anyhow!("스크린샷 WebP 인코딩 실패: {e}"))?;
-        let (dw, dh, rgb) = decode_webp(&enc.bytes).map_err(|e| anyhow!("스크린샷 WebP 디코딩 실패: {e}"))?;
-        let img = DynamicImage::ImageRgb8(RgbImage::from_raw(dw, dh, rgb).ok_or_else(|| anyhow!("디코딩한 프레임의 크기가 맞지 않습니다"))?);
+        let (dw, dh, img) = if self.cfg.webp_quality >= 100.0 {
+            // Skip redundant lossless WebP encode+decode round-trip when full RGB quality is requested.
+            let img = DynamicImage::ImageRgb8(
+                RgbImage::from_raw(w, h, f.rgb.clone()).ok_or_else(|| anyhow!("프레임의 크기가 맞지 않습니다"))?,
+            );
+            (w, h, img)
+        } else {
+            let enc = encode_webp(&f.rgb, w, h, self.cfg.webp_quality).map_err(|e| anyhow!("스크린샷 WebP 인코딩 실패: {e}"))?;
+            let (dw, dh, rgb) = decode_webp(&enc.bytes).map_err(|e| anyhow!("스크린샷 WebP 디코딩 실패: {e}"))?;
+            let img = DynamicImage::ImageRgb8(RgbImage::from_raw(dw, dh, rgb).ok_or_else(|| anyhow!("디코딩한 프레임의 크기가 맞지 않습니다"))?);
+            (dw, dh, img)
+        };
 
         let hv = input.world.head_view(input.camera);
         let view = hv.est;

@@ -562,18 +562,17 @@ pub fn sgbm(left: &Rgb, right: &Rgb, rig: &StereoRig, cfg: &SgbmCfg, pyramid: Op
     let f = rig.focal_on(left.width, gw);
     let fb = f * rig.baseline_m;
     let nd = ((fb / cfg.min_depth_m.max(0.05)).ceil() as usize + 2).next_multiple_of(8).clamp(8, (w / 2).max(8));
-    let (gl, ml) = grey_on(left, gw, gh);
-    let (gr, mr) = grey_on(right, gw, gh);
-    let (cl, sd) = census(&gl, w, h);
-    let (cr, _) = census(&gr, w, h);
+    let ((gl, ml), (gr, mr)) = rayon::join(|| grey_on(left, gw, gh), || grey_on(right, gw, gh));
+    let ((cl, sd), (cr, _)) = rayon::join(|| census(&gl, w, h), || census(&gr, w, h));
     let block = cfg.block as usize;
     let cost = costs(&cl, &cr, w, h, nd, block);
     let sum = aggregate(&cost, &gl, w, h, nd, cfg);
 
     // The right image's own best disparity at each of its pixels, from the same aggregated costs: S_R(xr, d) =
     // S(xr + d, d).
+    use rayon::prelude::*;
     let mut right_disp = vec![-1i32; w * h];
-    for y in 0..h {
+    right_disp.par_chunks_mut(w).enumerate().for_each(|(y, r_row)| {
         for xr in 0..w {
             let (mut best, mut bd) = (u16::MAX, -1i32);
             for d in 0..nd.min(w - xr) {
@@ -583,68 +582,80 @@ pub fn sgbm(left: &Rgb, right: &Rgb, rig: &StereoRig, cfg: &SgbmCfg, pyramid: Op
                     bd = d as i32;
                 }
             }
-            right_disp[y * w + xr] = bd;
+            r_row[xr] = bd;
         }
-    }
+    });
 
     let edge = CENSUS_R as usize + block;
     let mut disp = vec![f32::NAN; w * h];
     let mut why = vec![Why::Valid; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            let i = y * w + x;
-            if x < edge || y < edge || x + edge >= w || y + edge >= h {
-                why[i] = Why::Border;
-                continue;
-            }
-            if ml[i] >= cfg.saturated {
-                why[i] = Why::Saturated;
-                continue;
-            }
-            if sd[i] < cfg.min_texture {
-                why[i] = Why::NoTexture;
-                continue;
-            }
-            let s = &sum[i * nd..i * nd + nd];
-            let top = nd.min(x + 1);
-            let (mut best, mut bd) = (u16::MAX, 0usize);
-            for (d, &v) in s.iter().enumerate().take(top) {
-                if v < best {
-                    best = v;
-                    bd = d;
+    disp.par_chunks_mut(w)
+        .zip(why.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(y, (disp_row, why_row))| {
+            for x in 0..w {
+                let i = y * w + x;
+                if x < edge || y < edge || x + edge >= w || y + edge >= h {
+                    why_row[x] = Why::Border;
+                    continue;
                 }
+                if ml[i] >= cfg.saturated {
+                    why_row[x] = Why::Saturated;
+                    continue;
+                }
+                if sd[i] < cfg.min_texture {
+                    why_row[x] = Why::NoTexture;
+                    continue;
+                }
+                let s = &sum[i * nd..i * nd + nd];
+                let top = nd.min(x + 1);
+                let (mut best, mut bd) = (u16::MAX, 0usize);
+                for (d, &v) in s.iter().enumerate().take(top) {
+                    if v < best {
+                        best = v;
+                        bd = d;
+                    }
+                }
+                let second = s
+                    .iter()
+                    .enumerate()
+                    .take(top)
+                    .filter(|(d, _)| d.abs_diff(bd) > 1)
+                    .map(|(_, &v)| v)
+                    .min()
+                    .unwrap_or(u16::MAX);
+                // A tie is not a win, even at zero cost (a pattern that repeats matches perfectly at every period).
+                if (second as f32) * (1.0 - cfg.uniqueness) <= best as f32 {
+                    why_row[x] = Why::NotUnique;
+                    continue;
+                }
+                // The pixel's own matching cost must single the disparity out too. Where another disparity more than one
+                // away matches as well or better, the paths' smoothness alone made the choice — on a repeating pattern
+                // it carries whatever the image edge said across the whole row — and the depth would be a guess.
+                let c = &cost[i * nd..i * nd + nd];
+                if c.iter().enumerate().take(top).any(|(d, &v)| d.abs_diff(bd) > 1 && v <= c[bd]) {
+                    why_row[x] = Why::NotUnique;
+                    continue;
+                }
+                let mut d = bd as f32;
+                if bd > 0 && bd + 1 < top {
+                    d += subpixel(s[bd - 1] as f32, s[bd] as f32, s[bd + 1] as f32, cfg.subpixel);
+                }
+                let xr = x as i64 - d.round() as i64;
+                let ok = xr >= 0
+                    && right_disp[y * w + xr as usize] >= 0
+                    && (d - right_disp[y * w + xr as usize] as f32).abs() <= cfg.lr_max_diff;
+                if !ok {
+                    why_row[x] = Why::LrMismatch;
+                    continue;
+                }
+                if xr >= 0 && mr[y * w + xr as usize] >= cfg.saturated {
+                    why_row[x] = Why::Saturated;
+                    continue;
+                }
+                disp_row[x] = d;
             }
-            let second = s.iter().enumerate().take(top).filter(|(d, _)| d.abs_diff(bd) > 1).map(|(_, &v)| v).min().unwrap_or(u16::MAX);
-            // A tie is not a win, even at zero cost (a pattern that repeats matches perfectly at every period).
-            if (second as f32) * (1.0 - cfg.uniqueness) <= best as f32 {
-                why[i] = Why::NotUnique;
-                continue;
-            }
-            // The pixel's own matching cost must single the disparity out too. Where another disparity more than one
-            // away matches as well or better, the paths' smoothness alone made the choice — on a repeating pattern
-            // it carries whatever the image edge said across the whole row — and the depth would be a guess.
-            let c = &cost[i * nd..i * nd + nd];
-            if c.iter().enumerate().take(top).any(|(d, &v)| d.abs_diff(bd) > 1 && v <= c[bd]) {
-                why[i] = Why::NotUnique;
-                continue;
-            }
-            let mut d = bd as f32;
-            if bd > 0 && bd + 1 < top {
-                d += subpixel(s[bd - 1] as f32, s[bd] as f32, s[bd + 1] as f32, cfg.subpixel);
-            }
-            let xr = x as i64 - d.round() as i64;
-            let ok = xr >= 0 && right_disp[y * w + xr as usize] >= 0 && (d - right_disp[y * w + xr as usize] as f32).abs() <= cfg.lr_max_diff;
-            if !ok {
-                why[i] = Why::LrMismatch;
-                continue;
-            }
-            if xr >= 0 && mr[y * w + xr as usize] >= cfg.saturated {
-                why[i] = Why::Saturated;
-                continue;
-            }
-            disp[i] = d;
-        }
-    }
+        });
     remove_speckles(&mut disp, &mut why, w, h, cfg.speckle_px, cfg.speckle_range);
 
     let mut stats = StereoStats { width: gw, height: gh, disparities: nd as u32, focal_px: f, baseline_m: rig.baseline_m, ..StereoStats::default() };

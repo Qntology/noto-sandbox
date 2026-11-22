@@ -20,15 +20,17 @@ pub const VULKAN_TRIM_MIN_BYTES: usize = 64 << 20;
 pub enum AccelOp {
     Matmul,
     Softmax,
+    LayerNorm,
     QuantQ8,
     FlashAttn,
     Conv2d,
 }
 
 impl AccelOp {
-    pub const ALL: [AccelOp; 5] = [
+    pub const ALL: [AccelOp; 6] = [
         AccelOp::Matmul,
         AccelOp::Softmax,
+        AccelOp::LayerNorm,
         AccelOp::QuantQ8,
         AccelOp::FlashAttn,
         AccelOp::Conv2d,
@@ -38,6 +40,7 @@ impl AccelOp {
         match self {
             AccelOp::Matmul => "matmul",
             AccelOp::Softmax => "softmax",
+            AccelOp::LayerNorm => "layer_norm",
             AccelOp::QuantQ8 => "q8_0",
             AccelOp::FlashAttn => "flash_attn",
             AccelOp::Conv2d => "conv2d",
@@ -137,6 +140,25 @@ fn run_accel_probe(device: &Device, op: AccelOp) -> Result<bool> {
             let a = Tensor::from_vec(det(N * N, 3), (N, N), &Device::Cpu)?;
             let got = softmax_last_dim(&a.to_device(device)?)?;
             same(got, softmax_last_dim(&a)?)
+        }
+        AccelOp::LayerNorm => {
+            // Includes +1000.0 DC-offset probe (BUG LN-1) against two-pass f64 CPU reference.
+            let (rows, h) = (4usize, 128usize);
+            let x_vals: Vec<f32> = det(rows * h, 9)
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| if i / h >= 2 { v * 0.05 + 1000.0 } else { v })
+                .collect();
+            let w_vals = det(h, 10);
+            let b_vals = det(h, 12);
+            let mut ref_vals = vec![0.0f32; rows * h];
+            noto_cpu_kernels::layer_norm(&x_vals, h, &w_vals, Some(&b_vals), 1e-6, &mut ref_vals);
+            let ref_t = Tensor::from_vec(ref_vals, (rows, h), &Device::Cpu)?;
+            let x_dev = Tensor::from_vec(x_vals, (rows, h), &Device::Cpu)?.to_device(device)?;
+            let w_dev = Tensor::from_vec(w_vals, h, &Device::Cpu)?.to_device(device)?;
+            let b_dev = Tensor::from_vec(b_vals, h, &Device::Cpu)?.to_device(device)?;
+            let got = candle_nn::ops::layer_norm(&x_dev, &w_dev, &b_dev, 1e-6)?;
+            same_tol(got, ref_t, 5e-3)
         }
         AccelOp::QuantQ8 => {
             use candle_core::quantized::GgmlDType;
@@ -312,8 +334,13 @@ impl Backend {
             return Ok(d.clone());
         }
         let d = self.open(ordinal)?;
+        let actual = device_ordinal(&d);
         let mut g = cache.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(g.entry((self, ordinal)).or_insert(d).clone())
+        let dev = g.entry((self, ordinal)).or_insert(d).clone();
+        if actual != ordinal {
+            g.entry((self, actual)).or_insert_with(|| dev.clone());
+        }
+        Ok(dev)
     }
 
     pub fn open(self, ordinal: usize) -> Result<Device> {
@@ -366,7 +393,9 @@ impl Backend {
                     };
                     let d = d?;
                     ROCM_USED.store(true, Ordering::SeqCst);
-                    ROCM_ORDINAL.store(ordinal, Ordering::SeqCst);
+                    if ordinal < 64 {
+                        ROCM_ORDINALS.fetch_or(1u64 << ordinal, Ordering::SeqCst);
+                    }
                     return Ok(d);
                 }
                 #[cfg(not(feature = "rocm"))]
@@ -481,7 +510,10 @@ pub fn select(request: Option<&str>) -> Selection {
             return Selection { backend: b, ordinal: 0, reason: format!("{DEVICE_ENV}=cpu") };
         }
         match b.device(ordinal) {
-            Ok(_) => return Selection { backend: b, ordinal, reason: format!("{DEVICE_ENV}={}:{ordinal}", b.name()) },
+            Ok(d) => {
+                let actual = device_ordinal(&d);
+                return Selection { backend: b, ordinal: actual, reason: format!("{DEVICE_ENV}={}:{actual}", b.name()) };
+            }
             Err(e) => notes.push(format!("{} 장치 {ordinal}을 열 수 없음: {e}", b.name())),
         }
     }
@@ -490,9 +522,10 @@ pub fn select(request: Option<&str>) -> Selection {
             continue;
         }
         match b.device(ordinal) {
-            Ok(_) => {
-                notes.push(format!("이 빌드의 첫 GPU 백엔드 {}:{ordinal}", b.name()));
-                return Selection { backend: b, ordinal, reason: notes.join("; ") };
+            Ok(d) => {
+                let actual = device_ordinal(&d);
+                notes.push(format!("이 빌드의 첫 GPU 백엔드 {}:{actual}", b.name()));
+                return Selection { backend: b, ordinal: actual, reason: notes.join("; ") };
             }
             Err(e) => notes.push(format!("{}: {e}", b.name())),
         }
@@ -604,7 +637,7 @@ impl BatchPolicy {
 }
 
 static ROCM_USED: AtomicBool = AtomicBool::new(false);
-static ROCM_ORDINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ROCM_ORDINALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn rocm_exit_now_if_used(code: u32) {
     #[cfg(all(windows, feature = "rocm"))]
@@ -616,9 +649,16 @@ pub fn rocm_exit_now_if_used(code: u32) {
         if std::env::var("NOTO_ROCM_FAST_EXIT").map(|v| v.trim() == "0").unwrap_or(false) {
             return;
         }
-        let ord = ROCM_ORDINAL.load(Ordering::SeqCst);
-        if let Ok(d) = Backend::Rocm.device(ord) {
-            drain_gpu_pool(&d);
+        let mut mask = ROCM_ORDINALS.load(Ordering::SeqCst);
+        if mask == 0 {
+            mask = 1;
+        }
+        while mask != 0 {
+            let ord = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            if let Ok(d) = Backend::Rocm.device(ord) {
+                drain_gpu_pool(&d);
+            }
         }
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
@@ -628,7 +668,7 @@ pub fn rocm_exit_now_if_used(code: u32) {
         }
     }
     let _ = code;
-    let _ = (ROCM_USED.load(Ordering::Relaxed), ROCM_ORDINAL.load(Ordering::Relaxed));
+    let _ = (ROCM_USED.load(Ordering::Relaxed), ROCM_ORDINALS.load(Ordering::Relaxed));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -772,6 +812,7 @@ mod tests {
         println!("[ACCEL] {}", accel_diagnose(&dev));
         assert!(accel_op_ok(&dev, AccelOp::Matmul), "matmul should pass on {:?}", sel.backend);
         assert!(accel_op_ok(&dev, AccelOp::Softmax), "softmax should pass on {:?}", sel.backend);
+        assert!(accel_op_ok(&dev, AccelOp::LayerNorm), "layer_norm (+1000 DC-offset BUG LN-1) should pass on {:?}", sel.backend);
         assert!(accel_op_ok(&dev, AccelOp::QuantQ8), "pyramid quant (Q8_0/Q4K/Q5K/Q6K) should pass on {:?}", sel.backend);
         assert!(accel_op_ok(&dev, AccelOp::FlashAttn), "flash_attn should pass on {:?}", sel.backend);
         assert!(accel_op_ok(&dev, AccelOp::Conv2d), "conv2d should pass on {:?}", sel.backend);

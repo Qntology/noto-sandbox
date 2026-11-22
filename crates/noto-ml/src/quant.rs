@@ -609,12 +609,89 @@ impl QLinear {
     pub fn from_dense_packed(weight: &Tensor, bias: Option<&Tensor>) -> candle_core::Result<QLinear> {
         let (out_dim, in_dim) = weight.dims2()?;
         let w_flat = weight.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-        let packed = Arc::new(noto_cpu_kernels::PackedW::pack(&w_flat, out_dim, in_dim));
+        let packed = Arc::new(noto_cpu_kernels::PackedW::pack_padded(&w_flat, out_dim, in_dim));
         let b = match bias {
             Some(bt) => Some(bt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
             None => None,
         };
         Ok(QLinear::CpuPacked { w: packed, b })
+    }
+
+    fn forward_cpu_packed(
+        w: &noto_cpu_kernels::PackedW,
+        b: Option<&[f32]>,
+        x: &Tensor,
+        epilogue: noto_cpu_kernels::Epilogue,
+    ) -> candle_core::Result<Tensor> {
+        if !x.device().is_cpu() || x.dtype() != DType::F32 {
+            candle_core::bail!("QLinear::CpuPacked requires CPU F32 tensor, got {:?} {:?}", x.device(), x.dtype());
+        }
+        let dims = x.dims();
+        if dims.is_empty() || dims[dims.len() - 1] != w.k {
+            candle_core::bail!("QLinear::CpuPacked input {:?} incompatible with k={}", dims, w.k);
+        }
+        let m: usize = dims[..dims.len() - 1].iter().product();
+        let mut out_dims = dims.to_vec();
+        *out_dims.last_mut().unwrap() = w.n_valid;
+        if m == 0 {
+            return Tensor::zeros(out_dims, DType::F32, x.device());
+        }
+        let x_c = x.contiguous()?;
+        let (storage, layout) = x_c.storage_and_layout();
+        let x_slice = match &*storage {
+            candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v)) => {
+                let start = layout.start_offset();
+                &v[start..start + m * w.k]
+            }
+            _ => unreachable!("checked CPU F32"),
+        };
+        let mut out = vec![0.0f32; m * w.n_valid];
+        let threads = rayon::current_num_threads().max(1);
+        noto_cpu_kernels::gemm_bias(
+            x_slice,
+            m,
+            w,
+            b,
+            &mut out,
+            noto_cpu_kernels::Blocking::default(),
+            epilogue,
+            threads,
+        );
+        Tensor::from_vec(out, out_dims, x.device())
+    }
+
+    /// Fused `GELU(x Wᵀ + b)`:
+    /// - `CpuPacked` + tanh-GELU (`erf == false`): single-pass `noto_cpu_kernels::Epilogue::Gelu`
+    ///   (bit-identical to `Store + gelu_tanh_inplace`, zero intermediate buffer).
+    /// - CUDA / ROCm: fuses bias + GELU via `candle_core::vis_ops::fused_bias_gelu`.
+    pub fn forward_gelu(&self, x: &Tensor, erf: bool) -> candle_core::Result<Tensor> {
+        use candle_core::vis_ops::{fused_bias_gelu, GeluMode};
+        let mode = if erf { GeluMode::ExactErf } else { GeluMode::PytorchTanh };
+        let gpu_fused = matches!(x.device(), Device::Cuda(_) | Device::Rocm(_));
+        match self {
+            QLinear::CpuPacked { w, b } if !erf => {
+                Self::forward_cpu_packed(w, b.as_deref(), x, noto_cpu_kernels::Epilogue::Gelu)
+            }
+            QLinear::CpuPacked { w, b } => {
+                Self::forward_cpu_packed(w, b.as_deref(), x, noto_cpu_kernels::Epilogue::Store)?.gelu_erf()
+            }
+            QLinear::Quant { w, b, use_native_fwd } if gpu_fused => {
+                let y = if *use_native_fwd { w.forward(x)? } else { w.forward_exact(x)? };
+                fused_bias_gelu(&y, b.as_ref(), mode)
+            }
+            QLinear::Dense(l) if gpu_fused => {
+                let w_t = l.weight().t()?;
+                let y = match x.dims() {
+                    [_b, _n, _k] => x.broadcast_matmul(&w_t)?,
+                    _ => x.matmul(&w_t)?,
+                };
+                fused_bias_gelu(&y, l.bias(), mode)
+            }
+            _ => {
+                let y = self.forward(x)?;
+                if erf { y.gelu_erf() } else { y.gelu() }
+            }
+        }
     }
 }
 
@@ -623,41 +700,7 @@ impl Module for QLinear {
         match self {
             QLinear::Dense(l) => l.forward(x),
             QLinear::CpuPacked { w, b } => {
-                if !x.device().is_cpu() || x.dtype() != DType::F32 {
-                    candle_core::bail!("QLinear::CpuPacked requires CPU F32 tensor, got {:?} {:?}", x.device(), x.dtype());
-                }
-                let dims = x.dims();
-                if dims.is_empty() || dims[dims.len() - 1] != w.k {
-                    candle_core::bail!("QLinear::CpuPacked input {:?} incompatible with k={}", dims, w.k);
-                }
-                let m: usize = dims[..dims.len() - 1].iter().product();
-                let mut out_dims = dims.to_vec();
-                *out_dims.last_mut().unwrap() = w.n;
-                if m == 0 {
-                    return Tensor::zeros(out_dims, DType::F32, x.device());
-                }
-                let x_c = x.contiguous()?;
-                let (storage, layout) = x_c.storage_and_layout();
-                let x_slice = match &*storage {
-                    candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v)) => {
-                        let start = layout.start_offset();
-                        &v[start..start + m * w.k]
-                    }
-                    _ => unreachable!("checked CPU F32"),
-                };
-                let mut out = vec![0.0f32; m * w.n];
-                let threads = rayon::current_num_threads().max(1);
-                noto_cpu_kernels::gemm_bias(
-                    x_slice,
-                    m,
-                    w,
-                    b.as_deref(),
-                    &mut out,
-                    noto_cpu_kernels::Blocking::default(),
-                    noto_cpu_kernels::Epilogue::Store,
-                    threads,
-                );
-                Tensor::from_vec(out, out_dims, x.device())
+                Self::forward_cpu_packed(w, b.as_deref(), x, noto_cpu_kernels::Epilogue::Store)
             }
             QLinear::Quant { w, b, use_native_fwd } => {
                 // Vulkan and Metal Q8_0 native kernels accept F32 activations directly without activation
@@ -1128,6 +1171,17 @@ mod tests {
             l2.forward(&x4)?.flatten_all()?.to_vec1::<f32>()?,
             "cached Q8_0 reload must be bit-identical"
         );
+
+        // Non-NR-multiple out_dim (e.g. 50, like SigLIP2 4304) must pack via pack_padded and fuse GELU exactly.
+        let w_odd = Tensor::from_vec(normals(50 * 64, 301), (50, 64), &Device::Cpu)?;
+        let b_odd = Tensor::from_vec(normals(50, 302), 50, &Device::Cpu)?;
+        let packed_odd = QLinear::from_dense_packed(&w_odd, Some(&b_odd))?;
+        let dense_odd = QLinear::Dense(Linear::new(w_odd, Some(b_odd)));
+        let y_packed = packed_odd.forward_gelu(&x4, false)?;
+        assert_eq!(y_packed.dims(), &[4, 50]);
+        let y_dense = dense_odd.forward(&x4)?.gelu()?;
+        let gelu_diff = (&y_packed - &y_dense)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(gelu_diff < 1e-5, "non-multiple-of-32 packed forward_gelu diff {gelu_diff}");
         Ok(())
     }
 }

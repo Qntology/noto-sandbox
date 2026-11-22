@@ -25,12 +25,42 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    match std::fs::write(&tmp, bytes).and_then(|_| std::fs::rename(&tmp, path)) {
+    use std::io::Write;
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut tmp_os = path.as_os_str().to_owned();
+    tmp_os.push(format!(".tmp.{}.{seq}", std::process::id()));
+    let tmp = PathBuf::from(tmp_os);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
+        Err(_) if path.exists() => {
+            let mut bak_os = path.as_os_str().to_owned();
+            bak_os.push(format!(".bak.{}.{seq}", std::process::id()));
+            let bak = PathBuf::from(bak_os);
+            let _ = std::fs::remove_file(&bak);
+            if let Err(e) = std::fs::rename(path, &bak) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            match std::fs::rename(&tmp, path) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, path);
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e)
+                }
+            }
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
