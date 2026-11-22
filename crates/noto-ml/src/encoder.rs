@@ -220,30 +220,31 @@ impl Attention {
             }
         }
 
-        // Fastpath 2: GPU FlashAttention (unmasked; zero transpose copies when context=None && !need_kv).
-        if mask.is_none() && accel_op_ok(x.device(), AccelOp::FlashAttn) {
+        // Fastpath 2: GPU FlashAttention (unmasked, head_dim <= 256; zero transpose copies when context=None && !need_kv).
+        if mask.is_none() && self.head_dim <= 256 && accel_op_ok(x.device(), AccelOp::FlashAttn) {
             let fa_cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale as f32);
             if context.is_none() && !need_kv {
                 let q4 = q_lin.contiguous()?.reshape((b, n, self.heads, self.head_dim))?;
                 let k4 = k_lin.contiguous()?.reshape((b, n, self.heads, self.head_dim))?;
                 let v4 = v_lin.contiguous()?.reshape((b, n, self.heads, self.head_dim))?;
-                let ctx = candle_nn::flash_attn::flash_attn_with_config(&q4, &k4, &v4, &fa_cfg)?
-                    .reshape((b, n, d))?;
-                return Ok((self.out.forward(&ctx)?, None));
+                if let Ok(ctx) = candle_nn::flash_attn::flash_attn_with_config(&q4, &k4, &v4, &fa_cfg) {
+                    let ctx = ctx.reshape((b, n, d))?;
+                    return Ok((self.out.forward(&ctx)?, None));
+                }
+            } else {
+                let split = |t: &Tensor| -> Result<Tensor> {
+                    t.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
+                };
+                let (q, k, v) = (split(&q_lin)?, split(&k_lin)?, split(&v_lin)?);
+                let (k_all, v_all) = match context {
+                    Some(c) => (Tensor::cat(&[&c.k, &k], 2)?, Tensor::cat(&[&c.v, &v], 2)?),
+                    None => (k.clone(), v.clone()),
+                };
+                if let Ok(ctx) = candle_nn::flash_attn::flash_attn_bhsd(&q, &k_all, &v_all, &fa_cfg) {
+                    let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, n, d))?;
+                    return Ok((self.out.forward(&ctx)?, if need_kv { Some(LayerKv { k, v }) } else { None }));
+                }
             }
-            let split = |t: Tensor| -> Result<Tensor> {
-                t.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
-            };
-            let (q, k, v) = (split(q_lin)?, split(k_lin)?, split(v_lin)?);
-            let (k_all, v_all) = match context {
-                Some(c) => (Tensor::cat(&[&c.k, &k], 2)?, Tensor::cat(&[&c.v, &v], 2)?),
-                None => (k.clone(), v.clone()),
-            };
-            let ctx = candle_nn::flash_attn::flash_attn_bhsd(&q, &k_all, &v_all, &fa_cfg)?
-                .transpose(1, 2)?
-                .contiguous()?
-                .reshape((b, n, d))?;
-            return Ok((self.out.forward(&ctx)?, if need_kv { Some(LayerKv { k, v }) } else { None }));
         }
 
         // Standard unfused attention fallback (always used for masked text attention on GPU and non-packed CPU).

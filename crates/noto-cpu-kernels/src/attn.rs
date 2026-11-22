@@ -264,10 +264,98 @@ pub fn stream_attention_f32_masked(
     }
 
     let group = hq / hkv;
-    let n_panels = seq_kv.div_ceil(KP);
     let q_stride = hq * d;
     let kv_stride = hkv * d;
     let avx2 = use_avx2_fma();
+
+    // Fast path for single-query attention (seq_q == 1, e.g. MAP head / autoregressive decode):
+    // direct SIMD dot + strided V accumulation avoids O(seq_kv * hkv * d) K-transpose and V-copy.
+    if seq_q == 1 {
+        let out_ptr = SendPtr(out.as_mut_ptr());
+        let max_k = if cfg.causal {
+            (cfg.past_offset + 1).min(seq_kv)
+        } else {
+            seq_kv
+        };
+        let active_panels = max_k.div_ceil(KP);
+        let run_head = |head: usize| {
+            let out_ptr = &out_ptr;
+            let kvh = head / group;
+            let q_row = &q[head * d..(head + 1) * d];
+            SCRATCH.with(|cell| {
+                let mut sc = cell.borrow_mut();
+                if sc.scores.len() < KP {
+                    sc.scores.resize(KP, 0.0);
+                }
+                if sc.weights.len() < KP {
+                    sc.weights.resize(KP, 0.0);
+                }
+                if sc.acc.len() < d {
+                    sc.acc.resize(d, 0.0);
+                }
+                let TlsScratch { scores, weights, acc } = &mut *sc;
+                acc[..d].fill(0.0);
+                let mut m_curr = f32::NEG_INFINITY;
+                let mut l_curr = 0.0f32;
+                for p in 0..active_panels {
+                    let j0 = p * KP;
+                    let valid = KP.min(max_k - j0);
+                    let mut p_max = f32::NEG_INFINITY;
+                    if let Some(mask) = key_mask {
+                        for j in 0..valid {
+                            let k_off = (j0 + j) * kv_stride + kvh * d;
+                            let s = crate::dot_f32_simd(q_row, &k[k_off..k_off + d]) * cfg.scale + mask[j0 + j];
+                            scores[j] = s;
+                            if s > p_max {
+                                p_max = s;
+                            }
+                        }
+                    } else {
+                        for j in 0..valid {
+                            let k_off = (j0 + j) * kv_stride + kvh * d;
+                            let s = crate::dot_f32_simd(q_row, &k[k_off..k_off + d]) * cfg.scale;
+                            scores[j] = s;
+                            if s > p_max {
+                                p_max = s;
+                            }
+                        }
+                    }
+                    let m_new = m_curr.max(p_max);
+                    let corr = if m_curr.is_finite() { (m_curr - m_new).exp() } else { 0.0 };
+                    let mut p_sum = 0.0f32;
+                    for j in 0..valid {
+                        let w = (scores[j] - m_new).exp();
+                        weights[j] = w;
+                        p_sum += w;
+                    }
+                    let v_p = &v[j0 * kv_stride + kvh * d..];
+                    if avx2 {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            accumulate_avx2(acc.as_mut_ptr(), corr, weights.as_ptr(), v_p.as_ptr(), kv_stride, valid, d);
+                        }
+                    } else {
+                        accumulate_scalar(acc, corr, weights, v_p, kv_stride, valid, d);
+                    }
+                    l_curr = l_curr * corr + p_sum;
+                    m_curr = m_new;
+                }
+                let inv_l = if l_curr > 0.0 { 1.0 / l_curr } else { 0.0 };
+                let dst = unsafe { std::slice::from_raw_parts_mut(out_ptr.0.add(head * d), d) };
+                for e in 0..d {
+                    dst[e] = acc[e] * inv_l;
+                }
+            });
+        };
+        if hq <= 1 || seq_kv * hq * d < 65_536 {
+            (0..hq).for_each(run_head);
+        } else {
+            (0..hq).into_par_iter().for_each(run_head);
+        }
+        return;
+    }
+
+    let n_panels = seq_kv.div_ceil(KP);
 
     // 1) Transpose K once per KV head into contiguous 64-key panels:
     //    kt_all[kvh][panel][e * KP + j] = k[(panel*KP + j) * kv_stride + kvh * d + e]
@@ -589,5 +677,27 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err2 < 1e-5, "masked text attn max_err {max_err2}");
+    }
+
+    #[test]
+    fn single_query_zero_transpose_matches_reference_d72() {
+        let cfg = CpuStreamAttnCfg {
+            num_heads: 16,
+            num_kv_heads: 16,
+            head_dim: 72,
+            scale: 1.0 / (72.0f32).sqrt(),
+            causal: false,
+            past_offset: 0,
+        };
+        let q = det(16 * 72, 41);
+        let k = det(137 * 16 * 72, 42);
+        let v = det(137 * 16 * 72, 43);
+        let mut out = vec![0.0f32; 16 * 72];
+        reset_attn_scalar_tail_hits();
+        stream_attention_f32(&q, &k, &v, 1, 137, &cfg, &mut out);
+        assert_eq!(attn_scalar_tail_hits(), 0, "seq_q=1 head_dim=72 must not hit scalar tail");
+        let want = reference_attn(&q, &k, &v, 1, 137, &cfg, None);
+        let max_err = out.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(max_err < 1e-5, "seq_q=1 max_err {max_err}");
     }
 }
