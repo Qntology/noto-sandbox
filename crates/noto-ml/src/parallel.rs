@@ -606,7 +606,11 @@ pub fn cosine_matrix(rows: &[Vec<f32>], columns: &[Arc<[f32]>]) -> Vec<f32> {
     let mut out = vec![0.0f32; rows.len() * n];
     out.par_chunks_mut(n.max(1)).zip(rows.par_iter()).for_each(|(dst, row)| {
         for (j, col) in columns.iter().enumerate() {
-            dst[j] = row.iter().zip(col.iter()).map(|(a, b)| a * b).sum();
+            dst[j] = if row.len() == col.len() {
+                noto_cpu_kernels::dot_f32_simd(row, col)
+            } else {
+                row.iter().zip(col.iter()).map(|(a, b)| a * b).sum()
+            };
         }
     });
     out

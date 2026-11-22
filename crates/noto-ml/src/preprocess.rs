@@ -96,19 +96,32 @@ pub fn preprocess_grid(image: &DynamicImage, cfg: &Siglip2Config, grid_h: usize,
     let (grid_h, grid_w) = (grid_h.max(1), grid_w.max(1));
     let (rw, rh) = ((grid_w * p) as u32, (grid_h * p) as u32);
     let rgb = image.resize_exact(rw, rh, FilterType::Triangle).to_rgb8();
+    let raw = rgb.as_raw();
+    let stride = (rw as usize) * 3;
+
+    // Exact 256-entry LUT matches `v as f32 / 127.5 - 1.0` bit-for-bit without per-pixel division.
+    static U8_NORM_LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    let lut = U8_NORM_LUT.get_or_init(|| {
+        let mut t = [0.0f32; 256];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot = i as f32 / 127.5 - 1.0;
+        }
+        t
+    });
 
     let patch_dim = p * p * 3;
     let mut patches = vec![0.0f32; grid_h * grid_w * patch_dim];
+    let row_bytes = p * 3;
     for gy in 0..grid_h {
+        let y0 = gy * p;
         for gx in 0..grid_w {
             let base = (gy * grid_w + gx) * patch_dim;
+            let x0_b = gx * p * 3;
             for py in 0..p {
-                for px in 0..p {
-                    let pixel = rgb.get_pixel((gx * p + px) as u32, (gy * p + py) as u32);
-                    let at = base + (py * p + px) * 3;
-                    for c in 0..3 {
-                        patches[at + c] = pixel[c] as f32 / 127.5 - 1.0;
-                    }
+                let src = &raw[(y0 + py) * stride + x0_b..(y0 + py) * stride + x0_b + row_bytes];
+                let dst = &mut patches[base + py * row_bytes..base + (py + 1) * row_bytes];
+                for (d, &b) in dst.iter_mut().zip(src.iter()) {
+                    *d = lut[b as usize];
                 }
             }
         }

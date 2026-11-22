@@ -87,6 +87,7 @@ pub struct Siglip2 {
     quant: QuantPlan,
     quant_stats: QuantStats,
     fused_qkv: bool,
+    cpu_packed: bool,
 }
 
 impl Siglip2 {
@@ -120,10 +121,12 @@ impl Siglip2 {
             VocabPolicy::Full => None,
             VocabPolicy::Active => Some(TokenTable::active(MappedRows::open(&weights, TOKEN_TABLE, config.text_vocab, config.text_hidden)?, device)),
         };
-        let w = QWeights::with_plan(vb, &weights, Family::Siglip2, &opts.quant)?;
-        let mut model = Self::build(config, w, device, Some(tokenizer), tokens, opts.fused_qkv)?;
+        let cpu_packed = opts.quant.is_f32() && crate::device::cpu_packed_enabled(device);
+        let w = QWeights::with_plan(vb, &weights, Family::Siglip2, &opts.quant)?.with_cpu_packed(cpu_packed);
+        let mut model = Self::build(config, w.clone(), device, Some(tokenizer), tokens, opts.fused_qkv)?;
+        w.flush_cache();
         model.checkpoint = checkpoint_fingerprint(dir, &model.config);
-        model.fingerprint = text_salt(device_salt(model.checkpoint, device, &model.policy), &model.quant);
+        model.fingerprint = text_salt(device_salt(model.checkpoint, device, &model.policy, model.cpu_packed), &model.quant);
         // The tokens every text has (padding, the tokenizer's added ones) go on the device now.
         let base: Vec<&str> = vec![""];
         model.prime_vocab(&base)?;
@@ -148,7 +151,8 @@ impl Siglip2 {
         let policy = BatchPolicy::for_device(device);
         let checkpoint = fnv1a(FNV_OFFSET, format!("{config:?}").as_bytes());
         let quant = w.plan().clone();
-        let fingerprint = text_salt(device_salt(checkpoint, device, &policy), &quant);
+        let cpu_packed = w.is_cpu_packed();
+        let fingerprint = text_salt(device_salt(checkpoint, device, &policy, cpu_packed), &quant);
         Ok(Siglip2 {
             config,
             vision,
@@ -163,6 +167,7 @@ impl Siglip2 {
             quant,
             quant_stats: w.stats(),
             fused_qkv,
+            cpu_packed,
         })
     }
 
@@ -176,10 +181,13 @@ impl Siglip2 {
         &self.quant_stats
     }
 
-    /// The part of the dense locator's mode that keeps a quantized or fused vision tower's statistics and calibration
-    /// apart from the F32 one's (`""` for the F32 tower).
+    /// The part of the dense locator's mode that keeps a quantized, fused or CPU-packed vision tower's
+    /// statistics and calibration apart from the plain F32 one's (`""` for the plain F32 tower).
     pub fn mode_suffix(&self) -> String {
         let mut s = self.quant.mode_suffix(Family::Siglip2);
+        if self.cpu_packed {
+            s.push_str("+cpupack");
+        }
         if self.fused_qkv {
             s.push_str("+fqkv");
         }
@@ -215,7 +223,7 @@ impl Siglip2 {
     }
 
     pub fn set_batch_policy(&mut self, policy: BatchPolicy) {
-        self.fingerprint = text_salt(device_salt(self.checkpoint, &self.device, &policy), &self.quant);
+        self.fingerprint = text_salt(device_salt(self.checkpoint, &self.device, &policy, self.cpu_packed), &self.quant);
         self.policy = policy;
     }
 
@@ -315,16 +323,16 @@ impl Siglip2 {
         for chunk in self.image_chunks(&inputs, 0) {
             let refs: Vec<&NaflexInput> = chunk.iter().map(|&i| &inputs[i]).collect();
             let (dense, attn, pooled) = self.vision.forward_dense_batch(&refs)?;
-            let dense = l2_normalize(&dense)?;
-            let pooled = l2_normalize(&pooled)?.to_vec2::<f32>()?;
-            let attn = attn.to_vec2::<f32>()?;
+            let mut dense = l2_normalize(&dense)?.to_vec3::<f32>()?;
+            let mut pooled = l2_normalize(&pooled)?.to_vec2::<f32>()?;
+            let mut attn = attn.to_vec2::<f32>()?;
             for (k, &i) in chunk.iter().enumerate() {
                 out[i] = Some(DenseEmbedding {
                     grid_h: inputs[i].grid_h,
                     grid_w: inputs[i].grid_w,
-                    vectors: dense.get(k)?.to_vec2()?,
-                    attention: attn[k].clone(),
-                    pooled: pooled[k].clone(),
+                    vectors: std::mem::take(&mut dense[k]),
+                    attention: std::mem::take(&mut attn[k]),
+                    pooled: std::mem::take(&mut pooled[k]),
                 });
             }
         }
@@ -370,7 +378,6 @@ impl Siglip2 {
             sd.vectors[*c as usize] = Some(v);
         }
         sd.pooled = l2_normalize(&pooled)?.flatten_all()?.to_vec1()?;
-        trim_idle_pool(&self.device);
         Ok(())
     }
 
@@ -452,8 +459,11 @@ fn checkpoint_fingerprint(dir: &Path, config: &Siglip2Config) -> u64 {
     h
 }
 
-fn device_salt(h: u64, device: &Device, policy: &BatchPolicy) -> u64 {
-    let h = fnv1a(h, device_family(device).as_bytes());
+fn device_salt(h: u64, device: &Device, policy: &BatchPolicy, cpu_packed: bool) -> u64 {
+    let mut h = fnv1a(h, device_family(device).as_bytes());
+    if cpu_packed {
+        h = fnv1a(h, b"cpu-packed");
+    }
     if policy.fixed_shape {
         fnv1a(h, &(policy.max_rows as u64).to_le_bytes())
     } else {

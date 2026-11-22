@@ -1,8 +1,8 @@
 use candle_core::{Device, Result, Tensor};
-use candle_nn::{embedding, layer_norm, LayerNorm, Module, VarBuilder};
+use candle_nn::{embedding, Module, VarBuilder};
 
 use crate::config::Siglip2Config;
-use crate::encoder::{to_candle, EncoderLayer};
+use crate::encoder::{to_candle, EncoderLayer, FastLayerNorm};
 use crate::quant::{Family, QLinear, QWeights};
 use crate::vocab::{TokenTable, VocabStats};
 
@@ -10,7 +10,7 @@ pub struct TextTower {
     tokens: TokenTable,
     position: Tensor,
     layers: Vec<EncoderLayer>,
-    final_ln: LayerNorm,
+    final_ln: FastLayerNorm,
     head: QLinear,
     max_len: usize,
     hidden: usize,
@@ -41,7 +41,7 @@ impl TextTower {
                 .pp("position_embedding")
                 .get((cfg.text_max_len, d), "weight")?,
             layers,
-            final_ln: layer_norm(d, cfg.text_eps, vb.pp("final_layer_norm"))?,
+            final_ln: FastLayerNorm::new(d, cfg.text_eps, vb.pp("final_layer_norm"), w.is_cpu_packed())?,
             head: w.pp("head").linear(d, d).map_err(to_candle)?,
             max_len: cfg.text_max_len,
             hidden: d,

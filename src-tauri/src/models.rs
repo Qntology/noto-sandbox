@@ -120,7 +120,12 @@ pub fn present(m: &ModelSpec) -> bool {
 pub const SAM_ENV: &str = "NOTO_SAM";
 
 pub fn sam_opt_in() -> bool {
-    std::env::var(SAM_ENV).is_ok_and(|v| v.trim() == "1")
+    std::env::var(SAM_ENV).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "vit_b" | "vit-b" | "mobile"
+        )
+    })
 }
 
 pub fn needed(m: &ModelSpec, stereo: bool) -> bool {
@@ -473,8 +478,19 @@ fn gpu_hint(state: &AppState) -> Option<String> {
         return Some("이 Mac에는 Metal GPU가 있지만 이 빌드는 CPU 전용입니다. ./dev_metal.sh(또는 ./build_metal.sh)로 실행하면 네 모델이 모두 GPU에서 돕니다".into());
     }
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-    let nvidia = Path::new(&windir).join("System32").join("nvcuda.dll").is_file();
-    nvidia.then(|| "이 PC에는 NVIDIA GPU가 있지만 이 빌드는 CPU 전용입니다. dev_cuda.bat(또는 build_cuda.bat)로 실행하면 네 모델이 모두 GPU에서 돕니다".into())
+    let sys32 = Path::new(&windir).join("System32");
+    if sys32.join("nvcuda.dll").is_file() {
+        return Some("이 PC에는 NVIDIA GPU가 있지만 이 빌드는 CPU 전용입니다. dev_cuda.bat(또는 build_cuda.bat)로 실행하면 모델이 GPU에서 돕니다".into());
+    }
+    let rocm_present = sys32.join("amdhip64.dll").is_file()
+        || Path::new(r"C:\Program Files\AMD\ROCm").is_dir();
+    if rocm_present {
+        return Some("이 PC에는 AMD ROCm 환경이 있지만 이 빌드는 CPU 전용입니다. dev_rocm.bat(또는 build_rocm.bat)로 실행하면 모델이 GPU에서 돕니다".into());
+    }
+    if sys32.join("vulkan-1.dll").is_file() {
+        return Some("이 PC에는 Vulkan GPU가 있지만 이 빌드는 CPU 전용입니다. dev_vulkan.bat(또는 build_vulkan.bat)로 실행하면 모델이 GPU에서 돕니다".into());
+    }
+    None
 }
 
 fn activate(state: &Arc<AppState>) -> Result<(), String> {
@@ -596,7 +612,12 @@ mod tests {
         println!("[MODELS] loaded on {:?} in {:.1} s · {live:?}", state.selected(), t0.elapsed().as_secs_f32());
         assert!(state.models_ready());
         if noto_ml::device::select(None).backend != noto_ml::Backend::Cpu && std::env::var(noto_ml::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
-            assert!(live.values().all(|d| !d.starts_with("CPU") && d != "cpu"), "a model is not on the GPU: {live:?}");
+            assert!(
+                live.iter()
+                    .filter(|(k, _)| sam_opt_in() || k.as_str() != "sam")
+                    .all(|(_, d)| !d.starts_with("CPU") && d != "cpu"),
+                "a model is not on the GPU: {live:?}"
+            );
         }
         state
             .with_world(|rt| {

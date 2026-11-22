@@ -239,30 +239,35 @@ const CENSUS_BITS: u16 = 24;
 /// 5 × 5 census (a bit per neighbour darker than the centre; the border repeats the edge pixels) and the grey-level
 /// standard deviation over the same window.
 fn census(g: &[f32], w: usize, h: usize) -> (Vec<u32>, Vec<f32>) {
+    use rayon::prelude::*;
     let mut code = vec![0u32; w * h];
     let mut sd = vec![0.0f32; w * h];
+    let n = ((2 * CENSUS_R + 1) * (2 * CENSUS_R + 1)) as f32;
     let at = |x: i64, y: i64| g[(y.clamp(0, h as i64 - 1) as usize) * w + x.clamp(0, w as i64 - 1) as usize];
-    for y in 0..h as i64 {
-        for x in 0..w as i64 {
-            let c = at(x, y);
-            let (mut bits, mut s, mut ss) = (0u32, 0.0f32, 0.0f32);
-            for dy in -CENSUS_R..=CENSUS_R {
-                for dx in -CENSUS_R..=CENSUS_R {
-                    let v = at(x + dx, y + dy);
-                    s += v;
-                    ss += v * v;
-                    if dx == 0 && dy == 0 {
-                        continue;
+    code.par_chunks_mut(w)
+        .zip(sd.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(yi, (code_row, sd_row))| {
+            let y = yi as i64;
+            for x in 0..w as i64 {
+                let c = at(x, y);
+                let (mut bits, mut s, mut ss) = (0u32, 0.0f32, 0.0f32);
+                for dy in -CENSUS_R..=CENSUS_R {
+                    for dx in -CENSUS_R..=CENSUS_R {
+                        let v = at(x + dx, y + dy);
+                        s += v;
+                        ss += v * v;
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        bits = (bits << 1) | (v < c) as u32;
                     }
-                    bits = (bits << 1) | (v < c) as u32;
                 }
+                let xi = x as usize;
+                code_row[xi] = bits;
+                sd_row[xi] = (ss / n - (s / n).powi(2)).max(0.0).sqrt();
             }
-            let n = ((2 * CENSUS_R + 1) * (2 * CENSUS_R + 1)) as f32;
-            let i = y as usize * w + x as usize;
-            code[i] = bits;
-            sd[i] = (ss / n - (s / n).powi(2)).max(0.0).sqrt();
-        }
-    }
+        });
     (code, sd)
 }
 
@@ -271,52 +276,54 @@ fn census(g: &[f32], w: usize, h: usize) -> (Vec<u32>, Vec<f32>) {
 /// it costs what the pixel's best one does. (Costing it the most instead leaves a penalty that the paths from the
 /// left edge carry across the whole row, and that alone then picks among the equal matches of a repeating pattern.)
 fn costs(cl: &[u32], cr: &[u32], w: usize, h: usize, nd: usize, block: usize) -> Vec<u16> {
-    let mut ham = vec![0u16; w * h * nd];
-    for y in 0..h {
+    use rayon::prelude::*;
+    let row_stride = w * nd;
+    let mut ham = vec![0u16; h * row_stride];
+    ham.par_chunks_mut(row_stride).enumerate().for_each(|(y, dst_row)| {
+        let row_off = y * w;
         for x in 0..w {
-            let base = (y * w + x) * nd;
-            let a = cl[y * w + x];
+            let base = x * nd;
+            let a = cl[row_off + x];
             let top = nd.min(x + 1);
             let mut least = CENSUS_BITS;
             for d in 0..top {
-                let c = (a ^ cr[y * w + x - d]).count_ones() as u16;
-                ham[base + d] = c;
+                let c = (a ^ cr[row_off + x - d]).count_ones() as u16;
+                dst_row[base + d] = c;
                 least = least.min(c);
             }
             for d in top..nd {
-                ham[base + d] = least;
+                dst_row[base + d] = least;
             }
         }
-    }
+    });
     if block == 0 {
         return ham;
     }
-    // Box sum, rows then columns (the border repeats the edge).
-    let mut rows = vec![0u16; w * h * nd];
-    for y in 0..h {
+    // Box sum, rows then columns (the border repeats the edge). Parallel per row, bit-exact.
+    let mut rows = vec![0u16; h * row_stride];
+    rows.par_chunks_mut(row_stride).enumerate().for_each(|(y, dst_row)| {
+        let src_row = &ham[y * row_stride..(y + 1) * row_stride];
         for x in 0..w {
-            let out = (y * w + x) * nd;
+            let out = &mut dst_row[x * nd..(x + 1) * nd];
             for k in 0..=2 * block {
                 let xx = (x + k).saturating_sub(block).min(w - 1);
-                let src = (y * w + xx) * nd;
+                let src = &src_row[xx * nd..(xx + 1) * nd];
                 for d in 0..nd {
-                    rows[out + d] += ham[src + d];
+                    out[d] += src[d];
                 }
             }
         }
-    }
-    let mut out = vec![0u16; w * h * nd];
-    for y in 0..h {
+    });
+    let mut out = vec![0u16; h * row_stride];
+    out.par_chunks_mut(row_stride).enumerate().for_each(|(y, dst_row)| {
         for k in 0..=2 * block {
             let yy = (y + k).saturating_sub(block).min(h - 1);
-            for x in 0..w {
-                let (o, s) = ((y * w + x) * nd, (yy * w + x) * nd);
-                for d in 0..nd {
-                    out[o + d] += rows[s + d];
-                }
+            let src_row = &rows[yy * row_stride..(yy + 1) * row_stride];
+            for i in 0..row_stride {
+                dst_row[i] += src_row[i];
             }
         }
-    }
+    });
     out
 }
 
@@ -344,34 +351,47 @@ fn path_step(c: &[u16], prev: Option<(&[u16], u16)>, p1: u16, p2: u16, out: &mut
         }
         Some((lp, mp)) => {
             let jump = mp + p2;
-            let mut m = u16::MAX;
-            for d in 0..nd {
-                let mut best = lp[d].min(jump);
-                if d > 0 {
-                    best = best.min(lp[d - 1] + p1);
-                }
-                if d + 1 < nd {
-                    best = best.min(lp[d + 1] + p1);
-                }
+            if nd == 0 {
+                return u16::MAX;
+            }
+            if nd == 1 {
+                let v = c[0] + lp[0].min(jump) - mp;
+                out[0] = v;
+                return v;
+            }
+            // Split endpoints so the interior loop `1..nd-1` is branchless and auto-vectorizes cleanly.
+            let b0 = lp[0].min(jump).min(lp[1] + p1);
+            let v0 = c[0] + b0 - mp;
+            out[0] = v0;
+            let mut m = v0;
+            for d in 1..nd - 1 {
+                let best = lp[d].min(jump).min(lp[d - 1] + p1).min(lp[d + 1] + p1);
                 let v = c[d] + best - mp;
                 out[d] = v;
                 m = m.min(v);
             }
-            m
+            let last = nd - 1;
+            let blast = lp[last].min(jump).min(lp[last - 1] + p1);
+            let vlast = c[last] + blast - mp;
+            out[last] = vlast;
+            m.min(vlast)
         }
     }
 }
 
-/// S(p, d) = Σ_r L_r(p, d) over 4 or 8 paths, in two sweeps: rows top to bottom with the paths from the left, the
-/// top-left, the top and the top-right; then rows bottom to top with the four opposite ones.
+/// S(p, d) = Σ_r L_r(p, d) over 4 or 8 paths, in two independent sweeps run concurrently via `rayon::join`:
+/// rows top to bottom with the paths from the left, top-left, top and top-right; then rows bottom to top with
+/// the four opposite ones (single left cost volume, bit-exact).
 fn aggregate(cost: &[u16], grey: &[f32], w: usize, h: usize, nd: usize, cfg: &SgbmCfg) -> Vec<u16> {
+    use rayon::prelude::*;
     let p1 = cfg.p1;
     let lut = p2_by_step(cfg);
-    let step = |a: usize, b: usize| lut[(grey[a] - grey[b]).abs().min(255.0) as usize];
     let diagonals = cfg.paths >= 8;
-    let mut sum = vec![0u16; w * h * nd];
-    let mut tmp = vec![0u16; nd];
-    for forward in [true, false] {
+
+    let run_sweep = |forward: bool| -> Vec<u16> {
+        let step = |a: usize, b: usize| lut[(grey[a] - grey[b]).abs().min(255.0) as usize];
+        let mut sum = vec![0u16; w * h * nd];
+        let mut tmp = vec![0u16; nd];
         // [from x − s, from x, from x + s] of the previous row, s = 1 going forward and −1 going back.
         let mut prev: [Vec<u16>; 3] = [vec![0u16; w * nd], vec![0u16; w * nd], vec![0u16; w * nd]];
         let mut prev_min: [Vec<u16>; 3] = [vec![0u16; w], vec![0u16; w], vec![0u16; w]];
@@ -393,8 +413,9 @@ fn aggregate(cost: &[u16], grey: &[f32], w: usize, h: usize, nd: usize, cfg: &Sg
                     path_step(c, Some((&along, along_min)), p1, step(y * w + x, y * w + q), &mut tmp)
                 };
                 along.copy_from_slice(&tmp);
+                let dst = &mut sum[p..p + nd];
                 for d in 0..nd {
-                    sum[p + d] += tmp[d];
+                    dst[d] += tmp[d];
                 }
                 // From the previous row: straight, and the two diagonals.
                 for k in 0..3 {
@@ -418,16 +439,27 @@ fn aggregate(cost: &[u16], grey: &[f32], w: usize, h: usize, nd: usize, cfg: &Sg
                     };
                     cur[k][x * nd..x * nd + nd].copy_from_slice(&tmp);
                     cur_min[k][x] = m;
+                    let dst = &mut sum[p..p + nd];
                     for d in 0..nd {
-                        sum[p + d] += tmp[d];
+                        dst[d] += tmp[d];
                     }
                 }
             }
             std::mem::swap(&mut prev, &mut cur);
             std::mem::swap(&mut prev_min, &mut cur_min);
         }
-    }
-    sum
+        sum
+    };
+
+    let (mut fwd, bwd) = rayon::join(|| run_sweep(true), || run_sweep(false));
+    fwd.par_chunks_mut(w * nd)
+        .zip(bwd.par_chunks(w * nd))
+        .for_each(|(a, b)| {
+            for (x, &y) in a.iter_mut().zip(b.iter()) {
+                *x += y;
+            }
+        });
+    fwd
 }
 
 /// How far (−0.5…0.5 px) the cost minimum lies from the best whole disparity, from the costs one below (`a`), at

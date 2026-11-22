@@ -11,8 +11,9 @@
 //! embedding tables never go through here: they stay F32. So does every weight of a backend whose quantized matmul
 //! would not run on the device (Vulkan keeps Q8_0 only, see [`QuantPlan::for_device`]).
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -28,6 +29,194 @@ use crate::parallel::{fnv1a, FNV_OFFSET};
 
 /// `NOTO_QUANT`: the plan the model loaders use when the caller gives none (`f32`, `pyramid`, `q8`, or `<base>;<group>=<type>,...`).
 pub const QUANT_ENV: &str = "NOTO_QUANT";
+/// `NOTO_QUANT_CACHE=0`: disable the on-disk quantized weight cache beside the safetensors file.
+pub const QUANT_CACHE_ENV: &str = "NOTO_QUANT_CACHE";
+
+const QCACHE_MAGIC: &[u8; 8] = b"NOTOQC01";
+
+fn qtype_code(q: QType) -> u8 {
+    match q {
+        QType::F32 => 0,
+        QType::Q8_0 => 1,
+        QType::Q6K => 2,
+        QType::Q5K => 3,
+        QType::Q4K => 4,
+    }
+}
+
+fn qtype_from_code(c: u8) -> Option<QType> {
+    match c {
+        0 => Some(QType::F32),
+        1 => Some(QType::Q8_0),
+        2 => Some(QType::Q6K),
+        3 => Some(QType::Q5K),
+        4 => Some(QType::Q4K),
+        _ => None,
+    }
+}
+
+struct QuantDiskCache {
+    path: PathBuf,
+    file_len: u64,
+    mtime_nanos: u128,
+    plan_hash: u64,
+    entries: HashMap<String, (QType, usize, usize, Vec<u8>)>,
+    dirty: bool,
+}
+
+impl QuantDiskCache {
+    fn enabled() -> bool {
+        std::env::var(QUANT_CACHE_ENV).map_or(true, |v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("off"))
+    }
+
+    fn open(file: &Path, family: Family, plan: &QuantPlan) -> Option<Self> {
+        if !Self::enabled() {
+            return None;
+        }
+        let meta = std::fs::metadata(file).ok()?;
+        let file_len = meta.len();
+        let mtime_nanos = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        let parent = file.parent()?;
+        let stem = file.file_stem()?.to_string_lossy();
+        let fam = match family {
+            Family::Siglip2 => "siglip2",
+            Family::Tips => "tips",
+        };
+        let plan_hash = plan.hash();
+        let cache_dir = parent.join(".qcache");
+        let safe_tag: String = plan
+            .tag
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let path = cache_dir.join(format!("{stem}_{fam}_{safe_tag}_{plan_hash:016x}.nqb"));
+        let mut cache = Self {
+            path,
+            file_len,
+            mtime_nanos,
+            plan_hash,
+            entries: HashMap::new(),
+            dirty: false,
+        };
+        let _ = cache.try_load();
+        Some(cache)
+    }
+
+    fn try_load(&mut self) -> Option<()> {
+        let mut f = std::fs::File::open(&self.path).ok()?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).ok()?;
+        if buf.len() < 8 + 8 + 16 + 8 + 4 + 8 {
+            return None;
+        }
+        let payload_len = buf.len() - 8;
+        let expected_hash = u64::from_le_bytes(buf[payload_len..].try_into().ok()?);
+        if fnv1a(FNV_OFFSET, &buf[..payload_len]) != expected_hash {
+            return None;
+        }
+        if &buf[0..8] != QCACHE_MAGIC {
+            return None;
+        }
+        let mut pos = 8usize;
+        let read_u64 = |b: &[u8], p: &mut usize| -> Option<u64> {
+            let v = u64::from_le_bytes(b.get(*p..*p + 8)?.try_into().ok()?);
+            *p += 8;
+            Some(v)
+        };
+        let read_u128 = |b: &[u8], p: &mut usize| -> Option<u128> {
+            let v = u128::from_le_bytes(b.get(*p..*p + 16)?.try_into().ok()?);
+            *p += 16;
+            Some(v)
+        };
+        let read_u32 = |b: &[u8], p: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(b.get(*p..*p + 4)?.try_into().ok()?);
+            *p += 4;
+            Some(v)
+        };
+        let flen = read_u64(&buf, &mut pos)?;
+        let mtime = read_u128(&buf, &mut pos)?;
+        let phash = read_u64(&buf, &mut pos)?;
+        if flen != self.file_len || mtime != self.mtime_nanos || phash != self.plan_hash {
+            return None;
+        }
+        let count = read_u32(&buf, &mut pos)? as usize;
+        let mut entries = HashMap::with_capacity(count);
+        for _ in 0..count {
+            let name_len = read_u32(&buf, &mut pos)? as usize;
+            let name = std::str::from_utf8(buf.get(pos..pos + name_len)?).ok()?.to_string();
+            pos += name_len;
+            let q = qtype_from_code(*buf.get(pos)?)?;
+            pos += 1;
+            let rows = read_u64(&buf, &mut pos)? as usize;
+            let cols = read_u64(&buf, &mut pos)? as usize;
+            let blen = read_u64(&buf, &mut pos)? as usize;
+            let data = buf.get(pos..pos + blen)?.to_vec();
+            pos += blen;
+            entries.insert(name, (q, rows, cols, data));
+        }
+        if pos != payload_len {
+            return None;
+        }
+        self.entries = entries;
+        Some(())
+    }
+
+    fn get(&self, key: &str, q: QType, rows: usize, cols: usize) -> Option<&[u8]> {
+        let (cq, cr, cc, data) = self.entries.get(key)?;
+        if *cq == q && *cr == rows && *cc == cols {
+            Some(data.as_slice())
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: String, q: QType, rows: usize, cols: usize, bytes: Vec<u8>) {
+        self.entries.insert(key, (q, rows, cols, bytes));
+        self.dirty = true;
+    }
+
+    fn flush(&mut self) {
+        if !self.dirty || self.entries.is_empty() {
+            return;
+        }
+        let Some(parent) = self.path.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(QCACHE_MAGIC);
+        buf.extend_from_slice(&self.file_len.to_le_bytes());
+        buf.extend_from_slice(&self.mtime_nanos.to_le_bytes());
+        buf.extend_from_slice(&self.plan_hash.to_le_bytes());
+        buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for (name, (q, rows, cols, data)) in &self.entries {
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(qtype_code(*q));
+            buf.extend_from_slice(&(*rows as u64).to_le_bytes());
+            buf.extend_from_slice(&(*cols as u64).to_le_bytes());
+            buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+        let hash = fnv1a(FNV_OFFSET, &buf);
+        buf.extend_from_slice(&hash.to_le_bytes());
+        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
+        if let Ok(mut f) = std::fs::File::create(&tmp) {
+            if f.write_all(&buf).is_ok() && f.sync_all().is_ok() {
+                drop(f);
+                let _ = std::fs::rename(&tmp, &self.path);
+                self.dirty = false;
+            } else {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+}
 
 /// The format of one weight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -372,15 +561,31 @@ impl QuantStats {
     }
 }
 
-/// A linear layer whose weight is either the F32 tensor or quantized blocks with an F32 bias.
+/// A linear layer whose weight is an F32 tensor, CPU packed NR=32 panels, or quantized blocks with an F32 bias.
 pub enum QLinear {
     Dense(Linear),
-    Quant { w: QMatMul, b: Option<Tensor>, device_is_vulkan: bool },
+    CpuPacked { w: Arc<noto_cpu_kernels::PackedW>, b: Option<Vec<f32>> },
+    Quant { w: QMatMul, b: Option<Tensor>, use_native_fwd: bool },
 }
 
 impl QLinear {
     pub fn is_quantized(&self) -> bool {
         matches!(self, QLinear::Quant { .. })
+    }
+
+    pub fn is_cpu_packed(&self) -> bool {
+        matches!(self, QLinear::CpuPacked { .. })
+    }
+
+    pub fn from_dense_packed(weight: &Tensor, bias: Option<&Tensor>) -> candle_core::Result<QLinear> {
+        let (out_dim, in_dim) = weight.dims2()?;
+        let w_flat = weight.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let packed = Arc::new(noto_cpu_kernels::PackedW::pack(&w_flat, out_dim, in_dim));
+        let b = match bias {
+            Some(bt) => Some(bt.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?),
+            None => None,
+        };
+        Ok(QLinear::CpuPacked { w: packed, b })
     }
 }
 
@@ -388,9 +593,47 @@ impl Module for QLinear {
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         match self {
             QLinear::Dense(l) => l.forward(x),
-            QLinear::Quant { w, b, device_is_vulkan } => {
-                // Vulkan's Q8_0 kernel is its device path; elsewhere the exact path (f32 accumulation, no activation quantization).
-                let y = if *device_is_vulkan { w.forward(x)? } else { w.forward_exact(x)? };
+            QLinear::CpuPacked { w, b } => {
+                if !x.device().is_cpu() || x.dtype() != DType::F32 {
+                    candle_core::bail!("QLinear::CpuPacked requires CPU F32 tensor, got {:?} {:?}", x.device(), x.dtype());
+                }
+                let dims = x.dims();
+                if dims.is_empty() || dims[dims.len() - 1] != w.k {
+                    candle_core::bail!("QLinear::CpuPacked input {:?} incompatible with k={}", dims, w.k);
+                }
+                let m: usize = dims[..dims.len() - 1].iter().product();
+                let mut out_dims = dims.to_vec();
+                *out_dims.last_mut().unwrap() = w.n;
+                if m == 0 {
+                    return Tensor::zeros(out_dims, DType::F32, x.device());
+                }
+                let x_c = x.contiguous()?;
+                let (storage, layout) = x_c.storage_and_layout();
+                let x_slice = match &*storage {
+                    candle_core::Storage::Cpu(candle_core::CpuStorage::F32(v)) => {
+                        let start = layout.start_offset();
+                        &v[start..start + m * w.k]
+                    }
+                    _ => unreachable!("checked CPU F32"),
+                };
+                let mut out = vec![0.0f32; m * w.n];
+                let threads = rayon::current_num_threads().max(1);
+                noto_cpu_kernels::gemm_bias(
+                    x_slice,
+                    m,
+                    w,
+                    b.as_deref(),
+                    &mut out,
+                    noto_cpu_kernels::Blocking::default(),
+                    noto_cpu_kernels::Epilogue::Store,
+                    threads,
+                );
+                Tensor::from_vec(out, out_dims, x.device())
+            }
+            QLinear::Quant { w, b, use_native_fwd } => {
+                // Vulkan and Metal Q8_0 native kernels accept F32 activations directly without activation
+                // quantization; CUDA and ROCm use `forward_exact` (f32 accumulation, tiled dequant).
+                let y = if *use_native_fwd { w.forward(x)? } else { w.forward_exact(x)? };
                 match b {
                     Some(b) => y.broadcast_add(b),
                     None => Ok(y),
@@ -405,26 +648,65 @@ impl Module for QLinear {
 pub struct QWeights<'a> {
     vb: VarBuilder<'a>,
     src: Option<Arc<MmapedSafetensors>>,
+    cache: Option<Arc<Mutex<QuantDiskCache>>>,
     family: Family,
     plan: Arc<QuantPlan>,
     stats: Arc<Mutex<QuantStats>>,
+    cpu_packed: bool,
 }
 
 impl<'a> QWeights<'a> {
     /// No quantization source: every weight as `vb` gives it (tests with a `VarMap`, F32 plans).
     pub fn plain(vb: VarBuilder<'a>, family: Family) -> QWeights<'a> {
-        QWeights { vb, src: None, family, plan: Arc::new(QuantPlan::f32()), stats: Arc::default() }
+        QWeights {
+            vb,
+            src: None,
+            cache: None,
+            family,
+            plan: Arc::new(QuantPlan::f32()),
+            stats: Arc::default(),
+            cpu_packed: false,
+        }
     }
 
     /// `vb` over `file`, which is also memory-mapped for the CPU side of the quantization when the plan needs it.
     pub fn with_plan(vb: VarBuilder<'a>, file: &Path, family: Family, plan: &QuantPlan) -> Result<QWeights<'a>> {
         let plan = plan.for_device(vb.device());
-        let src = if plan.is_f32() {
-            None
+        let (src, cache) = if plan.is_f32() {
+            (None, None)
         } else {
-            Some(Arc::new(unsafe { MmapedSafetensors::new(file) }.with_context(|| format!("mapping {}", file.display()))?))
+            let src = Some(Arc::new(
+                unsafe { MmapedSafetensors::new(file) }.with_context(|| format!("mapping {}", file.display()))?,
+            ));
+            let cache = QuantDiskCache::open(file, family, &plan).map(|c| Arc::new(Mutex::new(c)));
+            (src, cache)
         };
-        Ok(QWeights { vb, src, family, plan: Arc::new(plan), stats: Arc::default() })
+        Ok(QWeights {
+            vb,
+            src,
+            cache,
+            family,
+            plan: Arc::new(plan),
+            stats: Arc::default(),
+            cpu_packed: false,
+        })
+    }
+
+    /// Enables M-/thread-invariant CPU NR=32 packed f32 weights for dense linear layers on CPU.
+    pub fn with_cpu_packed(mut self, on: bool) -> QWeights<'a> {
+        self.cpu_packed = on && self.vb.device().is_cpu();
+        self
+    }
+
+    pub fn is_cpu_packed(&self) -> bool {
+        self.cpu_packed
+    }
+
+    /// Persists newly quantized weights to the on-disk `.qcache` file atomically (no-op if unchanged or disabled).
+    pub fn flush_cache(&self) {
+        if let Some(c) = &self.cache {
+            c.lock().unwrap_or_else(|p| p.into_inner()).flush();
+        }
     }
 
     pub fn pp<S: ToString>(&self, s: S) -> QWeights<'a> {
@@ -476,18 +758,42 @@ impl<'a> QWeights<'a> {
         Ok(t.narrow(0, start, rows)?.flatten_all()?.to_vec1::<f32>()?)
     }
 
-    fn quantized(&self, values: &[f32], rows: usize, cols: usize, q: QType, bias: Option<Tensor>) -> Result<QLinear> {
-        let t0 = Instant::now();
-        let bytes = kquant::encode(values, cols, q.ggml(), None)?;
+    fn quantized_from_bytes(&self, bytes: &[u8], rows: usize, cols: usize, q: QType, bias: Option<Tensor>, elapsed_ms: f64) -> Result<QLinear> {
         // `qtensor_from_ggml` reads the bytes as blocks: give it an aligned buffer.
         let mut words = vec![0u64; bytes.len().div_ceil(8)];
         let (_, raw, _) = unsafe { words.align_to_mut::<u8>() };
-        raw[..bytes.len()].copy_from_slice(&bytes);
+        raw[..bytes.len()].copy_from_slice(bytes);
         let qt = qtensor_from_ggml(q.ggml(), &raw[..bytes.len()], vec![rows, cols], self.device())?;
         let mut s = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         s.add(q, (rows * cols * 4) as u64, bytes.len() as u64);
-        s.quantize_ms += t0.elapsed().as_secs_f64() * 1e3;
-        Ok(QLinear::Quant { w: QMatMul::from_qtensor(qt)?, b: bias, device_is_vulkan: matches!(self.device(), Device::Vulkan(_)) })
+        s.quantize_ms += elapsed_ms;
+        let use_native_fwd = matches!(self.device(), Device::Vulkan(_) | Device::Metal(_));
+        Ok(QLinear::Quant { w: QMatMul::from_qtensor(qt)?, b: bias, use_native_fwd })
+    }
+
+    fn quantized_cached<F>(&self, cache_key: String, rows: usize, cols: usize, q: QType, bias: Option<Tensor>, load_f32: F) -> Result<QLinear>
+    where
+        F: FnOnce() -> Result<Vec<f32>>,
+    {
+        let t0 = Instant::now();
+        if let Some(c) = &self.cache {
+            let hit = c
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&cache_key, q, rows, cols)
+                .map(|s| s.to_vec());
+            if let Some(bytes) = hit {
+                return self.quantized_from_bytes(&bytes, rows, cols, q, bias, t0.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let values = load_f32()?;
+        let bytes = kquant::encode(&values, cols, q.ggml(), None)?;
+        if let Some(c) = &self.cache {
+            c.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(cache_key, q, rows, cols, bytes.clone());
+        }
+        self.quantized_from_bytes(&bytes, rows, cols, q, bias, t0.elapsed().as_secs_f64() * 1e3)
     }
 
     /// Counts an F32 linear weight a layer loaded by itself (MapHead's packed projection) in the stats.
@@ -495,16 +801,29 @@ impl<'a> QWeights<'a> {
         self.stats.lock().unwrap_or_else(|p| p.into_inner()).add(QType::F32, (rows * cols * 4) as u64, (rows * cols * 4) as u64);
     }
 
-    /// `candle_nn::linear(in_dim, out_dim)` under this prefix, quantized when the plan says so.
+    fn dense_linear(&self, w: Tensor, b: Option<Tensor>) -> Result<QLinear> {
+        if self.cpu_packed {
+            Ok(QLinear::from_dense_packed(&w, b.as_ref())?)
+        } else {
+            Ok(QLinear::Dense(Linear::new(w, b)))
+        }
+    }
+
+    /// `candle_nn::linear(in_dim, out_dim)` under this prefix, quantized or CPU-packed when the plan says so.
     pub fn linear(&self, in_dim: usize, out_dim: usize) -> Result<QLinear> {
         let q = self.plan.qtype(self.family, &self.full("weight"), in_dim);
         if q == QType::F32 || self.src.is_none() {
             self.record_dense(out_dim, in_dim);
+            if self.cpu_packed {
+                let w = self.vb.get((out_dim, in_dim), "weight")?;
+                let b = self.vb.get(out_dim, "bias")?;
+                return self.dense_linear(w, Some(b));
+            }
             return Ok(QLinear::Dense(candle_nn::linear(in_dim, out_dim, self.vb.clone())?));
         }
-        let w = self.source_rows("weight", 0, out_dim, in_dim)?;
         let b = self.vb.get(out_dim, "bias")?;
-        self.quantized(&w, out_dim, in_dim, q, Some(b))
+        let key = self.full("weight");
+        self.quantized_cached(key, out_dim, in_dim, q, Some(b), || self.source_rows("weight", 0, out_dim, in_dim))
     }
 
     /// One linear layer over the concatenated outputs of `parts` (each `out_each` × `in_dim`, with bias): the fused
@@ -517,13 +836,16 @@ impl<'a> QWeights<'a> {
         if q == QType::F32 || self.src.is_none() {
             let ws = parts.iter().map(|p| self.vb.pp(p).get((out_each, in_dim), "weight")).collect::<candle_core::Result<Vec<_>>>()?;
             self.record_dense(out_each * parts.len(), in_dim);
-            return Ok(QLinear::Dense(Linear::new(Tensor::cat(&ws, 0)?, Some(b))));
+            return self.dense_linear(Tensor::cat(&ws, 0)?, Some(b));
         }
-        let mut w = Vec::with_capacity(parts.len() * out_each * in_dim);
-        for p in parts {
-            w.extend(self.pp(p).source_rows("weight", 0, out_each, in_dim)?);
-        }
-        self.quantized(&w, parts.len() * out_each, in_dim, q, Some(b))
+        let key = format!("{}.concat[{}]", self.vb.prefix(), parts.join(","));
+        self.quantized_cached(key, parts.len() * out_each, in_dim, q, Some(b), || {
+            let mut w = Vec::with_capacity(parts.len() * out_each * in_dim);
+            for p in parts {
+                w.extend(self.pp(p).source_rows("weight", 0, out_each, in_dim)?);
+            }
+            Ok(w)
+        })
     }
 
     /// Rows `start..start + rows` of the 2D weight `w_name` with the same rows of the bias `b_name` (MapHead's packed
@@ -534,10 +856,44 @@ impl<'a> QWeights<'a> {
         if q == QType::F32 || self.src.is_none() {
             let w = self.vb.get((total_rows, in_dim), w_name)?.narrow(0, start, rows)?.contiguous()?;
             self.record_dense(rows, in_dim);
-            return Ok(QLinear::Dense(Linear::new(w, Some(b))));
+            return self.dense_linear(w, Some(b));
         }
-        let w = self.source_rows(w_name, start, rows, in_dim)?;
-        self.quantized(&w, rows, in_dim, q, Some(b))
+        let key = format!("{}[{start}..{}]", self.full(w_name), start + rows);
+        self.quantized_cached(key, rows, in_dim, q, Some(b), || self.source_rows(w_name, start, rows, in_dim))
+    }
+
+    /// Splits a packed `[parts * rows, in_dim]` weight + bias into `parts` [`QLinear`]s in a single file load.
+    pub fn linear_split_rows(&self, w_name: &str, b_name: &str, parts: usize, rows: usize, in_dim: usize) -> Result<Vec<QLinear>> {
+        let total_rows = parts * rows;
+        let q = self.plan.qtype(self.family, &self.full(w_name), in_dim);
+        let b_all = self.vb.get(total_rows, b_name)?;
+        if q == QType::F32 || self.src.is_none() {
+            let w_all = self.vb.get((total_rows, in_dim), w_name)?;
+            let mut out = Vec::with_capacity(parts);
+            for i in 0..parts {
+                let w = w_all.narrow(0, i * rows, rows)?.contiguous()?;
+                let b = b_all.narrow(0, i * rows, rows)?.contiguous()?;
+                self.record_dense(rows, in_dim);
+                out.push(self.dense_linear(w, Some(b))?);
+            }
+            return Ok(out);
+        }
+        let mut loaded: Option<Vec<f32>> = None;
+        let mut out = Vec::with_capacity(parts);
+        for i in 0..parts {
+            let start = i * rows;
+            let b = b_all.narrow(0, start, rows)?.contiguous()?;
+            let key = format!("{}[{start}..{}]", self.full(w_name), start + rows);
+            let layer = self.quantized_cached(key, rows, in_dim, q, Some(b), || {
+                if loaded.is_none() {
+                    loaded = Some(self.source_rows(w_name, 0, total_rows, in_dim)?);
+                }
+                let all = loaded.as_ref().unwrap();
+                Ok(all[start * in_dim..(start + rows) * in_dim].to_vec())
+            })?;
+            out.push(layer);
+        }
+        Ok(out)
     }
 }
 
@@ -698,6 +1054,49 @@ mod tests {
                 assert!(err < bound, "rows {k} ({:?}): {err}", plan.tag);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_packed_linear_is_m_invariant_and_qcache_roundtrips() -> Result<()> {
+        let pre = "vision_model.encoder.layers.4.mlp.fc1";
+        let (path, _) = file_with(&[(&format!("{pre}.weight"), vec![128, 64]), (&format!("{pre}.bias"), vec![128])], 77);
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[&path], DType::F32, &Device::Cpu)? };
+        let x4 = Tensor::from_vec(normals(4 * 64, 123), (4, 64), &Device::Cpu)?;
+        let x1 = x4.narrow(0, 2, 1)?.contiguous()?;
+        let ref_lin = candle_nn::linear(64, 128, vb.pp(pre))?;
+        let packed = QWeights::with_plan(vb.clone(), &path, Family::Siglip2, &QuantPlan::f32())?
+            .with_cpu_packed(true)
+            .pp(pre)
+            .linear(64, 128)?;
+        assert!(packed.is_cpu_packed());
+        let y4 = packed.forward(&x4)?;
+        let y1 = packed.forward(&x1)?;
+        let row2 = y4.narrow(0, 2, 1)?.flatten_all()?.to_vec1::<f32>()?;
+        let single = y1.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(row2, single, "CpuPacked must be bit-identical between M=1 and M=4");
+        let y_ref = ref_lin.forward(&x4)?.flatten_all()?.to_vec1::<f32>()?;
+        let max_diff = y4
+            .flatten_all()?
+            .to_vec1::<f32>()?
+            .iter()
+            .zip(&y_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_diff < 1e-5, "CpuPacked vs Dense max_diff={max_diff}");
+
+        // Verify disk .qcache write + reload produces bit-identical Q8_0 outputs.
+        let plan = QuantPlan::parse("f32;sv.fc1=q8_0")?;
+        let w1 = QWeights::with_plan(vb.clone(), &path, Family::Siglip2, &plan)?;
+        let l1 = w1.pp(pre).linear(64, 128)?;
+        w1.flush_cache();
+        let w2 = QWeights::with_plan(vb.clone(), &path, Family::Siglip2, &plan)?;
+        let l2 = w2.pp(pre).linear(64, 128)?;
+        assert_eq!(
+            l1.forward(&x4)?.flatten_all()?.to_vec1::<f32>()?,
+            l2.forward(&x4)?.flatten_all()?.to_vec1::<f32>()?,
+            "cached Q8_0 reload must be bit-identical"
+        );
         Ok(())
     }
 }

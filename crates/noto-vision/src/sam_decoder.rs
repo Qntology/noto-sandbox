@@ -32,13 +32,67 @@ impl Mlp {
     }
 }
 
+/// Non-overlapping 2x2 stride-2 ConvTranspose2d as GEMM + pixel-shuffle (native device op on all backends).
+/// Keeps live `VarMap` tensors un-detached so post-build `Var::set()` in tests remains visible.
+enum FastUpscale2x2 {
+    Packed { proj: candle_nn::Linear, bias: Tensor, c_out: usize },
+    Live { weight: Tensor, bias: Tensor, c_in: usize, c_out: usize },
+}
+
+impl FastUpscale2x2 {
+    fn new(c_in: usize, c_out: usize, vb: VarBuilder) -> Result<Self> {
+        let w_raw = vb.get((c_in, c_out, 2, 2), "weight")?;
+        let b_raw = vb.get(c_out, "bias")?;
+        if w_raw.is_variable() || b_raw.is_variable() {
+            return Ok(FastUpscale2x2::Live { weight: w_raw, bias: b_raw, c_in, c_out });
+        }
+        let w = w_raw
+            .permute((1, 2, 3, 0))?
+            .contiguous()?
+            .reshape((c_out * 4, c_in))?;
+        let bias = b_raw.reshape((1, c_out, 1, 1))?;
+        Ok(FastUpscale2x2::Packed { proj: candle_nn::Linear::new(w, None), bias, c_out })
+    }
+}
+
+impl Module for FastUpscale2x2 {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, _, h, w) = x.dims4()?;
+        let x_hwc = x.permute((0, 2, 3, 1))?.contiguous()?;
+        match self {
+            FastUpscale2x2::Packed { proj, bias, c_out } => {
+                let y = proj
+                    .forward(&x_hwc)?
+                    .reshape((b, h, w, *c_out, 2, 2))?
+                    .permute((0, 3, 1, 4, 2, 5))?
+                    .contiguous()?
+                    .reshape((b, *c_out, h * 2, w * 2))?;
+                y.broadcast_add(bias)
+            }
+            FastUpscale2x2::Live { weight, bias, c_in, c_out } => {
+                let wt = weight
+                    .permute((1, 2, 3, 0))?
+                    .contiguous()?
+                    .reshape((*c_out * 4, *c_in))?;
+                let y = candle_nn::Linear::new(wt, None)
+                    .forward(&x_hwc)?
+                    .reshape((b, h, w, *c_out, 2, 2))?
+                    .permute((0, 3, 1, 4, 2, 5))?
+                    .contiguous()?
+                    .reshape((b, *c_out, h * 2, w * 2))?;
+                y.broadcast_add(&bias.reshape((1, *c_out, 1, 1))?)
+            }
+        }
+    }
+}
+
 pub struct MaskDecoder {
     iou_token: candle_nn::Embedding,
     mask_tokens: candle_nn::Embedding,
     iou_prediction_head: Mlp,
-    output_upscaling_conv1: candle_nn::ConvTranspose2d,
+    output_upscaling_conv1: FastUpscale2x2,
     output_upscaling_ln: LayerNorm2d,
-    output_upscaling_conv2: candle_nn::ConvTranspose2d,
+    output_upscaling_conv2: FastUpscale2x2,
     num_mask_tokens: usize,
     output_hypernetworks_mlps: Vec<Mlp>,
     transformer: TwoWayTransformer,
@@ -50,10 +104,9 @@ impl MaskDecoder {
         let iou_prediction_head = Mlp::new(transformer_dim, iou_head_hidden_dim, num_mask_tokens, iou_head_depth, vb.pp("iou_prediction_head"))?;
         let iou_token = candle_nn::embedding(1, transformer_dim, vb.pp("iou_token"))?;
         let mask_tokens = candle_nn::embedding(num_mask_tokens, transformer_dim, vb.pp("mask_tokens"))?;
-        let cfg = candle_nn::ConvTranspose2dConfig { stride: 2, ..Default::default() };
-        let output_upscaling_conv1 = candle_nn::conv_transpose2d(transformer_dim, transformer_dim / 4, 2, cfg, vb.pp("output_upscaling.0"))?;
+        let output_upscaling_conv1 = FastUpscale2x2::new(transformer_dim, transformer_dim / 4, vb.pp("output_upscaling.0"))?;
         let output_upscaling_ln = LayerNorm2d::new(transformer_dim / 4, 1e-6, vb.pp("output_upscaling.1"))?;
-        let output_upscaling_conv2 = candle_nn::conv_transpose2d(transformer_dim / 4, transformer_dim / 8, 2, cfg, vb.pp("output_upscaling.3"))?;
+        let output_upscaling_conv2 = FastUpscale2x2::new(transformer_dim / 4, transformer_dim / 8, vb.pp("output_upscaling.3"))?;
         let vb_o = vb.pp("output_hypernetworks_mlps");
         let output_hypernetworks_mlps = (0..num_mask_tokens).map(|i| Mlp::new(transformer_dim, transformer_dim, transformer_dim / 8, 3, vb_o.pp(i))).collect::<Result<_>>()?;
         let transformer = TwoWayTransformer::new(2, transformer_dim, 8, 2048, vb.pp("transformer"))?;

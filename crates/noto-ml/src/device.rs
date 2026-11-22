@@ -9,8 +9,231 @@ use serde::{Deserialize, Serialize};
 pub const DEVICE_ENV: &str = "NOTO_DEVICE";
 pub const BATCH_ROWS_ENV: &str = "NOTO_BATCH_ROWS";
 pub const FIXED_SHAPE_ENV: &str = "NOTO_FIXED_SHAPE";
+pub const FLASH_ATTN_ENV: &str = "NOTO_FLASH_ATTN";
+pub const CPU_PACKED_ENV: &str = "NOTO_CPU_PACKED";
+pub const ACCEL_CHECK_ENV: &str = "NOTO_ACCEL_CHECK";
 pub const POOL_KEEP_BYTES: usize = 256 << 20;
 pub const VULKAN_TRIM_MIN_BYTES: usize = 64 << 20;
+
+/// GPU accelerated operation classes validated at runtime against a CPU oracle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AccelOp {
+    Matmul,
+    Softmax,
+    QuantQ8,
+    FlashAttn,
+    Conv2d,
+}
+
+impl AccelOp {
+    pub const ALL: [AccelOp; 5] = [
+        AccelOp::Matmul,
+        AccelOp::Softmax,
+        AccelOp::QuantQ8,
+        AccelOp::FlashAttn,
+        AccelOp::Conv2d,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AccelOp::Matmul => "matmul",
+            AccelOp::Softmax => "softmax",
+            AccelOp::QuantQ8 => "q8_0",
+            AccelOp::FlashAttn => "flash_attn",
+            AccelOp::Conv2d => "conv2d",
+        }
+    }
+}
+
+fn device_ordinal(device: &Device) -> usize {
+    use candle_core::DeviceLocation;
+    match device.location() {
+        DeviceLocation::Cpu => 0,
+        DeviceLocation::Cuda { gpu_id }
+        | DeviceLocation::Metal { gpu_id }
+        | DeviceLocation::Rocm { gpu_id }
+        | DeviceLocation::Vulkan { gpu_id }
+        | DeviceLocation::OpenCl { gpu_id } => gpu_id,
+    }
+}
+
+fn accel_cache() -> &'static Mutex<HashMap<(Backend, usize, AccelOp), bool>> {
+    static CACHE: OnceLock<Mutex<HashMap<(Backend, usize, AccelOp), bool>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn accel_faults() -> &'static Mutex<HashMap<AccelOp, bool>> {
+    static FAULTS: OnceLock<Mutex<HashMap<AccelOp, bool>>> = OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fault-injection hook for tests: forces the self-check for `op` to fail and fall back.
+pub fn set_accel_fault(op: AccelOp, fail: bool) {
+    accel_faults().lock().unwrap_or_else(|p| p.into_inner()).insert(op, fail);
+    reset_accel_cache();
+}
+
+/// Clears cached per-device acceleration self-check verdicts.
+pub fn reset_accel_cache() {
+    accel_cache().lock().unwrap_or_else(|p| p.into_inner()).clear();
+}
+
+fn cpu_packed_override() -> &'static Mutex<Option<bool>> {
+    static OVERRIDE: OnceLock<Mutex<Option<bool>>> = OnceLock::new();
+    OVERRIDE.get_or_init(|| Mutex::new(None))
+}
+
+/// Test/runtime override for CPU packed-weight kernels (`None` defers to `NOTO_CPU_PACKED`).
+pub fn set_cpu_packed_override(v: Option<bool>) {
+    *cpu_packed_override().lock().unwrap_or_else(|p| p.into_inner()) = v;
+}
+
+/// Whether packed M-/thread-invariant CPU f32 kernels are enabled on `device`.
+pub fn cpu_packed_enabled(device: &Device) -> bool {
+    if !device.is_cpu() {
+        return false;
+    }
+    if let Some(v) = *cpu_packed_override().lock().unwrap_or_else(|p| p.into_inner()) {
+        return v;
+    }
+    std::env::var(CPU_PACKED_ENV).map_or(true, |v| v.trim() != "0" && !v.trim().eq_ignore_ascii_case("off"))
+}
+
+fn run_accel_probe(device: &Device, op: AccelOp) -> Result<bool> {
+    use candle_core::{DType, Tensor};
+    use candle_nn::ops::softmax_last_dim;
+
+    if accel_faults().lock().unwrap_or_else(|p| p.into_inner()).get(&op).copied().unwrap_or(false) {
+        return Ok(false);
+    }
+    const TOL: f32 = 1e-3;
+    let same = |on: Tensor, cpu: Tensor| -> Result<bool> {
+        let on = on.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        let cpu = cpu.to_device(&Device::Cpu)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        if on.len() != cpu.len() {
+            return Ok(false);
+        }
+        Ok(on.iter().zip(&cpu).all(|(p, q)| p.is_finite() && q.is_finite() && (p - q).abs() <= TOL * p.abs().max(q.abs()).max(1.0)))
+    };
+    let det = |n: usize, seed: usize| -> Vec<f32> {
+        (0..n).map(|i| ((i * 31 + seed) % 97) as f32 / 48.0 - 1.0).collect()
+    };
+
+    match op {
+        AccelOp::Matmul => {
+            const N: usize = 32;
+            let a = Tensor::from_vec(det(N * N, 1), (N, N), &Device::Cpu)?;
+            let b = Tensor::from_vec(det(N * N, 5), (N, N), &Device::Cpu)?;
+            let got = a.to_device(device)?.matmul(&b.to_device(device)?)?;
+            same(got, a.matmul(&b)?)
+        }
+        AccelOp::Softmax => {
+            const N: usize = 32;
+            let a = Tensor::from_vec(det(N * N, 3), (N, N), &Device::Cpu)?;
+            let got = softmax_last_dim(&a.to_device(device)?)?;
+            same(got, softmax_last_dim(&a)?)
+        }
+        AccelOp::QuantQ8 => {
+            let (rows, cols) = (32usize, 64usize);
+            let w = det(rows * cols, 7);
+            let x_cpu = Tensor::from_vec(det(4 * cols, 11), (1, 4, cols), &Device::Cpu)?;
+            let bytes = crate::kquant::encode(&w, cols, candle_core::quantized::GgmlDType::Q8_0, None)?;
+            let mut words = vec![0u64; bytes.len().div_ceil(8)];
+            let (_, raw, _) = unsafe { words.align_to_mut::<u8>() };
+            raw[..bytes.len()].copy_from_slice(&bytes);
+            let qt_cpu = candle_core::quantized::ggml_file::qtensor_from_ggml(
+                candle_core::quantized::GgmlDType::Q8_0,
+                &raw[..bytes.len()],
+                vec![rows, cols],
+                &Device::Cpu,
+            )?;
+            let qt_dev = candle_core::quantized::ggml_file::qtensor_from_ggml(
+                candle_core::quantized::GgmlDType::Q8_0,
+                &raw[..bytes.len()],
+                vec![rows, cols],
+                device,
+            )?;
+            let ref_out = candle_core::quantized::QMatMul::from_qtensor(qt_cpu)?.forward_exact(&x_cpu)?;
+            let qm_dev = candle_core::quantized::QMatMul::from_qtensor(qt_dev)?;
+            let x_dev = x_cpu.to_device(device)?;
+            let got = if matches!(device, Device::Vulkan(_) | Device::Metal(_)) {
+                candle_core::Module::forward(&qm_dev, &x_dev)?
+            } else {
+                qm_dev.forward_exact(&x_dev)?
+            };
+            same(got, ref_out)
+        }
+        AccelOp::FlashAttn => {
+            // Only probe fused GPU FlashAttention on backends that have native kernels (CUDA/ROCm/Vulkan).
+            if !matches!(device, Device::Cuda(_) | Device::Rocm(_) | Device::Vulkan(_)) {
+                return Ok(false);
+            }
+            let (b, s, h, d) = (1usize, 16usize, 4usize, 64usize);
+            let q = Tensor::from_vec(det(b * s * h * d, 13), (b, s, h, d), &Device::Cpu)?;
+            let k = Tensor::from_vec(det(b * s * h * d, 17), (b, s, h, d), &Device::Cpu)?;
+            let v = Tensor::from_vec(det(b * s * h * d, 19), (b, s, h, d), &Device::Cpu)?;
+            let scale = (d as f32).powf(-0.5);
+            let cfg_strict = candle_nn::flash_attn::FlashAttnConfig::new(scale).fused(true).strict(true);
+            let got = candle_nn::flash_attn::flash_attn_with_config(&q.to_device(device)?, &k.to_device(device)?, &v.to_device(device)?, &cfg_strict)?;
+            let q_bhsd = q.transpose(1, 2)?.contiguous()?;
+            let k_bhsd = k.transpose(1, 2)?.contiguous()?;
+            let v_bhsd = v.transpose(1, 2)?.contiguous()?;
+            let scores = q_bhsd.matmul(&k_bhsd.transpose(2, 3)?)?.affine(scale as f64, 0.0)?;
+            let ref_out = softmax_last_dim(&scores)?.matmul(&v_bhsd)?.transpose(1, 2)?.contiguous()?;
+            same(got, ref_out)
+        }
+        AccelOp::Conv2d => {
+            let x = Tensor::from_vec(det(1 * 8 * 8 * 8, 23), (1, 8, 8, 8), &Device::Cpu)?;
+            let w = Tensor::from_vec(det(8 * 8 * 9, 29), (8, 8, 3, 3), &Device::Cpu)?;
+            let got = x.to_device(device)?.conv2d(&w.to_device(device)?, 1, 1, 1, 1)?;
+            let ref_out = x.conv2d(&w, 1, 1, 1, 1)?;
+            same(got, ref_out)
+        }
+    }
+}
+
+/// Checks whether `op` is safe and numerically accurate on `device`, caching the verdict per
+/// `(backend, ordinal, op)` with `catch_unwind` isolation against panicking GPU drivers/kernels.
+pub fn accel_op_ok(device: &Device, op: AccelOp) -> bool {
+    let backend = Backend::of(device);
+    if backend == Backend::Cpu {
+        return false;
+    }
+    if op == AccelOp::FlashAttn {
+        if let Ok(v) = std::env::var(FLASH_ATTN_ENV) {
+            let t = v.trim();
+            if t == "0" || t.eq_ignore_ascii_case("off") || t.eq_ignore_ascii_case("false") {
+                return false;
+            }
+        }
+    }
+    if std::env::var(ACCEL_CHECK_ENV).is_ok_and(|v| v.trim() == "0" || v.trim().eq_ignore_ascii_case("off")) {
+        return !accel_faults().lock().unwrap_or_else(|p| p.into_inner()).get(&op).copied().unwrap_or(false);
+    }
+    let key = (backend, device_ordinal(device), op);
+    if let Some(&ok) = accel_cache().lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return ok;
+    }
+    let dev = device.clone();
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_accel_probe(&dev, op)))
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or(false);
+    accel_cache().lock().unwrap_or_else(|p| p.into_inner()).insert(key, ok);
+    ok
+}
+
+/// One-line diagnostic summary of verified GPU ops on `device`.
+pub fn accel_diagnose(device: &Device) -> String {
+    if device.is_cpu() {
+        return format!("CPU (packed={})", cpu_packed_enabled(device));
+    }
+    let parts: Vec<String> = AccelOp::ALL
+        .iter()
+        .map(|&op| format!("{}={}", op.name(), if accel_op_ok(device, op) { "ok" } else { "fallback" }))
+        .collect();
+    format!("{} [{}]", device_label(device), parts.join(", "))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,7 +309,10 @@ impl Backend {
             Backend::Cuda => {
                 #[cfg(feature = "cuda")]
                 {
-                    return Ok(Device::new_cuda(ordinal)?);
+                    let Ok(d) = std::panic::catch_unwind(|| Device::new_cuda(ordinal)) else {
+                        bail!("CUDA device {ordinal} panicked on open");
+                    };
+                    return Ok(d?);
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -108,7 +334,10 @@ impl Backend {
             Backend::Vulkan => {
                 #[cfg(feature = "vulkan")]
                 {
-                    return Ok(Device::new_vulkan(ordinal)?);
+                    let Ok(d) = std::panic::catch_unwind(|| Device::new_vulkan(ordinal)) else {
+                        bail!("Vulkan device {ordinal} panicked on open");
+                    };
+                    return Ok(d?);
                 }
                 #[cfg(not(feature = "vulkan"))]
                 {
@@ -119,8 +348,12 @@ impl Backend {
             Backend::Rocm => {
                 #[cfg(feature = "rocm")]
                 {
-                    let d = Device::new_rocm(ordinal)?;
+                    let Ok(d) = std::panic::catch_unwind(|| Device::new_rocm(ordinal)) else {
+                        bail!("ROCm device {ordinal} panicked on open");
+                    };
+                    let d = d?;
                     ROCM_USED.store(true, Ordering::SeqCst);
+                    ROCM_ORDINAL.store(ordinal, Ordering::SeqCst);
                     return Ok(d);
                 }
                 #[cfg(not(feature = "rocm"))]
@@ -229,14 +462,15 @@ pub fn preferred() -> Selection {
 }
 
 pub fn device_label(device: &Device) -> String {
+    let ord = device_ordinal(device);
     match device {
-        Device::Cuda(_) => "CUDA:0".into(),
+        Device::Cuda(_) => format!("CUDA:{ord}"),
         Device::Rocm(r) => match r.name() {
-            Ok(n) if !n.is_empty() => format!("ROCm:0 ({n})"),
-            _ => "ROCm:0".into(),
+            Ok(n) if !n.is_empty() => format!("ROCm:{ord} ({n})"),
+            _ => format!("ROCm:{ord}"),
         },
-        Device::Vulkan(v) => format!("Vulkan:0 ({}, {})", v.name(), v.device_type()),
-        Device::Metal(_) => "Metal".into(),
+        Device::Vulkan(v) => format!("Vulkan:{ord} ({}, {})", v.name(), v.device_type()),
+        Device::Metal(_) => if ord == 0 { "Metal".into() } else { format!("Metal:{ord}") },
         _ => "CPU".into(),
     }
 }
@@ -294,6 +528,7 @@ impl BatchPolicy {
 }
 
 static ROCM_USED: AtomicBool = AtomicBool::new(false);
+static ROCM_ORDINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn rocm_exit_now_if_used(code: u32) {
     #[cfg(all(windows, feature = "rocm"))]
@@ -305,7 +540,8 @@ pub fn rocm_exit_now_if_used(code: u32) {
         if std::env::var("NOTO_ROCM_FAST_EXIT").map(|v| v.trim() == "0").unwrap_or(false) {
             return;
         }
-        if let Ok(d) = Backend::Rocm.device(0) {
+        let ord = ROCM_ORDINAL.load(Ordering::SeqCst);
+        if let Ok(d) = Backend::Rocm.device(ord) {
             let _ = d.synchronize();
             let _ = d.trim_memory_pool(0);
         }
@@ -317,7 +553,7 @@ pub fn rocm_exit_now_if_used(code: u32) {
         }
     }
     let _ = code;
-    let _ = ROCM_USED.load(Ordering::Relaxed);
+    let _ = (ROCM_USED.load(Ordering::Relaxed), ROCM_ORDINAL.load(Ordering::Relaxed));
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -437,5 +673,24 @@ mod tests {
         }
         assert!(p.image_rows(256) >= 1 && p.image_rows(256) <= p.max_rows);
         assert_eq!(p.image_rows(100_000), 1);
+    }
+
+    #[test]
+    fn accel_check_and_fault_injection_work() {
+        assert!(!accel_op_ok(&Device::Cpu, AccelOp::FlashAttn));
+        assert!(accel_diagnose(&Device::Cpu).starts_with("CPU"));
+        let sel = select(None);
+        if sel.backend != Backend::Cpu {
+            let dev = sel.backend.device(sel.ordinal).unwrap();
+            reset_accel_cache();
+            println!("[ACCEL] {}", accel_diagnose(&dev));
+            assert!(accel_op_ok(&dev, AccelOp::Matmul), "matmul should pass on {:?}", sel.backend);
+            assert!(accel_op_ok(&dev, AccelOp::Softmax), "softmax should pass on {:?}", sel.backend);
+            assert!(accel_op_ok(&dev, AccelOp::QuantQ8), "q8_0 should pass on {:?}", sel.backend);
+            set_accel_fault(AccelOp::FlashAttn, true);
+            assert!(!accel_op_ok(&dev, AccelOp::FlashAttn), "fault injection must disable FlashAttn");
+            set_accel_fault(AccelOp::FlashAttn, false);
+            assert!(accel_op_ok(&dev, AccelOp::Conv2d), "conv2d should pass on {:?}", sel.backend);
+        }
     }
 }

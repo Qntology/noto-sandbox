@@ -647,14 +647,19 @@ impl MlPipeline {
     }
 
     pub fn prefetch(&mut self, frames: &[&Rgb]) -> Result<usize> {
+        let pairs: Vec<(&Rgb, Option<&Intrinsics>)> = frames.iter().map(|&f| (f, None)).collect();
+        self.prefetch_with_cameras(&pairs)
+    }
+
+    pub fn prefetch_with_cameras(&mut self, frames: &[(&Rgb, Option<&Intrinsics>)]) -> Result<usize> {
         let mut seen = std::collections::HashSet::new();
-        let todo: Vec<(u64, &Rgb)> = frames
+        let todo: Vec<(u64, &Rgb, Option<&Intrinsics>)> = frames
             .iter()
-            .map(|f| (frame_key(f), *f))
-            .filter(|(k, _)| !self.pre.contains_key(k) && seen.insert(*k))
+            .map(|&(f, intr)| (frame_key(f), f, intr))
+            .filter(|(k, _, _)| !self.pre.contains_key(k) && seen.insert(*k))
             .take(PREFETCH_MAX)
             .collect();
-        let sel: Vec<&Rgb> = todo.iter().map(|(_, f)| *f).collect();
+        let sel: Vec<&Rgb> = todo.iter().map(|(_, f, _)| *f).collect();
         if sel.is_empty() {
             return Ok(0);
         }
@@ -671,12 +676,33 @@ impl MlPipeline {
             DepthEngine::Model(_) | DepthEngine::StandIn(_) => None,
         };
         let points = match &mut self.locate {
-            LocateEngine::Model(m) => Some(m.locate_batch(&sel, &self.labels)?),
+            LocateEngine::Model(m) => {
+                if let Some(intr) = todo.iter().find_map(|(_, _, intr)| *intr) {
+                    m.set_camera(Some(intr));
+                }
+                Some(m.locate_batch(&sel, &self.labels)?)
+            }
             LocateEngine::StandIn(_) => None,
         };
         if lazy {
+            let pyr_cfg = self.fix.pyramid.filter(|p| p.gate.enabled);
             let any: Vec<&Rgb> = match &points {
-                Some(pts) => sel.iter().zip(pts).filter(|(_, p)| !self.prompts_for(p, None, &|_| f32::NEG_INFINITY).is_empty()).map(|(f, _)| *f).collect(),
+                Some(pts) => sel
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, f)| {
+                        if let (Some(cfg), Some(ds)) = (pyr_cfg, depths.as_ref()) {
+                            let mut gated = pts[i].clone();
+                            let pyr = Pyramid::for_frame(f.width, f.height, &cfg);
+                            let geo = noto_vision::cell_geometry(&pyr, &ds[i].depth, ds[i].segmentation.as_ref(), None, cfg.gate.far_m);
+                            noto_vision::gate_points(&mut gated, &pyr, &geo, &cfg.gate);
+                            !self.prompts_for(&gated, None, &|_| f32::NEG_INFINITY).is_empty()
+                        } else {
+                            !self.prompts_for(&pts[i], None, &|_| f32::NEG_INFINITY).is_empty()
+                        }
+                    })
+                    .map(|(_, f)| *f)
+                    .collect(),
                 None => sel.clone(),
             };
             if !any.is_empty() {
@@ -688,7 +714,7 @@ impl MlPipeline {
         }
         let mut depths = depths.map(|v| v.into_iter().map(Some).collect::<Vec<_>>());
         let mut points = points.map(|v| v.into_iter().map(Some).collect::<Vec<_>>());
-        for (i, (key, _)) in todo.iter().enumerate() {
+        for (i, (key, _, _)) in todo.iter().enumerate() {
             let p = Prefetched { depth: depths.as_mut().and_then(|d| d[i].take()), points: points.as_mut().and_then(|p| p[i].take()) };
             if self.pre.insert(*key, p).is_none() {
                 self.pre_order.push_back(*key);
@@ -794,19 +820,63 @@ impl MlPipeline {
             v
         };
         let mut t = std::time::Instant::now();
-        let scene = match (pre.depth, &mut self.depth, truth) {
-            // Two cameras: SGBM on the pair, metric, NaN where it could not match. No right image is an error, not a
-            // reason to guess from the left one.
-            (_, DepthEngine::Model(m), _) if m.stereo_rig().is_some() => match right {
-                Some(r) => noto_vision::DepthScene::depth_only(m.infer_pair(rgb, r)?),
-                None => anyhow::bail!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"),
-            },
-            (Some(d), DepthEngine::Model(_), _) => d,
-            (_, DepthEngine::Model(m), _) => m.infer_scene(rgb, heads)?,
-            (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
-            (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
+        // In stereo mode (CPU SGBM) with an unprefetched GPU locator, run depth and locate concurrently
+        // so CPU stereo matching overlaps with GPU semantic localization.
+        let can_overlap_stereo = pre.points.is_none()
+            && right.is_some()
+            && matches!(&self.depth, DepthEngine::Model(m) if m.stereo_rig().is_some())
+            && matches!(&self.locate, LocateEngine::Model(_));
+        let (scene, mut points) = if can_overlap_stereo {
+            let r = right.expect("checked above");
+            let labels = &self.labels;
+            let (depth_res, loc_res) = match (&mut self.depth, &mut self.locate) {
+                (DepthEngine::Model(dm), LocateEngine::Model(lm)) => {
+                    lm.set_camera(Some(intr));
+                    std::thread::scope(|s| {
+                        let dh = s.spawn(|| {
+                            let t0 = std::time::Instant::now();
+                            let d = dm.infer_pair(rgb, r).map(noto_vision::DepthScene::depth_only);
+                            (d, t0.elapsed().as_secs_f32() * 1000.0)
+                        });
+                        let t1 = std::time::Instant::now();
+                        let lr = (lm.locate(rgb, labels), t1.elapsed().as_secs_f32() * 1000.0);
+                        let dr = dh.join().expect("stereo depth thread panicked");
+                        (dr, lr)
+                    })
+                }
+                _ => unreachable!(),
+            };
+            ms.depth = depth_res.1;
+            ms.locate = loc_res.1;
+            let _ = lap(&mut t);
+            (depth_res.0?, loc_res.0?)
+        } else {
+            let scene = match (pre.depth, &mut self.depth, truth) {
+                // Two cameras: SGBM on the pair, metric, NaN where it could not match. No right image is an error, not a
+                // reason to guess from the left one.
+                (_, DepthEngine::Model(m), _) if m.stereo_rig().is_some() => match right {
+                    Some(r) => noto_vision::DepthScene::depth_only(m.infer_pair(rgb, r)?),
+                    None => anyhow::bail!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"),
+                },
+                (Some(d), DepthEngine::Model(_), _) => d,
+                (_, DepthEngine::Model(m), _) => m.infer_scene(rgb, heads)?,
+                (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
+                (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
+            };
+            ms.depth = lap(&mut t);
+            let points = match (pre.points, &mut self.locate, truth) {
+                (Some(p), LocateEngine::Model(_), _) => p,
+                (_, LocateEngine::Model(m), _) => {
+                    // A perforated pass keeps its dense band on this camera's horizon.
+                    m.set_camera(Some(intr));
+                    m.locate(rgb, &self.labels)?
+                }
+                (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
+                (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
+            };
+            ms.locate = lap(&mut t);
+            (scene, points)
         };
-        ms.depth = lap(&mut t);
         let mut depth = scene.depth;
         let seg = scene.segmentation;
         let normals = scene.normals.filter(|_| self.fix.normals);
@@ -818,17 +888,6 @@ impl MlPipeline {
             _ => None,
         };
         ms.align = lap(&mut t);
-        let mut points = match (pre.points, &mut self.locate, truth) {
-            (Some(p), LocateEngine::Model(_), _) => p,
-            (_, LocateEngine::Model(m), _) => {
-                // A perforated pass keeps its dense band on this camera's horizon.
-                m.set_camera(Some(intr));
-                m.locate(rgb, &self.labels)?
-            }
-            (_, LocateEngine::StandIn(s), Some(t)) => s.run(t, &self.labels),
-            (_, LocateEngine::StandIn(_), None) => anyhow::bail!("의미 위치 대역 모델에는 정답 버퍼가 필요합니다"),
-        };
-        ms.locate = lap(&mut t);
         let pyramid = self.fix.pyramid.map(|cfg| {
             let pyr = Pyramid::for_frame(rgb.width, rgb.height, &cfg);
             let view = noto_vision::pyramid::View { intr, pose, height };

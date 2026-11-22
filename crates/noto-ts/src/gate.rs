@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::fusion::{forecast, HistoryMse, Predictor};
+use crate::fusion::{forecast, Forecast, HistoryMse, Predictor};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateConfig {
@@ -48,30 +48,49 @@ pub fn temporal_gate(
     past_errors: &[HistoryMse],
     cfg: &GateConfig,
 ) -> TemporalVerdict {
+    temporal_gate_with_forecast(history, observed, sds_sd, extra, past_errors, cfg).0
+}
+
+/// Evaluates the temporal gate and returns the 1-step [`Forecast`] computed for it,
+/// avoiding a redundant second forecast call when the caller logs fusion MSE weights.
+pub fn temporal_gate_with_forecast(
+    history: &[f64],
+    observed: f64,
+    sds_sd: Option<f64>,
+    extra: &[&dyn Predictor],
+    past_errors: &[HistoryMse],
+    cfg: &GateConfig,
+) -> (TemporalVerdict, Option<Forecast>) {
     if !observed.is_finite() {
-        return TemporalVerdict {
-            outcome: TemporalOutcome::Held,
-            observed,
-            expected: None,
-            lo: None,
-            hi: None,
-            z: None,
-            method: "none".into(),
-            reason: "관측값이 유한하지 않음".into(),
-        };
+        return (
+            TemporalVerdict {
+                outcome: TemporalOutcome::Held,
+                observed,
+                expected: None,
+                lo: None,
+                hi: None,
+                z: None,
+                method: "none".into(),
+                reason: "관측값이 유한하지 않음".into(),
+            },
+            None,
+        );
     }
     let usable = history.iter().filter(|v| v.is_finite()).count();
     if usable < cfg.min_history {
-        return TemporalVerdict {
-            outcome: TemporalOutcome::Abstained,
-            observed,
-            expected: None,
-            lo: None,
-            hi: None,
-            z: None,
-            method: "none".into(),
-            reason: format!("이력 {usable}점 < {}점이라 판정하지 않음", cfg.min_history),
-        };
+        return (
+            TemporalVerdict {
+                outcome: TemporalOutcome::Abstained,
+                observed,
+                expected: None,
+                lo: None,
+                hi: None,
+                z: None,
+                method: "none".into(),
+                reason: format!("이력 {usable}점 < {}점이라 판정하지 않음", cfg.min_history),
+            },
+            None,
+        );
     }
     let f = forecast(history, 1, extra, past_errors);
     let widen = cfg.widen_sd * sds_sd.unwrap_or(0.0).max(0.0);
@@ -79,14 +98,14 @@ pub fn temporal_gate(
     let half = ((hi - lo) / 2.0).max(1e-9);
     let z = (observed - p50) / (half / 1.2816);
     let inside = observed >= lo && observed <= hi;
-    TemporalVerdict {
+    let verdict = TemporalVerdict {
         outcome: if inside { TemporalOutcome::Accepted } else { TemporalOutcome::Held },
         observed,
         expected: Some(p50),
         lo: Some(lo),
         hi: Some(hi),
         z: Some(z),
-        method: f.method,
+        method: f.method.clone(),
         reason: if inside {
             "예측 띠 안".into()
         } else if observed > hi {
@@ -94,7 +113,8 @@ pub fn temporal_gate(
         } else {
             format!("예측 띠 아래로 벗어남 (관측 {observed:.3} < 하한 {lo:.3})")
         },
-    }
+    };
+    (verdict, Some(f))
 }
 
 #[cfg(test)]

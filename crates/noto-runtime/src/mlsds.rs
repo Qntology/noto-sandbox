@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use noto_core::balance::{reference, Source};
 use noto_sds::{BalanceRow, KeyframeRow, Level, QuestRun, Scope, StepRecord, Track};
-use noto_vision::{features, flags, FlagCfg, FusionInput, Sighting};
+use noto_vision::{features, flags, FlagCfg, FusionInput, Rgb, Sighting};
 use serde_json::json;
 use world_sim::encode_webp;
 
@@ -41,6 +41,10 @@ impl Runtime {
 
     pub(crate) fn ml_analyse(&mut self, kf: &mut Keyframe, wanted: &[String], prefer: Option<u32>) -> Result<MlOut> {
         let rgb = kf.rgb()?;
+        self.ml_analyse_with_rgb(kf, &rgb, wanted, prefer)
+    }
+
+    pub(crate) fn ml_analyse_with_rgb(&mut self, kf: &mut Keyframe, rgb: &Rgb, wanted: &[String], prefer: Option<u32>) -> Result<MlOut> {
         let right = kf.rgb_right()?;
         let lmode = self.ml.locate_mode();
         let floor_default = default_floor(&lmode);
@@ -56,7 +60,7 @@ impl Runtime {
         let ground0 = self.world.surface_m(kf.pose.x, kf.pose.z);
         let world = &self.world;
         let height = move |x: f32, z: f32| world.surface_m(x, z) - ground0;
-        let frame = self.ml.analyse_with(&rgb, right.as_ref(), &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer, Some(&height))?;
+        let frame = self.ml.analyse_with(rgb, right.as_ref(), &kf.intr, &kf.pose, Some(&kf.truth), wanted, &|l| floors.get(l).copied().unwrap_or(floor_default), prefer, Some(&height))?;
         let (dmode, tmode) = (self.ml.depth_mode(), self.ml.track_mode());
         let label = frame.target.as_ref().map(|t| t.label.clone()).or_else(|| wanted.first().cloned()).unwrap_or_default();
 

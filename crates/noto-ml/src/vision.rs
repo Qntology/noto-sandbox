@@ -2,34 +2,59 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use candle_core::{Device, Result, Tensor};
-use candle_nn::{layer_norm, linear, LayerNorm, Linear, Module, VarBuilder};
+use candle_nn::{linear, Module, VarBuilder};
 
 use crate::config::Siglip2Config;
-use crate::encoder::{to_candle, EncoderLayer, LayerKv, Mlp};
+use crate::encoder::{to_candle, EncoderLayer, FastLayerNorm, LayerKv, Mlp};
 use crate::preprocess::NaflexInput;
 use crate::quant::{Family, QLinear, QWeights};
 
-/// MapHead's packed `in_proj` (query, key and value rows). F32: the checkpoint's `[3D, D]` weight sliced per call as
-/// before (bit for bit the old head); quantized: one [`QLinear`] per slice.
+/// MapHead's packed `in_proj` (query, key and value rows). F32: pre-sliced & pre-transposed once at load
+/// for immutable checkpoint tensors (eliminating 5× 2.36 MB per-call copies while staying bit-identical);
+/// live `VarMap` variables keep their reference so post-build `Var::set()` remains visible; quantized or
+/// CPU-packed uses one [`QLinear`] per slice.
 enum InProj {
-    Raw { w: Tensor, b: Tensor, d: usize },
+    Raw { w_t: [Tensor; 3], b: [Tensor; 3] },
+    Var { w: Tensor, b: Tensor, d: usize },
     Q([QLinear; 3]),
 }
 
 impl InProj {
     fn new(w: &QWeights, d: usize) -> Result<InProj> {
-        if w.qtype("in_proj_weight", d) == crate::quant::QType::F32 {
+        if w.qtype("in_proj_weight", d) == crate::quant::QType::F32 && !w.is_cpu_packed() {
             w.record_dense(3 * d, d);
-            return Ok(InProj::Raw { w: w.vb().get((3 * d, d), "in_proj_weight")?, b: w.vb().get(3 * d, "in_proj_bias")?, d });
+            let w_all = w.vb().get((3 * d, d), "in_proj_weight")?;
+            let b_all = w.vb().get(3 * d, "in_proj_bias")?;
+            if w_all.is_variable() || b_all.is_variable() {
+                return Ok(InProj::Var { w: w_all, b: b_all, d });
+            }
+            let w_t = [
+                w_all.narrow(0, 0, d)?.t()?.contiguous()?,
+                w_all.narrow(0, d, d)?.t()?.contiguous()?,
+                w_all.narrow(0, 2 * d, d)?.t()?.contiguous()?,
+            ];
+            let b = [
+                b_all.narrow(0, 0, d)?.contiguous()?,
+                b_all.narrow(0, d, d)?.contiguous()?,
+                b_all.narrow(0, 2 * d, d)?.contiguous()?,
+            ];
+            return Ok(InProj::Raw { w_t, b });
         }
-        let part = |i: usize| w.linear_rows("in_proj_weight", "in_proj_bias", 3 * d, i * d, d, d).map_err(to_candle);
-        Ok(InProj::Q([part(0)?, part(1)?, part(2)?]))
+        let mut parts = w
+            .linear_split_rows("in_proj_weight", "in_proj_bias", 3, d, d)
+            .map_err(to_candle)?
+            .into_iter();
+        let q = parts.next().expect("3 parts");
+        let k = parts.next().expect("3 parts");
+        let v = parts.next().expect("3 parts");
+        Ok(InProj::Q([q, k, v]))
     }
 
     /// Projection `i` (0 query, 1 key, 2 value) of `x`.
     fn forward(&self, i: usize, x: &Tensor) -> Result<Tensor> {
         match self {
-            InProj::Raw { w, b, d } => x.broadcast_matmul(&w.narrow(0, i * d, *d)?.t()?.contiguous()?)?.broadcast_add(&b.narrow(0, i * d, *d)?),
+            InProj::Raw { w_t, b } => x.broadcast_matmul(&w_t[i])?.broadcast_add(&b[i]),
+            InProj::Var { w, b, d } => x.broadcast_matmul(&w.narrow(0, i * d, *d)?.t()?.contiguous()?)?.broadcast_add(&b.narrow(0, i * d, *d)?),
             InProj::Q(l) => l[i].forward(x),
         }
     }
@@ -39,7 +64,7 @@ pub struct MapHead {
     probe: Tensor,
     in_proj: InProj,
     out: QLinear,
-    ln: LayerNorm,
+    ln: FastLayerNorm,
     mlp: Mlp,
     heads: usize,
     hidden: usize,
@@ -53,7 +78,7 @@ impl MapHead {
             probe: w.vb().get((1, 1, d), "probe")?,
             in_proj: InProj::new(&attn, d)?,
             out: attn.pp("out_proj").linear(d, d).map_err(to_candle)?,
-            ln: layer_norm(d, cfg.vision_eps, w.vb().pp("layernorm"))?,
+            ln: FastLayerNorm::new(d, cfg.vision_eps, w.vb().pp("layernorm"), w.is_cpu_packed())?,
             mlp: Mlp::with_weights(d, cfg.vision_intermediate, &w.pp("mlp"))?,
             heads: cfg.vision_heads,
             hidden: d,
@@ -100,26 +125,51 @@ impl MapHead {
         &attended + self.mlp.forward(&normed)?
     }
 
-    fn attention(&self, tokens: &Tensor) -> Result<Tensor> {
+    /// Single-pass computation of `(dense, attention, pooled)`, sharing `q`, `k`, `v`, and `probs`
+    /// instead of evaluating `in_proj` and probe attention twice.
+    fn dense_all(&self, tokens: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let d = self.hidden;
         let (b, n, _) = tokens.dims3()?;
         let hd = d / self.heads;
+
         let probe = self.probe.broadcast_as((b, 1, d))?.contiguous()?;
         let q = self.in_proj.forward(0, &probe)?;
         let k = self.in_proj.forward(1, tokens)?;
-        let q = q.reshape((b, 1, self.heads, hd))?.transpose(1, 2)?.contiguous()?;
-        let k = k.reshape((b, n, self.heads, hd))?.transpose(1, 2)?.contiguous()?;
-        let scores = q.matmul(&k.transpose(2, 3)?)?.affine((hd as f64).powf(-0.5), 0.0)?;
+        let v_lin = self.in_proj.forward(2, tokens)?;
+
+        let split = |t: Tensor, len: usize| -> Result<Tensor> {
+            t.reshape((b, len, self.heads, hd))?.transpose(1, 2)?.contiguous()
+        };
+        let q = split(q, 1)?;
+        let k = split(k, n)?;
+        let v = split(v_lin.clone(), n)?;
+        let scores = q
+            .matmul(&k.transpose(2, 3)?)?
+            .affine((hd as f64).powf(-0.5), 0.0)?;
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        probs.mean(1)?.reshape((b, n))
+        let attn = probs.mean(1)?.reshape((b, n))?;
+
+        let ctx = probs
+            .matmul(&v)?
+            .transpose(1, 2)?
+            .contiguous()?
+            .reshape((b, 1, d))?;
+        let pooled_att = self.out.forward(&ctx)?;
+        let pooled_norm = self.ln.forward(&pooled_att)?;
+        let pooled = (&pooled_att + self.mlp.forward(&pooled_norm)?)?.reshape((b, d))?;
+
+        let dense_att = self.out.forward(&v_lin)?;
+        let dense_norm = self.ln.forward(&dense_att)?;
+        let dense = (&dense_att + self.mlp.forward(&dense_norm)?)?;
+        Ok((dense, attn, pooled))
     }
 }
 
 pub struct VisionTower {
-    patch_proj: Linear,
+    patch_proj: QLinear,
     position: Tensor,
     layers: Vec<EncoderLayer>,
-    post_ln: LayerNorm,
+    post_ln: FastLayerNorm,
     head: MapHead,
     side: usize,
     hidden: usize,
@@ -164,13 +214,19 @@ impl VisionTower {
         for i in 0..cfg.vision_layers {
             layers.push(EncoderLayer::with_weights(d, cfg.vision_intermediate, cfg.vision_heads, cfg.vision_eps, &w.pp("encoder").pp(format!("layers.{i}")), fused_qkv)?);
         }
+        let patch_lin = linear(patch_dim, d, emb.pp("patch_embedding"))?;
+        let patch_proj = if w.is_cpu_packed() {
+            QLinear::from_dense_packed(patch_lin.weight(), patch_lin.bias())?
+        } else {
+            QLinear::Dense(patch_lin)
+        };
         Ok(VisionTower {
-            patch_proj: linear(patch_dim, d, emb.pp("patch_embedding"))?,
+            patch_proj,
             position: emb
                 .pp("position_embedding")
                 .get((cfg.max_patches, d), "weight")?,
             layers,
-            post_ln: layer_norm(d, cfg.vision_eps, vb.pp("post_layernorm"))?,
+            post_ln: FastLayerNorm::new(d, cfg.vision_eps, vb.pp("post_layernorm"), w.is_cpu_packed())?,
             head: MapHead::new(cfg, &w.pp("head"))?,
             side: cfg.position_side(),
             hidden: d,
@@ -235,10 +291,8 @@ impl VisionTower {
 
     pub fn forward_dense(&self, input: &NaflexInput) -> Result<(Tensor, Tensor, Tensor)> {
         let x = self.tokens(input)?;
-        let dense = self.head.dense(&x)?.squeeze(0)?;
-        let attn = self.head.attention(&x)?.squeeze(0)?;
-        let pooled = self.head.forward(&x)?.squeeze(0)?;
-        Ok((dense, attn, pooled))
+        let (dense, attn, pooled) = self.head.dense_all(&x)?;
+        Ok((dense.squeeze(0)?, attn.squeeze(0)?, pooled.squeeze(0)?))
     }
 
     pub fn forward(&self, input: &NaflexInput) -> Result<Tensor> {
@@ -247,10 +301,13 @@ impl VisionTower {
 
     pub fn forward_dense_batch(&self, inputs: &[&NaflexInput]) -> Result<(Tensor, Tensor, Tensor)> {
         let x = self.batch_tokens(inputs)?;
-        Ok((self.head.dense(&x)?, self.head.attention(&x)?, self.head.forward(&x)?))
+        self.head.dense_all(&x)
     }
 
     fn batch_tokens(&self, inputs: &[&NaflexInput]) -> Result<Tensor> {
+        if inputs.len() == 1 {
+            return self.tokens(inputs[0]);
+        }
         let first = match inputs.first() {
             Some(f) => f,
             None => candle_core::bail!("a vision batch needs at least one image"),
