@@ -388,19 +388,25 @@ fn open_best_vulkan(ordinal: usize) -> Result<Device> {
     if count <= 1 {
         return Ok(Device::new_vulkan(0)?);
     }
-    let mut best_hw: Option<(u64, Device)> = None;
-    let mut best_cpu: Option<(u64, Device)> = None;
+    // Prefer discrete > integrated > virtual > other > CPU renderers, breaking ties by free VRAM.
+    let mut best: Option<((u8, u64), Device)> = None;
     for id in 0..count {
         if let Ok(d) = Device::new_vulkan(id) {
+            let tier: u8 = match d.as_vulkan_device().map(|v| v.device_type()) {
+                Ok("discrete") => 4,
+                Ok("integrated") => 3,
+                Ok("virtual") => 2,
+                Ok("other") => 1,
+                _ => 0,
+            };
             let free = d.mem_info().ok().flatten().map_or(0, |(f, _)| f as u64);
-            let is_cpu = d.as_vulkan_device().is_ok_and(|v| v.is_cpu_device());
-            let slot = if is_cpu { &mut best_cpu } else { &mut best_hw };
-            if slot.as_ref().is_none_or(|(b, _)| free > *b) {
-                *slot = Some((free, d));
+            let rank = (tier, free);
+            if best.as_ref().is_none_or(|(b, _)| rank > *b) {
+                best = Some((rank, d));
             }
         }
     }
-    match best_hw.or(best_cpu) {
+    match best {
         Some((_, d)) => Ok(d),
         None => Ok(Device::new_vulkan(0)?),
     }
@@ -524,18 +530,24 @@ pub fn mem_info(device: &Device) -> Option<(u64, u64)> {
 }
 
 pub fn trim_idle_pool(device: &Device) {
+    #[cfg(any(feature = "rocm", feature = "cuda"))]
+    const HIGH_WATER: usize = 320 << 20;
     match device {
         #[cfg(feature = "rocm")]
         Device::Rocm(rd) => {
             // Only trim ROCm pool when idle bytes exceed 320 MiB, keeping a 256 MiB hot pool
             // to avoid hipMallocAsync/hipFreeAsync stalls between inference frames.
-            const HIGH_WATER: usize = 320 << 20;
             if rd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
                 let _ = rd.trim_memory_pool_to(POOL_KEEP_BYTES);
             }
         }
-        Device::Cuda(_) => {
-            let _ = device.trim_memory_pool(POOL_KEEP_BYTES);
+        #[cfg(feature = "cuda")]
+        Device::Cuda(cd) => {
+            // Keep a 256 MiB hot pool on CUDA and trim only above 320 MiB idle to avoid
+            // per-frame synchronize_all() + cuMemPoolTrimTo stalls.
+            if cd.pool_idle_bytes().unwrap_or(0) >= HIGH_WATER {
+                let _ = cd.trim_memory_pool(POOL_KEEP_BYTES);
+            }
         }
         Device::Vulkan(_) => {
             if device.pool_idle_bytes().unwrap_or(0) >= VULKAN_TRIM_MIN_BYTES {
