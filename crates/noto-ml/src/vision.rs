@@ -62,6 +62,9 @@ impl InProj {
 
 pub struct MapHead {
     probe: Tensor,
+    /// Precomputed `split(in_proj(0, probe))` shaped `(1, heads, 1, hd)` for immutable checkpoint weights
+    /// (avoids re-running the constant probe projection every frame; `None` for live `VarMap` test variables).
+    q_probe: Option<Tensor>,
     in_proj: InProj,
     out: QLinear,
     ln: FastLayerNorm,
@@ -73,16 +76,48 @@ pub struct MapHead {
 impl MapHead {
     fn new(cfg: &Siglip2Config, w: &QWeights) -> Result<Self> {
         let d = cfg.vision_hidden;
+        let heads = cfg.vision_heads;
+        let hd = d / heads;
         let attn = w.pp("attention");
+        let probe = w.vb().get((1, 1, d), "probe")?;
+        let in_proj = InProj::new(&attn, d)?;
+        let q_probe = if !probe.is_variable() && !matches!(in_proj, InProj::Var { .. }) {
+            let q = in_proj
+                .forward(0, &probe)?
+                .reshape((1, 1, heads, hd))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            Some(q)
+        } else {
+            None
+        };
         Ok(MapHead {
-            probe: w.vb().get((1, 1, d), "probe")?,
-            in_proj: InProj::new(&attn, d)?,
+            probe,
+            q_probe,
+            in_proj,
             out: attn.pp("out_proj").linear(d, d).map_err(to_candle)?,
             ln: FastLayerNorm::new(d, cfg.vision_eps, w.vb().pp("layernorm"), w.is_cpu_packed())?,
             mlp: Mlp::with_weights(d, cfg.vision_intermediate, &w.pp("mlp"))?,
-            heads: cfg.vision_heads,
+            heads,
             hidden: d,
         })
+    }
+
+    fn q_for_batch(&self, b: usize, hd: usize) -> Result<Tensor> {
+        if let Some(ref qp) = self.q_probe {
+            return if b == 1 {
+                Ok(qp.clone())
+            } else {
+                qp.broadcast_as((b, self.heads, 1, hd))?.contiguous()
+            };
+        }
+        // Contiguous: from a broadcast batch Metal's matmul gets every row after the first wrong.
+        let probe = self.probe.broadcast_as((b, 1, self.hidden))?.contiguous()?;
+        self.in_proj
+            .forward(0, &probe)?
+            .reshape((b, 1, self.heads, hd))?
+            .transpose(1, 2)?
+            .contiguous()
     }
 
     fn forward(&self, tokens: &Tensor) -> Result<Tensor> {
@@ -90,16 +125,13 @@ impl MapHead {
         let (b, n, _) = tokens.dims3()?;
         let hd = d / self.heads;
 
-        // Contiguous: from a broadcast batch Metal's matmul gets every row after the first wrong.
-        let probe = self.probe.broadcast_as((b, 1, d))?.contiguous()?;
-        let q = self.in_proj.forward(0, &probe)?;
+        let q = self.q_for_batch(b, hd)?;
         let k = self.in_proj.forward(1, tokens)?;
         let v = self.in_proj.forward(2, tokens)?;
 
         let split = |t: Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.heads, hd))?.transpose(1, 2)?.contiguous()
         };
-        let q = split(q, 1)?;
         let k = split(k, n)?;
         let v = split(v, n)?;
         let scores = q
@@ -132,15 +164,13 @@ impl MapHead {
         let (b, n, _) = tokens.dims3()?;
         let hd = d / self.heads;
 
-        let probe = self.probe.broadcast_as((b, 1, d))?.contiguous()?;
-        let q = self.in_proj.forward(0, &probe)?;
+        let q = self.q_for_batch(b, hd)?;
         let k = self.in_proj.forward(1, tokens)?;
         let v_lin = self.in_proj.forward(2, tokens)?;
 
         let split = |t: Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.heads, hd))?.transpose(1, 2)?.contiguous()
         };
-        let q = split(q, 1)?;
         let k = split(k, n)?;
         let v = split(v_lin.clone(), n)?;
         let scores = q

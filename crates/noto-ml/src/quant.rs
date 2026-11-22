@@ -204,17 +204,49 @@ impl QuantDiskCache {
         }
         let hash = fnv1a(FNV_OFFSET, &buf);
         buf.extend_from_slice(&hash.to_le_bytes());
-        let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = self.path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
         if let Ok(mut f) = std::fs::File::create(&tmp) {
             if f.write_all(&buf).is_ok() && f.sync_all().is_ok() {
                 drop(f);
-                let _ = std::fs::rename(&tmp, &self.path);
-                self.dirty = false;
+                if atomic_replace_file(&tmp, &self.path).is_ok() {
+                    self.dirty = false;
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
             } else {
                 drop(f);
                 let _ = std::fs::remove_file(&tmp);
             }
         }
+    }
+}
+
+/// Crash-safe Windows-compatible atomic file replacement (backup-swap when target exists).
+fn atomic_replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp, target) {
+        Ok(()) => Ok(()),
+        Err(_) if target.exists() => {
+            static BAK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = BAK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut bak_os = target.as_os_str().to_os_string();
+            bak_os.push(format!(".bak.{}.{seq}", std::process::id()));
+            let bak = PathBuf::from(bak_os);
+            let _ = std::fs::remove_file(&bak);
+            std::fs::rename(target, &bak)?;
+            match std::fs::rename(tmp, target) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&bak);
+                    Ok(())
+                }
+                Err(e) => {
+                    let _ = std::fs::rename(&bak, target);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -487,14 +519,11 @@ impl QuantPlan {
         h
     }
 
-    /// The plan this device can run: Vulkan multiplies only Q8_0 on the device (the fork runs other block formats on
-    /// the host), so its K-quant groups go to Q8_0.
-    pub fn for_device(&self, device: &Device) -> QuantPlan {
-        if matches!(device, Device::Vulkan(_)) {
-            self.q8_only()
-        } else {
-            self.clone()
-        }
+    /// The plan this device can run: on candle@708b2f2, CUDA / ROCm (`w8a16.hip`), Vulkan (`GpuQuant`),
+    /// Metal, and CPU all execute Q8_0 and K-quant (Q4K / Q5K / Q6K) blocks natively, so every device
+    /// keeps the requested pyramid plan without downgrading K-quants to Q8_0.
+    pub fn for_device(&self, _device: &Device) -> QuantPlan {
+        self.clone()
     }
 
     /// Every K-quant group at Q8_0 instead (tagged apart when anything moved).
@@ -767,7 +796,9 @@ impl<'a> QWeights<'a> {
         let mut s = self.stats.lock().unwrap_or_else(|p| p.into_inner());
         s.add(q, (rows * cols * 4) as u64, bytes.len() as u64);
         s.quantize_ms += elapsed_ms;
-        let use_native_fwd = matches!(self.device(), Device::Vulkan(_) | Device::Metal(_));
+        // On candle@708b2f2, Vulkan runs native GpuQuant VRAM shaders via Module::forward;
+        // CUDA, ROCm (w8a16.hip), and Metal all run native exact kernels via forward_exact.
+        let use_native_fwd = matches!(self.device(), Device::Vulkan(_));
         Ok(QLinear::Quant { w: QMatMul::from_qtensor(qt)?, b: bias, use_native_fwd })
     }
 
@@ -966,12 +997,12 @@ mod tests {
     }
 
     #[test]
-    fn vulkan_keeps_q8_0_only() {
+    fn vulkan_keeps_full_pyramid_and_q8_only_still_maps() {
         let p = QuantPlan::pyramid();
         assert_eq!(p.for_device(&Device::Cpu), p, "the CPU runs every format");
         let v = p.q8_only();
         assert!(v.groups.values().all(|q| *q == QType::Q8_0) && v.groups.len() == p.groups.len());
-        assert_eq!(v.tag, "pyr-q8", "statistics of the Vulkan plan stay apart");
+        assert_eq!(v.tag, "pyr-q8", "q8_only keeps a distinct tag");
         let q8 = QuantPlan::q8();
         assert_eq!(q8.q8_only(), q8);
     }

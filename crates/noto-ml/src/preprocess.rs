@@ -112,19 +112,31 @@ pub fn preprocess_grid(image: &DynamicImage, cfg: &Siglip2Config, grid_h: usize,
     let patch_dim = p * p * 3;
     let mut patches = vec![0.0f32; grid_h * grid_w * patch_dim];
     let row_bytes = p * 3;
-    for gy in 0..grid_h {
+    let extract_row = |(gy, dst_grid_row): (usize, &mut [f32])| {
         let y0 = gy * p;
         for gx in 0..grid_w {
-            let base = (gy * grid_w + gx) * patch_dim;
+            let base = gx * patch_dim;
             let x0_b = gx * p * 3;
             for py in 0..p {
                 let src = &raw[(y0 + py) * stride + x0_b..(y0 + py) * stride + x0_b + row_bytes];
-                let dst = &mut patches[base + py * row_bytes..base + (py + 1) * row_bytes];
+                let dst = &mut dst_grid_row[base + py * row_bytes..base + (py + 1) * row_bytes];
                 for (d, &b) in dst.iter_mut().zip(src.iter()) {
                     *d = lut[b as usize];
                 }
             }
         }
+    };
+    if grid_h * grid_w >= 32 {
+        use rayon::prelude::*;
+        patches
+            .par_chunks_exact_mut(grid_w * patch_dim)
+            .enumerate()
+            .for_each(extract_row);
+    } else {
+        patches
+            .chunks_exact_mut(grid_w * patch_dim)
+            .enumerate()
+            .for_each(extract_row);
     }
 
     NaflexInput {
@@ -199,5 +211,40 @@ mod tests {
         assert!(input.patches.iter().all(|v| (-1.0..=1.0).contains(v)));
         assert!((input.patches[0] - 1.0).abs() < 1e-6);
         assert!((input.patches[1] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn preprocess_large_grid_parallel_matches_serial_lut() {
+        let cfg = Siglip2Config {
+            patch_size: 16,
+            max_patches: 256,
+            ..Siglip2Config::default()
+        };
+        // 12x16 = 192 patches (>= 32) exercises rayon parallel extraction.
+        let mut raw = vec![0u8; 320 * 240 * 3];
+        for (i, b) in raw.iter_mut().enumerate() {
+            *b = ((i * 29 + 17) % 256) as u8;
+        }
+        let img = DynamicImage::ImageRgb8(RgbImage::from_raw(320, 240, raw).unwrap());
+        let got = preprocess_grid(&img, &cfg, 12, 16);
+        let rgb = img.resize_exact(16 * 16, 12 * 16, FilterType::Triangle).to_rgb8();
+        let src = rgb.as_raw();
+        let stride = 16 * 16 * 3;
+        let patch_dim = 16 * 16 * 3;
+        let mut want = vec![0.0f32; 12 * 16 * patch_dim];
+        for gy in 0..12 {
+            for gx in 0..16 {
+                let base = (gy * 16 + gx) * patch_dim;
+                for py in 0..16 {
+                    for px in 0..16 {
+                        for c in 0..3 {
+                            let b = src[(gy * 16 + py) * stride + (gx * 16 + px) * 3 + c];
+                            want[base + (py * 16 + px) * 3 + c] = b as f32 / 127.5 - 1.0;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(got.patches, want, "parallel preprocess_grid must be bit-identical to serial LUT");
     }
 }

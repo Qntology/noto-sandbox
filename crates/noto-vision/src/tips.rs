@@ -326,14 +326,15 @@ impl Attention {
         }
 
         // Fastpath 2: GPU FlashAttention in (b, n, heads, head_dim) layout (zero transpose copies).
-        if accel_op_ok(x.device(), AccelOp::FlashAttn) {
+        if self.head_dim <= 256 && accel_op_ok(x.device(), AccelOp::FlashAttn) {
             let qkv_4 = qkv.reshape((b, n, 3, self.heads, self.head_dim))?;
             let q = qkv_4.narrow(2, 0, 1)?.squeeze(2)?.contiguous()?;
             let k = qkv_4.narrow(2, 1, 1)?.squeeze(2)?.contiguous()?;
             let v = qkv_4.narrow(2, 2, 1)?.squeeze(2)?.contiguous()?;
             let fa_cfg = candle_nn::flash_attn::FlashAttnConfig::new(scale as f32);
-            let ctx = candle_nn::flash_attn::flash_attn_with_config(&q, &k, &v, &fa_cfg)?.reshape((b, n, d))?;
-            return self.proj.forward(&ctx);
+            if let Ok(ctx) = candle_nn::flash_attn::flash_attn_with_config(&q, &k, &v, &fa_cfg) {
+                return self.proj.forward(&ctx.reshape((b, n, d))?);
+            }
         }
 
         let qkv_4 = qkv.reshape((b, n, 3, self.heads, self.head_dim))?;
