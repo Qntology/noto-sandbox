@@ -99,6 +99,12 @@ pub struct Posture {
     pub ground: Surface,
     #[serde(default)]
     pub moving: bool,
+    /// Sinusoidal moving-floor horizontal acceleration amplitude (m/s²), 0 = still floor.
+    #[serde(default)]
+    pub floor_amp_mps2: f32,
+    /// Sinusoidal moving-floor excitation frequency (Hz), 0 = still floor.
+    #[serde(default)]
+    pub floor_hz: f32,
 }
 
 impl Posture {
@@ -115,6 +121,8 @@ impl Posture {
             accel_mps2: 0.0,
             ground: Surface::Firm,
             moving: false,
+            floor_amp_mps2: 0.0,
+            floor_hz: 0.0,
         }
     }
 
@@ -220,10 +228,14 @@ pub struct Traction {
 
 impl BalanceReport {
     pub fn ref_ctx(&self, body_mass_kg: f32) -> RefCtx {
+        self.ref_ctx_for(body_mass_kg, false)
+    }
+
+    pub fn ref_ctx_for(&self, body_mass_kg: f32, single_support: bool) -> RefCtx {
         let m = body_mass_kg.max(1.0);
         match self.source {
-            Source::CarryFront => RefCtx { load_ratio: self.cargo_kg / m, load_dist_m: self.cargo_x_m, slope_deg: self.slope_deg },
-            _ => RefCtx { load_ratio: self.hand_load_kg / m, load_dist_m: 0.0, slope_deg: self.slope_deg },
+            Source::CarryFront => RefCtx { load_ratio: self.cargo_kg / m, load_dist_m: self.cargo_x_m, slope_deg: self.slope_deg, single_support },
+            _ => RefCtx { load_ratio: self.hand_load_kg / m, load_dist_m: 0.0, slope_deg: self.slope_deg, single_support },
         }
     }
 
@@ -967,6 +979,25 @@ impl Body {
             (one, false)
         }
     }
+
+    /// Look up the physical actuator specification for a named joint.
+    pub fn joint_actuator(&self, joint: &str) -> Option<Actuator> {
+        match joint {
+            n if n.starts_with("shoulder") => Some(self.arm.shoulder),
+            n if n.starts_with("elbow") => Some(self.arm.elbow),
+            "waist" | "waist_pitch" => self.belly.pitch,
+            "waist_yaw" => Some(self.belly.waist),
+            "neck" => Some(self.head.neck),
+            n if n.starts_with("knee") || n.starts_with("hip") => Some(self.leg.knee),
+            n if n.starts_with("ankle") => Some(self.leg.ankle),
+            _ => None,
+        }
+    }
+
+    /// Thermal time constant (seconds) for a named joint (falls back to 60 s for unnamed/chassis joints).
+    pub fn thermal_tau_s(&self, joint: &str) -> f32 {
+        self.joint_actuator(joint).map_or(60.0, |a| a.thermal_tau_s)
+    }
 }
 
 pub fn step_knee_lever(d: &Dims, h: f32) -> f32 {
@@ -978,6 +1009,8 @@ pub struct RefCtx {
     pub load_ratio: f32,
     pub load_dist_m: f32,
     pub slope_deg: f32,
+    #[serde(default)]
+    pub single_support: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -994,6 +1027,9 @@ fn r(value: f32, tolerance: f32, cite: &'static str) -> Option<Reference> {
 pub fn reference(source: Source, target: Segment, axis: &str, ctx: &RefCtx) -> Option<Reference> {
     const R5: f32 = 0.067;
     let lr = (ctx.load_ratio / R5).max(0.0);
+    if ctx.single_support && source == Source::ArmRaise && target == Segment::Foot && matches!(axis, "com_shift_frac" | "ankle_rise") {
+        return None;
+    }
     match (source, target, axis) {
         (_, Segment::Head, "tilt_deg") => r(0.0, if matches!(source, Source::FootLift | Source::StepUp) { 8.5 } else { 5.0 }, "Pozzo 1990 (머리 <20°), 보행 피치 1.5–8.5°"),
         (Source::ArmRaise, Segment::Arm, "peak_ratio") => r(0.15, 0.05, "어깨 ~15% (유도: Winter 질량, Marcondes 2019)"),

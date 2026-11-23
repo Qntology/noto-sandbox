@@ -7,7 +7,9 @@ import { bus, state } from './state.js';
 import { $, clear, el, fmt, observeResize } from './util.js';
 import { drawJointOverlay } from './joint-view.js';
 import { drawEyeDepthOverlay, renderPickHud, wantsEyeDepth, wantsForkCam } from './pick-hud.js';
-import { isOpen } from './overlays.js';
+import { isWorldCovered } from './dock.js';
+import { openAnalysis } from './analysis-modal.js';
+import { register } from './poller.js';
 
 const POLL_MS = 160;
 const RETRY_MS = 2500;
@@ -116,6 +118,18 @@ function tagText(d) {
   return state.toggles.oracle ? `${base} · ${d.label_id}` : base;
 }
 
+function detTitle(d) {
+  const parts = [d.reason ?? ''];
+  if (d.floor_source) parts.push(`바닥: ${d.floor_source}`);
+  const t = d.temporal;
+  if (t && t.expected != null) {
+    const z = t.z != null ? ` z ${Number(t.z).toFixed(2)}` : '';
+    const band = t.lo != null && t.hi != null ? ` [${Number(t.lo).toFixed(2)}, ${Number(t.hi).toFixed(2)}]` : '';
+    parts.push(`시계열(${t.outcome}): 기대 ${Number(t.expected).toFixed(2)}${band}${z}`);
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
 function renderDetections() {
   const layer = $('det-layer');
   clear(layer);
@@ -124,8 +138,18 @@ function renderDetections() {
     for (const d of dets) {
       if (!Array.isArray(d.bbox) || d.bbox.length < 4) continue;
       const [x0, y0, x1, y1] = d.bbox;
-      const box = el('div', { class: `det-box${d.accepted ? '' : ' hold'}${y0 < 0.07 ? ' edge' : ''}`, title: d.reason ?? '' },
-        el('span', { class: 'det-tag', text: tagText(d) }));
+      const box = el('div', {
+        class: `det-box${d.accepted ? '' : ' hold'}${y0 < 0.07 ? ' edge' : ''}`,
+        title: detTitle(d) + (d.landmark != null ? '\n(클릭하면 이 랜드마크의 시계열·게이트 추적을 엽니다)' : ''),
+        style: d.landmark != null ? 'pointer-events:auto;cursor:pointer' : null,
+        on: d.landmark != null ? {
+          click: (e) => {
+            e.stopPropagation();
+            openAnalysis('ts');
+            bus.emit('open-ts', { series: `lm:${d.landmark}:score` });
+          },
+        } : null,
+      }, el('span', { class: 'det-tag', text: tagText(d) }));
       box.style.left = `${x0 * 100}%`;
       box.style.top = `${y0 * 100}%`;
       box.style.width = `${Math.max(0, x1 - x0) * 100}%`;
@@ -143,7 +167,7 @@ function renderDetections() {
     return;
   }
   for (const d of sorted) {
-    list.append(el('li', { class: d.accepted ? '' : 'hold', title: d.reason ?? '' },
+    list.append(el('li', { class: d.accepted ? '' : 'hold', title: detTitle(d) },
       el('span', { class: 'sw' }),
       el('span', { class: 'nm', text: state.toggles.oracle ? `${d.label_ko} [${d.label_id}]` : d.label_ko }),
       el('span', { class: 'sc', text: `${Math.round(d.score * 100)}%` }),
@@ -184,10 +208,37 @@ async function drawEyeDepth(quality) {
   drawEyeDepthOverlay(canvas, f.overlay);
 }
 
+async function drawPastCursor(c) {
+  if (!c || c.mode !== 'past') return;
+  const kf = c.ctx?.keyframe;
+  const vid = c.ctx?.video_index;
+  try {
+    let b64 = null;
+    if (vid != null) {
+      const vr = await call('test_video', { pass: c.pass, from: vid, count: 1 }, { quiet: true });
+      b64 = vr?.frames?.[0]?.webp ?? null;
+    }
+    if (!b64 && kf?.i != null) {
+      const kr = await call('test_keyframe', { pass: c.pass, index: kf.i, close_ups: false }, { quiet: true });
+      b64 = kr?.frame_webp ?? null;
+    }
+    if (!b64) return;
+    const img = await decode(b64);
+    const canvas = $('world-canvas');
+    if (canvas.width !== img.width || canvas.height !== img.height) {
+      canvas.width = img.width;
+      canvas.height = img.height;
+      layoutFrame();
+    }
+    canvas.getContext('2d').drawImage(img, 0, 0);
+    img.close?.();
+  } catch { /* 과거 프레임 없으면 조용히 유지 */ }
+}
+
 // ── 폴링 ────────────────────────────────────────────────────────
 async function poll(force = false) {
-  // 분석 모달은 월드를 덮으므로 그동안은 받지 않는다(닫으면 틱이 달라 다음 주기에 받는다).
-  if (pending || document.hidden || !state.snapshot || isOpen('analysis-modal')) return;
+  // 전체 크기 분석 창이나 과거 커서일 때만 실시간 폴링을 멈춘다(반 크기 도킹은 실시간 유지).
+  if (pending || document.hidden || !state.snapshot || isWorldCovered() || state.cursor?.mode === 'past') return;
   if (!force && Date.now() < retryAt) return;
   const p = framePreset();
   const sel = viewNow();
@@ -271,6 +322,15 @@ export function initWorldView() {
   // 틱은 그대로인데 화면이 바뀌는 일(작업자 소환·제거, 몸 교체): 받는 중이어도 다음 주기에 다시 받게 키를 지운다.
   bus.on('frame-stale', () => { lastKey = ''; poll(true); });
   bus.on('world-error', (m) => showEmpty(`월드를 만들지 못했습니다: ${m}`, true, () => $('world-new').click()));
-  setInterval(() => poll(false), POLL_MS);
+  bus.on('dock', () => { layoutFrame(); lastKey = ''; poll(true); });
+  bus.on('cursor', (c) => {
+    if (c.mode === 'past') drawPastCursor(c);
+    else { lastKey = ''; poll(true); }
+  });
+  register('world-frame', {
+    every: POLL_MS,
+    visible: () => !isWorldCovered() && state.cursor?.mode !== 'past',
+    run: () => poll(false),
+  });
   renderDetections();
 }

@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use noto_sds::{BalanceRow, KeyframeRow, MirrorBatch, QuestRun, SuccessStat};
-use lancedb::arrow::arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
+use noto_sds::{BalanceRow, KeyframeRow, MirrorBatch, NnPhaseRow, QuestRun, SuccessStat};
+use lancedb::arrow::arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::store::LanceStore;
@@ -12,6 +12,8 @@ pub const TABLE_QUEST_STEPS: &str = "quest_steps";
 pub const TABLE_QUEST_STATS: &str = "quest_stats";
 pub const TABLE_ML_KEYFRAMES: &str = "ml_keyframes";
 pub const TABLE_BALANCE_EFFORT: &str = "balance_effort";
+pub const TABLE_NN_PHASES: &str = "nn_phases";
+pub const TABLE_TS_SAMPLES: &str = "ts_samples";
 
 fn s(name: &str) -> Field {
     Field::new(name, DataType::Utf8, false)
@@ -46,6 +48,9 @@ pub fn quest_runs_schema() -> SchemaRef {
         f("time_s"),
         f("energy_j"),
         Field::new("created_ms", DataType::Int64, false),
+        s("generation"),
+        s("ledger_digest"),
+        s("sds_mode"),
     ]))
 }
 
@@ -97,11 +102,15 @@ pub fn ml_keyframes_schema() -> SchemaRef {
         s("fusion_flags"),
         fo("balance_margin"),
         fo("effort_max"),
+        s("generation"),
+        s("ledger_digest"),
+        s("sds_mode"),
     ]))
 }
 
 pub fn balance_effort_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
+        s("event_id"),
         s("run_id"),
         s("pass"),
         u64f("tick"),
@@ -120,6 +129,41 @@ pub fn balance_effort_schema() -> SchemaRef {
         f("margin"),
         f("margin_noff"),
         f("ff_gain"),
+        s("generation"),
+        s("ledger_digest"),
+        s("sds_mode"),
+    ]))
+}
+
+pub fn nn_phases_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        s("event_id"),
+        s("run_id"),
+        s("pass"),
+        u64f("tick"),
+        f("time_s"),
+        u64f("instance_id"),
+        u64f("span_id"),
+        s("scenario"),
+        s("phase"),
+        Field::new("holdout", DataType::Boolean, false),
+        s("form"),
+        s("gnd"),
+        s("slope"),
+        s("stg"),
+        s("wk"),
+        f("score"),
+        Field::new("item", DataType::UInt8, false),
+        s("gate_codes"),
+        Field::new("beyond_human", DataType::Boolean, false),
+        f("static_margin"),
+        f("min_margin"),
+        f("peak_ratio"),
+        f("sustained_effort"),
+        so("worst_joint"),
+        s("generation"),
+        s("ledger_digest"),
+        s("sds_mode"),
     ]))
 }
 
@@ -156,6 +200,9 @@ pub fn quest_runs_batch(rows: &[QuestRun]) -> Result<RecordBatch> {
         f64s(rows, |r| r.time_s),
         f64s(rows, |r| r.energy_j),
         Arc::new(Int64Array::from(rows.iter().map(|r| r.created_ms).collect::<Vec<i64>>())),
+        strs(rows, |r| r.generation.clone()),
+        strs(rows, |r| r.ledger_digest.clone()),
+        strs(rows, |r| r.sds_mode.clone()),
     ];
     Ok(RecordBatch::try_new(quest_runs_schema(), cols)?)
 }
@@ -222,12 +269,16 @@ pub fn ml_keyframes_batch(rows: &[KeyframeRow]) -> Result<RecordBatch> {
         strs(rows, |r| r.fusion_flags.clone()),
         of64s(rows, |r| r.balance_margin),
         of64s(rows, |r| r.effort_max),
+        strs(rows, |r| r.generation.clone()),
+        strs(rows, |r| r.ledger_digest.clone()),
+        strs(rows, |r| r.sds_mode.clone()),
     ];
     Ok(RecordBatch::try_new(ml_keyframes_schema(), cols)?)
 }
 
 pub fn balance_effort_batch(rows: &[BalanceRow]) -> Result<RecordBatch> {
     let cols: Vec<ArrayRef> = vec![
+        strs(rows, |r| r.event_id.clone()),
         strs(rows, |r| r.run_id.clone()),
         strs(rows, |r| r.pass.clone()),
         u64s(rows, |r| r.tick),
@@ -246,8 +297,44 @@ pub fn balance_effort_batch(rows: &[BalanceRow]) -> Result<RecordBatch> {
         f64s(rows, |r| r.margin),
         f64s(rows, |r| r.margin_noff),
         f64s(rows, |r| r.ff_gain),
+        strs(rows, |r| r.generation.clone()),
+        strs(rows, |r| r.ledger_digest.clone()),
+        strs(rows, |r| r.sds_mode.clone()),
     ];
     Ok(RecordBatch::try_new(balance_effort_schema(), cols)?)
+}
+
+pub fn nn_phases_batch(rows: &[NnPhaseRow]) -> Result<RecordBatch> {
+    let cols: Vec<ArrayRef> = vec![
+        strs(rows, |r| r.event_id.clone()),
+        strs(rows, |r| r.run_id.clone()),
+        strs(rows, |r| r.pass.clone()),
+        u64s(rows, |r| r.tick),
+        f64s(rows, |r| r.time_s),
+        u64s(rows, |r| r.instance_id),
+        u64s(rows, |r| r.span_id),
+        strs(rows, |r| r.scenario.clone()),
+        strs(rows, |r| r.phase.clone()),
+        Arc::new(BooleanArray::from(rows.iter().map(|r| r.holdout).collect::<Vec<bool>>())),
+        strs(rows, |r| r.form.clone()),
+        strs(rows, |r| r.gnd.clone()),
+        strs(rows, |r| r.slope.clone()),
+        strs(rows, |r| r.stg.clone()),
+        strs(rows, |r| r.wk.clone()),
+        f64s(rows, |r| r.score),
+        Arc::new(UInt8Array::from(rows.iter().map(|r| r.item).collect::<Vec<u8>>())),
+        strs(rows, |r| r.gate_codes.clone()),
+        Arc::new(BooleanArray::from(rows.iter().map(|r| r.beyond_human).collect::<Vec<bool>>())),
+        f64s(rows, |r| r.static_margin),
+        f64s(rows, |r| r.min_margin),
+        f64s(rows, |r| r.peak_ratio),
+        f64s(rows, |r| r.sustained_effort),
+        ostrs(rows, |r| r.worst_joint.clone()),
+        strs(rows, |r| r.generation.clone()),
+        strs(rows, |r| r.ledger_digest.clone()),
+        strs(rows, |r| r.sds_mode.clone()),
+    ];
+    Ok(RecordBatch::try_new(nn_phases_schema(), cols)?)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -257,6 +344,7 @@ pub struct MirrorCounts {
     pub quest_stats: usize,
     pub ml_keyframes: usize,
     pub balance_effort: usize,
+    pub nn_phases: usize,
 }
 
 pub async fn write_mirror(store: &LanceStore, batch: &MirrorBatch, stats: &[SuccessStat]) -> Result<MirrorCounts> {
@@ -276,9 +364,60 @@ pub async fn write_mirror(store: &LanceStore, batch: &MirrorBatch, stats: &[Succ
         store.append(TABLE_BALANCE_EFFORT, balance_effort_batch(&batch.balance)?).await?;
         c.balance_effort = batch.balance.len();
     }
+    if !batch.nn_phases.is_empty() {
+        store.append(TABLE_NN_PHASES, nn_phases_batch(&batch.nn_phases)?).await?;
+        c.nn_phases = batch.nn_phases.len();
+    }
     if !stats.is_empty() {
         store.replace_with(TABLE_QUEST_STATS, vec![quest_stats_batch(stats)?]).await?;
         c.quest_stats = stats.len();
     }
     Ok(c)
+}
+
+#[derive(Clone, Debug)]
+pub struct TsSampleEntry {
+    pub run_id: String,
+    pub worker: u32,
+    pub channel: String,
+    pub subject: String,
+    pub dtick: u32,
+    pub sub_ms: u16,
+    pub value: f64,
+    pub q: u16,
+}
+
+pub fn ts_samples_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        s("run_id"),
+        Field::new("worker", DataType::UInt32, false),
+        s("channel"),
+        s("subject"),
+        Field::new("dtick", DataType::UInt32, false),
+        Field::new("sub_ms", DataType::UInt16, false),
+        f("value"),
+        Field::new("q", DataType::UInt16, false),
+    ]))
+}
+
+pub fn ts_samples_batch(rows: &[TsSampleEntry]) -> Result<RecordBatch> {
+    let cols: Vec<ArrayRef> = vec![
+        strs(rows, |r| r.run_id.clone()),
+        Arc::new(UInt32Array::from(rows.iter().map(|r| r.worker).collect::<Vec<u32>>())),
+        strs(rows, |r| r.channel.clone()),
+        strs(rows, |r| r.subject.clone()),
+        Arc::new(UInt32Array::from(rows.iter().map(|r| r.dtick).collect::<Vec<u32>>())),
+        Arc::new(UInt16Array::from(rows.iter().map(|r| r.sub_ms).collect::<Vec<u16>>())),
+        f64s(rows, |r| r.value),
+        Arc::new(UInt16Array::from(rows.iter().map(|r| r.q).collect::<Vec<u16>>())),
+    ];
+    Ok(RecordBatch::try_new(ts_samples_schema(), cols)?)
+}
+
+pub async fn write_ts_samples(store: &LanceStore, rows: &[TsSampleEntry]) -> Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    store.append(TABLE_TS_SAMPLES, ts_samples_batch(rows)?).await?;
+    Ok(rows.len())
 }

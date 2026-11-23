@@ -31,6 +31,12 @@ import { initUnitHud } from './unit-hud.js';
 import { initUnitPreset } from './unit-preset.js';
 import { initCctv } from './cctv.js';
 import { initCctvZoom } from './cctv-zoom.js';
+import { initPoller } from './poller.js';
+import { initDock } from './dock.js';
+import { initCursor } from './cursor.js';
+import { initProgressBand } from './progress-band.js';
+import { initNnPanel } from './nn-panel.js';
+import { initSdsExplorer } from './sds-explorer.js';
 
 const recentErrors = new Map();
 
@@ -68,8 +74,14 @@ async function main() {
   showVersion();
 
   initLayout();
+  initPoller();
   initOverlays();
+  initDock();
+  initCursor();
   initAnalysisModal();
+  initProgressBand();
+  initNnPanel();
+  initSdsExplorer();
   initHandCanvas();
   initBodyHud();
   initQuestPanel();

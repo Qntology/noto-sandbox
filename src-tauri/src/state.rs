@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use noto_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
 use noto_runtime::{Runtime, RuntimeConfig};
+use serde_json::{json, Value};
 
 pub const DICTIONARY_JSON: &str = include_str!("../../data/logistics_dictionary.json");
 pub const MODEL_FOLDER: &str = "siglip2-base-patch16-naflex";
@@ -20,12 +22,23 @@ pub struct VisionEngine {
     pub ordinal: usize,
 }
 
+#[derive(Default)]
+pub struct ReadCache {
+    pub revs: Option<Value>,
+    pub sds_tree_root: Option<(u64, Value)>,
+    pub ts_series_list: Option<(u64, Value)>,
+    pub last_wait_ms: f64,
+    pub last_hold_ms: f64,
+    pub max_wait_ms: f64,
+}
+
 pub struct AppState {
     device: Mutex<(Backend, usize)>,
     startup: Selection,
     probed: OnceLock<Vec<BackendStatus>>,
     vision: Mutex<Option<Arc<VisionEngine>>>,
     world: Mutex<Option<Runtime>>,
+    pub read_cache: RwLock<ReadCache>,
     pub downloads: Arc<crate::models::Downloads>,
     models_ready: AtomicBool,
     /// The robot's eye is a stereo pair (two cameras): its depth is SGBM's, and TIPSv2 is neither needed nor loaded.
@@ -44,12 +57,42 @@ impl AppState {
             probed: OnceLock::new(),
             vision: Mutex::new(None),
             world: Mutex::new(None),
+            read_cache: RwLock::new(ReadCache::default()),
             downloads: Arc::default(),
             models_ready: AtomicBool::new(false),
             stereo: AtomicBool::new(false),
             loading: Mutex::new(None),
             load_error: Mutex::new(None),
             live_devices: Mutex::new(Default::default()),
+        }
+    }
+
+    pub fn refresh_read_cache(&self, rt: &Runtime) {
+        let revs = rt.api_rt_revs();
+        let sds_rev = rt.sds().rev();
+        let ts_rev = revs["ts"].as_u64().unwrap_or(0)
+            ^ sds_rev.rotate_left(17)
+            ^ revs["test"].as_u64().unwrap_or(0).rotate_left(33);
+        let need_tree = self
+            .read_cache
+            .read()
+            .ok()
+            .map_or(true, |c| c.sds_tree_root.as_ref().map_or(true, |(r, _)| *r != sds_rev));
+        let need_ts = self
+            .read_cache
+            .read()
+            .ok()
+            .map_or(true, |c| c.ts_series_list.as_ref().map_or(true, |(r, _)| *r != ts_rev));
+        let tree_val = need_tree.then(|| noto_runtime::sdsview::sds_tree(rt.sds(), None, None));
+        let ts_val = need_ts.then(|| rt.api_ts_series(&json!({})).ok()).flatten();
+        if let Ok(mut c) = self.read_cache.write() {
+            c.revs = Some(revs);
+            if let Some(tv) = tree_val {
+                c.sds_tree_root = Some((sds_rev, tv));
+            }
+            if let Some(sv) = ts_val {
+                c.ts_series_list = Some((ts_rev, sv));
+            }
         }
     }
 
@@ -124,11 +167,23 @@ impl AppState {
     }
 
     pub fn with_world<T>(&self, f: impl FnOnce(&mut Runtime) -> Result<T, String>) -> Result<T, String> {
+        let t0 = Instant::now();
         let mut slot = self.world.lock().map_err(|_| "월드 잠금이 깨졌습니다. 앱을 다시 시작하세요".to_string())?;
+        let wait_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if slot.is_none() {
             *slot = Some(build_runtime()?);
         }
-        f(slot.as_mut().expect("just built"))
+        let t1 = Instant::now();
+        let res = f(slot.as_mut().expect("just built"));
+        let hold_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        if let Ok(mut c) = self.read_cache.try_write() {
+            c.last_wait_ms = wait_ms;
+            c.last_hold_ms = hold_ms;
+            if wait_ms > c.max_wait_ms {
+                c.max_wait_ms = wait_ms;
+            }
+        }
+        res
     }
 
     pub fn backends(&self) -> &[BackendStatus] {

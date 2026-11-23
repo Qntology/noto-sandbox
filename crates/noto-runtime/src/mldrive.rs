@@ -278,6 +278,7 @@ impl Runtime {
     }
 
     fn mark_executed(&mut self, t: &MlTask, what: String, ok: bool) {
+        let mut touched = false;
         if let (Some(i), Some(rec)) = (t.pending_kf, self.recording.as_mut()) {
             if let Some(d) = rec.keyframes.get_mut(i).and_then(|k| k.decision.as_mut()) {
                 if d.executed.is_empty() {
@@ -286,6 +287,12 @@ impl Runtime {
                     d.executed = format!("{} → {what}", d.executed);
                 }
                 d.ok = d.ok && ok;
+                touched = true;
+            }
+        }
+        if touched {
+            if let Some(i) = t.pending_kf {
+                self.bump_recorded_keyframe_rev(i);
             }
         }
     }
@@ -557,15 +564,16 @@ impl Runtime {
             t.fixed = false;
             rep.decision = Decision::Hold { reason: "semantic_mismatch".into() };
             rep.note = "도달 직전 의미 피크가 추적 마스크 밖: 추적을 다시 시작".into();
-            self.sds.record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", false);
+            self.active_sds_mut().record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", false);
         } else if matches!(rep.decision, Decision::Arrive { .. }) {
-            self.sds.record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", true);
+            self.active_sds_mut().record_agreement(&Scope::new(Track::Fusion, &label, ""), "commit_ok", true);
         }
 
         if let (Some(fix), Some(s)) = (&rep.fix, &sighting) {
             if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(fix, s)) {
-                let scope = Scope::new(Track::Depth, &self.ml.depth_mode(), &label);
-                self.sds.record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
+                let dmode = self.ml.depth_mode();
+                let scope = Scope::new(Track::Depth, &dmode, &label);
+                self.active_sds_mut().record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
             }
         }
         let kind = match &rep.decision {
@@ -583,10 +591,23 @@ impl Runtime {
             if let Some((m, sd, _)) = self.sds.adaptive_baseline(&dscope, "residual_deg") {
                 kf.sds.insert("decide".into(), ((r as f64 - m) / sd.max(1e-6)) as f32);
             }
-            self.sds.record_baseline(&dscope, "residual_deg", r as f64);
+            self.active_sds_mut().record_baseline(&dscope, "residual_deg", r as f64);
         }
         if let Some(f) = &rep.fix {
-            self.sds.record_baseline(&dscope, "tri_sigma_frac", (f.sigma_m / f.range_m.max(0.1)) as f64);
+            self.active_sds_mut().record_baseline(&dscope, "tri_sigma_frac", (f.sigma_m / f.range_m.max(0.1)) as f64);
+            let ts_tick = self.world.tick.saturating_sub(1).max(self.ts.start_tick());
+            self.ts.record(1, "decide.fix_x", &label, ts_tick, f.x);
+            self.ts.record(1, "decide.fix_z", &label, ts_tick, f.z);
+        }
+        if let Some((dx, dz)) = rep.realized_pos_err {
+            let fscope = Scope::new(Track::Forecast, &label, &format!("pos@{base}"));
+            let e2 = (dx as f64).powi(2) + (dz as f64).powi(2);
+            let held = matches!(&rep.decision, Decision::Hold { reason } if reason == "band");
+            let sds = self.active_sds_mut();
+            sds.record_baseline(&fscope, "pos:res2", e2);
+            sds.record_baseline(&fscope, "pos:res_x", dx as f64);
+            sds.record_baseline(&fscope, "pos:res_z", dz as f64);
+            sds.record_agreement(&fscope, "pos:covg", !held);
         }
         if let Some(ml) = kf.ml.as_mut() {
             if let Some(tv) = ml.target.as_mut() {
@@ -606,6 +627,8 @@ impl Runtime {
             residual_deg: rep.residual_deg,
             forecast_method: rep.forecast_method.clone(),
             band: rep.band,
+            cov: rep.cov,
+            pos_model: rep.pos_model.clone(),
             estimate: rep.estimate.as_ref().map(|e| (e.x, e.z, e.range_m, e.sigma_m)),
             fix: rep.fix.as_ref().map(|f| (f.x, f.z, f.range_m, f.parallax_deg, f.sigma_m)),
             executed: String::new(),
@@ -681,16 +704,8 @@ impl Runtime {
             }
         }
         let newly_fixed = !t.fixed && t.decider.has_fix();
-        if let Some(rec) = self.recording.as_mut() {
-            if rec.keyframes.len() < self.test_cfg.record.max_keyframes {
-                kf.truth.shed_pixels();
-                rec.keyframes.push(kf);
-                t.pending_kf = Some(rec.keyframes.len() - 1);
-            } else {
-                rec.dropped_keyframes += 1;
-                t.pending_kf = None;
-            }
-        }
+        kf.truth.shed_pixels();
+        t.pending_kf = self.push_recorded_keyframe(kf);
         if newly_fixed {
             self.ml_goto(t, MlPhase::Look, "");
             let (a, b) = (4 * t.cur, 4 * t.cur + 1);
@@ -825,7 +840,7 @@ impl Runtime {
         let hit = kind.spec().drop == want;
         let lmode = self.ml.locate_mode();
         for l in t.target().labels.clone() {
-            self.sds.record_agreement(&Scope::new(Track::Locate, &l, &lmode), "touch", hit);
+            self.active_sds_mut().record_agreement(&Scope::new(Track::Locate, &l, &lmode), "touch", hit);
         }
         t.decider.reset();
         self.ml.reset();

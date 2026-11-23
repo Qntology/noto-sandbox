@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use noto_runtime::{Runtime, RuntimeConfig};
 use serde_json::Value;
@@ -11,9 +12,12 @@ use serde_json::Value;
 const SHIM: &str = r#"<script>
 // 개발 서버 shim: 월드 명령은 이 서버(실제 Rust 런타임)로, 나머지는 브라우저 모의 백엔드로 보낸다.
 (() => {
-  const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status','sds_status','ts_forecast','log_tail','models_status',
-    'test_start','test_step','test_status','test_keyframe','test_video','test_stats','test_cancel','body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror',
-    'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status','depth_view',
+  const WORLD = new Set(['world_new','sim_step','world_frame','command_submit','quest_list','perception_scan','body_status',
+    'sds_status','sds_feedback','sds_generations','sds_archive','sds_tree','sds_query','sds_watch','audit_verify','replay',
+    'ts_forecast','ts_keys','ts_series','ts_view','forecast_uses','rt_revs','log_tail','models_status',
+    'test_start','test_step','test_status','test_status_delta','test_context','test_keyframe','test_video','test_stats','test_cancel',
+    'body_presets','body_plan_eval','body_plan_set','world_body','test_db_mirror',
+    'inventory_drop','world_reset','body_reset','world_terrain','nn_status','physics_status','act_status','world_light','depth_view',
     'crew_add','crew_clear','crew_remove','crew_mode','crew_status','camera_rig','rig_presets','rig_design','rig_import','rig_keep_design','rig_validate','rig_apply','rig_delete',
     'units_list','unit_frame','unit_apply','rig_prompt','rig_edit','rig_params','rig_commit']);
   let mock = null;
@@ -28,6 +32,7 @@ const SHIM: &str = r#"<script>
     return j;
   } } };
   window.__devServer = true;
+  window.__notoEventsUrl = '/events';
 })();
 </script>"#;
 
@@ -69,7 +74,7 @@ fn safe_path(ui: &Path, url_path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
-fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
+fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>, pulse: &(Mutex<u64>, Condvar)) {
     let mut reader = BufReader::new(match s.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -96,6 +101,30 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
         return;
     }
 
+    if method == "GET" && path == "/events" {
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+        if s.write_all(head.as_bytes()).is_err() {
+            return;
+        }
+        let mut last_sent = String::new();
+        loop {
+            let revs = rt.lock().ok().map(|r| r.api_rt_revs().to_string()).unwrap_or_default();
+            if !revs.is_empty() && revs != last_sent {
+                let msg = format!("event: rt-revs\ndata: {revs}\n\n");
+                if s.write_all(msg.as_bytes()).is_err() || s.flush().is_err() {
+                    return;
+                }
+                last_sent = revs;
+            } else if s.write_all(b": keepalive\n\n").is_err() || s.flush().is_err() {
+                return;
+            }
+            let (lock, cv) = pulse;
+            if let Ok(g) = lock.lock() {
+                let _ = cv.wait_timeout(g, Duration::from_millis(500));
+            }
+        }
+    }
+
     if method == "POST" {
         if path == "/mcp" {
             let call = |name: &str, args: &Value| match rt.lock() {
@@ -116,6 +145,12 @@ fn handle(mut s: TcpStream, ui: &Path, rt: &Mutex<Runtime>) {
                     Err(_) => Err("월드 잠금이 깨졌습니다".to_string()),
                 }
             };
+            if matches!(cmd, "sim_step" | "test_step" | "test_start" | "test_cancel" | "command_submit" | "world_new" | "world_reset" | "perception_scan") {
+                if let Ok(mut g) = pulse.0.lock() {
+                    *g = g.saturating_add(1);
+                    pulse.1.notify_all();
+                }
+            }
             match result {
                 Ok(v) => respond(&mut s, "200 OK", "application/json", v.to_string().as_bytes()),
                 Err(e) => respond(&mut s, "400 Bad Request", "application/json", serde_json::json!({ "error": e }).to_string().as_bytes()),
@@ -162,12 +197,13 @@ fn main() -> anyhow::Result<()> {
     let lexicon = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/world_lexicon.json"))?;
     let data_dir = std::env::var("RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/runtime"));
     let rt = Arc::new(Mutex::new(Runtime::new(RuntimeConfig::default(), &lexicon, Some(&data_dir))?));
+    let pulse = Arc::new((Mutex::new(0u64), Condvar::new()));
     let ui = Arc::new(ui.canonicalize()?);
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    println!("http://127.0.0.1:{port}/  (ui: {}, 로그·SDS: {})  MCP: POST http://127.0.0.1:{port}/mcp", ui.display(), data_dir.display());
+    println!("http://127.0.0.1:{port}/  (ui: {}, 로그·SDS: {})  MCP: POST http://127.0.0.1:{port}/mcp  SSE: GET /events", ui.display(), data_dir.display());
     for conn in listener.incoming().flatten() {
-        let (rt, ui) = (Arc::clone(&rt), Arc::clone(&ui));
-        thread::spawn(move || handle(conn, &ui, &rt));
+        let (rt, ui, pulse) = (Arc::clone(&rt), Arc::clone(&ui), Arc::clone(&pulse));
+        thread::spawn(move || handle(conn, &ui, &rt, &pulse));
     }
     Ok(())
 }

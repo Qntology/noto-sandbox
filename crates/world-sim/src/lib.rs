@@ -26,4 +26,4 @@ pub use render::{Camera, Frame, ObjectClass, VisibleObject};
 pub use site::{Site, SiteCfg, Support};
 pub use snapshot::{GraspInfo, MotionView, SiteView, TerrainGrid, WorldSnapshot};
 pub use terrain::{CurbKind, TerrainKind};
-pub use world::{amount_text, Action, ActionError, BalanceEvent, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};
+pub use world::{amount_text, Action, ActionError, BalanceEvent, BodySense, StanceSupport, TimedEvent, World, WorldConfig, WorldEvent, TICK_S};

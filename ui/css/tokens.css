@@ -59,6 +59,12 @@
   --lv-warn: var(--warning);
   --lv-bad: var(--alert);
   --lv-crit: var(--danger);
+  --nn-item0: #e06c6c;
+  --nn-item1: #d6b65e;
+  --nn-item2: #5fb98c;
+  --hold: #e06c6c;
+  --abstain: #9ca3af;
+  --excused: #60a5fa;
   --glass: rgba(17, 17, 19, 0.86);
   --glass-strong: rgba(17, 17, 19, 0.95);
 }
