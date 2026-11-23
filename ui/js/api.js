@@ -6,8 +6,8 @@ let backend = null;
 
 // v0.3 의 런타임 호출(통합 테스트·부품 프리셋)은 Tauri 에서 rt_call 하나로 묶여 있다.
 // 개발 서버(shim)는 이름 그대로 받는다.
-const RT_CALL = new Set(['test_start', 'test_step', 'test_status', 'test_keyframe', 'test_video', 'test_stats', 'test_cancel', 'body_presets', 'body_plan_eval', 'body_plan_set', 'world_body',
-  'inventory_drop', 'world_reset', 'body_reset', 'world_terrain', 'nn_status', 'physics_status', 'depth_view',
+const RT_CALL = new Set(['test_start', 'test_step', 'test_status', 'test_status_delta', 'test_context', 'test_keyframe', 'test_video', 'test_stats', 'test_cancel', 'body_presets', 'body_plan_eval', 'body_plan_set', 'world_body',
+  'inventory_drop', 'world_reset', 'body_reset', 'world_terrain', 'nn_status', 'sds_feedback', 'sds_generations', 'sds_archive', 'sds_tree', 'sds_query', 'sds_watch', 'audit_verify', 'replay', 'ts_keys', 'ts_series', 'ts_view', 'forecast_uses', 'rt_revs', 'physics_status', 'act_status', 'world_light', 'depth_view',
   'crew_add', 'crew_clear', 'crew_mode', 'crew_status', 'camera_rig',
   'rig_presets', 'rig_design', 'rig_import', 'rig_keep_design', 'rig_validate', 'rig_apply', 'rig_delete',
   'units_list', 'unit_frame', 'unit_apply', 'rig_prompt', 'rig_commit', 'crew_remove']);

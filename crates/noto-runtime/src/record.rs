@@ -96,14 +96,31 @@ pub struct DecisionView {
     pub residual_deg: Option<f32>,
     pub forecast_method: String,
     pub band: Option<[f32; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cov: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pos_model: Option<String>,
     pub estimate: Option<(f32, f32, f32, f32)>,
     pub fix: Option<(f32, f32, f32, f32, f32)>,
     pub executed: String,
     pub ok: bool,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct KeyframeCtx {
+    pub log_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quest_step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub procedure_stage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_ref: Option<String>,
+}
+
 pub struct Keyframe {
     pub index: u32,
+    pub created_rev: u64,
+    pub rev: u64,
     pub tick: u64,
     pub time_s: f64,
     pub pose: Pose,
@@ -119,9 +136,13 @@ pub struct Keyframe {
     pub ml_webp: Option<Vec<u8>>,
     pub decision: Option<DecisionView>,
     pub sds: BTreeMap<String, f32>,
+    /// Per-cell SDS detail `(value, n, resolved_scope_key)` for F9 disambiguation.
+    pub sds_detail: BTreeMap<String, (f32, u64, String)>,
+    pub ctx: KeyframeCtx,
     pub event: Option<KeyEvent>,
     pub focus: Option<FocusFrame>,
     pub focus_webp: Vec<(String, Vec<u8>)>,
+    pub nn_open: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,6 +171,7 @@ impl Keyframe {
 pub struct Recording {
     pub pass: String,
     pub run_id: String,
+    pub test_rev: u64,
     pub keyframes: Vec<Keyframe>,
     pub video: Vec<VideoFrame>,
     pub started_tick: u64,
@@ -163,7 +185,7 @@ pub const MAX_VISION_MARKS: usize = 4000;
 
 impl Recording {
     pub fn new(pass: &str, run_id: &str, tick: u64) -> Recording {
-        Recording { pass: pass.into(), run_id: run_id.into(), keyframes: Vec::new(), video: Vec::new(), started_tick: tick, ended_tick: None, dropped_keyframes: 0, vision: Vec::new(), belief_err: Vec::new() }
+        Recording { pass: pass.into(), run_id: run_id.into(), test_rev: 0, keyframes: Vec::new(), video: Vec::new(), started_tick: tick, ended_tick: None, dropped_keyframes: 0, vision: Vec::new(), belief_err: Vec::new() }
     }
 
     /// The bytes the recording holds: the keyframes' truth pixels (until each is analysed), their images (the frame,
@@ -218,6 +240,8 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32, s
     };
     Ok(Keyframe {
         index,
+        created_rev: 0,
+        rev: 0,
         tick: world.tick,
         time_s: world.time_s,
         pose: odometry(world, cam),
@@ -232,9 +256,12 @@ pub fn capture_keyframe(world: &World, cam: &Camera, quality: f32, index: u32, s
         ml_webp: None,
         decision: None,
         sds: BTreeMap::new(),
+        sds_detail: BTreeMap::new(),
+        ctx: KeyframeCtx::default(),
         event: None,
         focus: Some(world.focus_frame()),
         focus_webp: capture_focus(world, quality),
+        nn_open: Vec::new(),
     })
 }
 

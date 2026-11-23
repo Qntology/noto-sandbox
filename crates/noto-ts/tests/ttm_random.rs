@@ -145,3 +145,104 @@ fn a_missing_weight_folder_gives_a_readable_error() {
     let err = TtmForecaster::load(std::path::Path::new("/nonexistent/ttm"), &Device::Cpu).unwrap_err();
     assert!(err.contains("config.json") || err.contains("없습니다"), "{err}");
 }
+
+#[test]
+fn fusion_notes_why_ttm_sat_out() {
+    let m = model(6, serde_json::json!({}));
+    let ttm = TtmPredictor(&m);
+    for n in 6..=10 {
+        let y = series(n);
+        let f = forecast(&y, 2, &[&ttm], &[]);
+        assert!(f.weights.iter().all(|w| w.method != "ttm"), "n={n}: should not join without history");
+        assert!(f.notes.iter().any(|s| s.contains("ttm") && s.contains("분할")), "n={n}: {:?}", f.notes);
+        let elig = m.eligibility(n, 2, 0);
+        assert!(!elig.joins && elig.reason.is_some(), "n={n}: {elig:?}");
+    }
+    // With sufficient SDS history (n>=4) and real_points >= min_history (8), history-only weighting lets TTM join
+    let hist = [noto_ts::HistoryMse { method: "ttm".into(), mse: 0.01, n: 4 }];
+    let f = forecast(&series(9), 2, &[&ttm], &hist);
+    assert!(f.weights.iter().any(|w| w.method == "ttm"), "{:?} / {:?}", f.weights, f.notes);
+    assert!(m.eligibility(9, 2, 4).joins);
+}
+
+#[test]
+fn ttm_fingerprint_tracks_config_and_unverified_weights() {
+    let m1 = model(7, serde_json::json!({"prediction_filter_length": 8}));
+    let fp = m1.fingerprint();
+    assert_eq!(fp.fp8.len(), 8);
+    assert!(!fp.verified, "random backend weights are not official R3 weights");
+    assert!(fp.warnings.iter().any(|w| w.contains("prediction_filter_length")), "{:?}", fp.warnings);
+    let m2 = model(7, serde_json::json!({"d_model": 32}));
+    assert_ne!(m1.fp8(), m2.fp8(), "different configs produce different fp8");
+}
+
+#[test]
+fn padded_tokens_stay_in_distribution() {
+    use noto_ts::ttm::{prepare_scaled, PadMode, TtmInputPolicy};
+    // High-offset narrow-variance series (like vision score around 0.85 ± 0.02):
+    // under Mean padding, padded tokens sit at 0.0 (mean) instead of -42σ!
+    let s: Vec<f64> = (0..12).map(|i| 0.85 + 0.02 * (i as f64 * 0.5).sin()).collect();
+    for mode in [PadMode::Mean, PadMode::Edge] {
+        let policy = TtmInputPolicy { pad: mode, scale_floor: None, min_real: 8 };
+        let (scaled, obs_start, loc, scale) = prepare_scaled(&s, 52, &policy);
+        assert_eq!(scaled.len(), 52);
+        assert_eq!(obs_start, 40);
+        assert!((loc - 0.85).abs() < 0.05);
+        assert!(scale > 0.0 && scale < 0.05);
+        for (i, &v) in scaled[..obs_start].iter().enumerate() {
+            assert!(v.abs() <= 3.0, "mode={mode:?} pad[{i}]={v} out of distribution");
+        }
+    }
+    // Zero padding produces an extreme negative outlier for high-offset narrow series.
+    let zero_pol = TtmInputPolicy { pad: PadMode::Zero, scale_floor: None, min_real: 8 };
+    let (z_scaled, obs_start, _, _) = prepare_scaled(&s, 52, &zero_pol);
+    assert!(z_scaled[0].abs() > 10.0 && obs_start == 40);
+}
+
+#[test]
+fn ttm_batch_equals_sequential() {
+    let m = model(19, serde_json::json!({}));
+    let s1: Vec<f64> = (0..18).map(|i| 0.70 + 0.05 * (i as f64 * 0.3).sin()).collect();
+    let s2: Vec<f64> = (0..32).map(|i| 10.0 + 0.2 * i as f64).collect();
+    let s3: Vec<f64> = (0..52).map(|i| 0.5 + 0.1 * (i as f64 * 0.17).cos()).collect();
+    let seq1 = m.forecast(&s1).unwrap();
+    let seq2 = m.forecast(&s2).unwrap();
+    let seq3 = m.forecast(&s3).unwrap();
+    m.clear_cache();
+    let batch = m.forecast_batch(&[s1.as_slice(), s2.as_slice(), s3.as_slice()]).unwrap();
+    assert_eq!(batch.len(), 3);
+    for (a, b) in [(&seq1, &batch[0]), (&seq2, &batch[1]), (&seq3, &batch[2])] {
+        assert_eq!(a.point.len(), b.point.len());
+        for (x, y) in a.point.iter().zip(&b.point) {
+            assert!((x - y).abs() < 1e-4, "batch mismatch: {x} vs {y}");
+        }
+    }
+}
+
+#[test]
+fn ttm_cache_hits_on_unchanged_history() {
+    let m = model(23, serde_json::json!({}));
+    let s: Vec<f64> = (0..20).map(|i| 0.6 + 0.04 * (i as f64 * 0.4).sin()).collect();
+    let a = m.forecast(&s).unwrap();
+    let b = m.forecast(&s).unwrap();
+    assert_eq!(a.point, b.point);
+    let stats = m.call_stats();
+    assert_eq!(stats.calls, 1, "second call must hit cache: {stats:?}");
+    assert_eq!(stats.cache_hits, 1, "expected 1 cache hit: {stats:?}");
+    let mut s2 = s.clone();
+    s2.push(0.62);
+    let _ = m.forecast(&s2).unwrap();
+    let stats2 = m.call_stats();
+    assert_eq!(stats2.calls, 2);
+    assert_eq!(stats2.cache_hits, 1);
+}
+
+#[test]
+fn ttm_fingerprint_rejects_hash_mismatch() {
+    use noto_ts::ttm::{PadMode, TtmInputPolicy};
+    let m1 = model(31, serde_json::json!({}));
+    let fp1 = m1.fp8().to_string();
+    let m2 = m1.clone().with_policy(TtmInputPolicy { pad: PadMode::Edge, scale_floor: None, min_real: 8 });
+    assert_ne!(fp1, m2.fp8(), "changing input policy must change fp8 to isolate SDS MSE");
+    assert!(!m2.fingerprint().verified);
+}

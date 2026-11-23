@@ -80,18 +80,17 @@ impl Runtime {
             });
             if let Some(v) = value {
                 let scope = Scope::new(Track::Act, &format!("{act}:{kind}"), "");
-                if let Some((m, sd, _)) = self.sds.adaptive_baseline(&scope, "value") {
-                    kf.sds.insert("act".into(), ((v as f64 - m) / sd.max(1e-6)) as f32);
+                if let Some(((m, sd, n), key)) = self.sds.adaptive_baseline_scoped(&scope, "value") {
+                    let z = ((v as f64 - m) / sd.max(1e-6)) as f32;
+                    kf.sds.insert("act".into(), z);
+                    kf.sds_detail.insert("act".into(), (z, n, key));
                 }
-                self.sds.record_baseline(&scope, "value", v as f64);
+                self.active_sds_mut().record_baseline(&scope, "value", v as f64);
             }
-            if let Some(r) = self.recording.as_mut() {
-                // Only the game pass's keyframes are analysed afterwards; a moment in another pass keeps no truth.
-                if r.pass != "game" {
-                    kf.truth.shed_pixels();
-                }
-                r.keyframes.push(kf);
+            if self.recording.as_ref().is_some_and(|r| r.pass != "game") {
+                kf.truth.shed_pixels();
             }
+            let _ = self.push_recorded_keyframe(kf);
         }
     }
 
@@ -107,19 +106,22 @@ impl Runtime {
         let preset = noto_core::bench::form_id(&self.world.body);
         let what = p.object.map(|o| o.0.id().to_string()).unwrap_or_default();
         let s1 = Scope::new(Track::Act, action.id(), &preset);
-        self.sds.record_agreement(&s1, "ok", r.outcome.ok);
-        self.sds.record_transition(&s1, "attempt", r.outcome.code.unwrap_or("ok"));
-        if let Some(pred) = r.metric("p_success") {
-            record_forecast(&mut self.sds, &s1, "p_success", r.outcome.ok, pred);
-        }
-        let s2 = Scope::new(Track::Act, &format!("{}:ts", action.id()), &what);
-        for (k, v) in &r.metrics {
-            if !v.is_finite() {
-                continue;
+        {
+            let sds = self.active_sds_mut();
+            sds.record_agreement(&s1, "ok", r.outcome.ok);
+            sds.record_transition(&s1, "attempt", r.outcome.code.unwrap_or("ok"));
+            if let Some(pred) = r.metric("p_success") {
+                record_forecast(sds, &s1, "p_success", r.outcome.ok, pred);
             }
-            match ts_reference(action, k) {
-                Some((rf, tol)) if r.outcome.ok => self.sds.record_reference(&s2, k, *v as f64, rf as f64, tol as f64),
-                _ => self.sds.record_baseline(&s2, k, *v as f64),
+            let s2 = Scope::new(Track::Act, &format!("{}:ts", action.id()), &what);
+            for (k, v) in &r.metrics {
+                if !v.is_finite() {
+                    continue;
+                }
+                match ts_reference(action, k) {
+                    Some((rf, tol)) if r.outcome.ok => sds.record_reference(&s2, k, *v as f64, rf as f64, tol as f64),
+                    _ => sds.record_baseline(&s2, k, *v as f64),
+                }
             }
         }
         if action == ActKind::Push {
@@ -133,46 +135,49 @@ impl Runtime {
         });
         if let Some(b) = bottom {
             let k = kin::solve_fast(&self.world.body, &b.pose, &b.loads);
+            let legged = self.world.body.legged();
             let s3 = Scope::new(Track::Act, &format!("{}>part", action.id()), b.phase);
+            let s4 = Scope::new(Track::Act, &format!("nn:{}", action.id()), "foot");
+            let s4n = Scope::new(Track::Act, &format!("nn:{}", action.id()), "neck");
+            let sds = self.active_sds_mut();
             for j in k.joints.iter().filter(|j| !j.structural) {
-                self.sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
+                sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
             }
             let trunk = k.pose.trunk_deg();
-            self.sds.record_reference(&s3, "trunk_deg", trunk as f64, ab::LIFT_TRUNK_DEG.0 as f64, ab::LIFT_TRUNK_DEG.1 as f64);
-            if self.world.body.legged() {
+            sds.record_reference(&s3, "trunk_deg", trunk as f64, ab::LIFT_TRUNK_DEG.0 as f64, ab::LIFT_TRUNK_DEG.1 as f64);
+            if legged {
                 if let Some(h) = k.joint("hip_pitch_r").and_then(|j| j.angle_deg) {
-                    self.sds.record_reference(&s3, "hip_flex_deg", h as f64, ab::LIFT_HIP_DEG.0 as f64, ab::LIFT_HIP_DEG.1 as f64);
+                    sds.record_reference(&s3, "hip_flex_deg", h as f64, ab::LIFT_HIP_DEG.0 as f64, ab::LIFT_HIP_DEG.1 as f64);
                 }
                 if let Some(n) = k.joint("knee_r").and_then(|j| j.angle_deg) {
-                    self.sds.record_reference(&s3, "knee_flex_deg", n as f64, ab::LIFT_KNEE_DEG.0 as f64, ab::LIFT_KNEE_DEG.1 as f64);
+                    sds.record_reference(&s3, "knee_flex_deg", n as f64, ab::LIFT_KNEE_DEG.0 as f64, ab::LIFT_KNEE_DEG.1 as f64);
                 }
             }
-            let s4 = Scope::new(Track::Act, &format!("nn:{}", action.id()), "foot");
             match reference(Source::ArmLift, Segment::Foot, "margin", &RefCtx::default()) {
-                Some(rf) => self.sds.record_reference(&s4, "margin", k.margin as f64, rf.value as f64, rf.tolerance as f64),
-                None => self.sds.record_baseline(&s4, "margin", k.margin as f64),
+                Some(rf) => sds.record_reference(&s4, "margin", k.margin as f64, rf.value as f64, rf.tolerance as f64),
+                None => sds.record_baseline(&s4, "margin", k.margin as f64),
             }
-            let s4n = Scope::new(Track::Act, &format!("nn:{}", action.id()), "neck");
-            self.sds.record_baseline(&s4n, "camera_pitch_deg", (k.pose.trunk_deg() + k.pose.neck_deg) as f64);
+            sds.record_baseline(&s4n, "camera_pitch_deg", (k.pose.trunk_deg() + k.pose.neck_deg) as f64);
         }
     }
 
     fn record_push_layers(&mut self, r: &ActRollout) {
         let Some(key) = r.samples.iter().max_by(|a, b| a.peak_ratio.total_cmp(&b.peak_ratio)) else { return };
         let k = kin::solve_fast(&self.world.body, &key.pose, &key.loads);
-        let s3 = Scope::new(Track::Act, "push>part", key.phase);
-        for j in k.joints.iter().filter(|j| !j.structural) {
-            self.sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
-        }
         let props = *self.world.ground_here().surface().props();
         let slope = self.world.posture_now().0.slope_deg;
         let st = drive::state(&self.world.body, &props, slope, 0.0, self.world.carried_kg(), r.metric("push_peak_n").unwrap_or(0.0));
         let part = if self.world.body.base == BaseKind::Track { "track" } else { "wheel" };
+        let s3 = Scope::new(Track::Act, "push>part", key.phase);
         let s4 = Scope::new(Track::Act, "nn:push", part);
-        self.sds.record_baseline(&s4, "bumper>wheel:front_share", (st.front_n / (st.front_n + st.rear_n).max(1e-3)) as f64);
-        self.sds.record_baseline(&s4, "bumper>wheel:slip", st.slip as f64);
-        self.sds.record_baseline(&s4, "need_over_limit", (st.need_n / st.limit_n.max(1e-3)) as f64);
-        self.sds.record_baseline(&Scope::new(Track::Act, "nn:push", "base"), "margin", k.margin as f64);
+        let sds = self.active_sds_mut();
+        for j in k.joints.iter().filter(|j| !j.structural) {
+            sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
+        }
+        sds.record_baseline(&s4, "bumper>wheel:front_share", (st.front_n / (st.front_n + st.rear_n).max(1e-3)) as f64);
+        sds.record_baseline(&s4, "bumper>wheel:slip", st.slip as f64);
+        sds.record_baseline(&s4, "need_over_limit", (st.need_n / st.limit_n.max(1e-3)) as f64);
+        sds.record_baseline(&Scope::new(Track::Act, "nn:push", "base"), "margin", k.margin as f64);
     }
 
     fn record_motion_sds(&mut self, events: &[TimedEvent]) {
@@ -185,8 +190,8 @@ impl Runtime {
                     }
                     let legged = self.world.body.base == BaseKind::HumanFoot;
                     let s1 = Scope::new(Track::Act, if legged { "walk" } else { "drive" }, &form);
-                    self.sds.record_agreement(&s1, "ok", *ok);
-                    self.sds.record_transition(&s1, "attempt", &if *ok { "ok".to_string() } else { code_of(reason.as_deref()) });
+                    self.active_sds_mut().record_agreement(&s1, "ok", *ok);
+                    self.active_sds_mut().record_transition(&s1, "attempt", &if *ok { "ok".to_string() } else { code_of(reason.as_deref()) });
                     if legged {
                         self.record_walk_layers();
                     } else {
@@ -195,12 +200,13 @@ impl Runtime {
                 }
                 WorldEvent::Act { act, kind, ok, value, .. } if MOTION_EVENTS.contains(&kind.as_str()) => {
                     let ground = self.world.ground_here().id();
-                    self.sds.record_agreement(&Scope::new(Track::Act, &format!("event:{kind}"), &form), "ok", *ok);
+                    let sds = self.active_sds_mut();
+                    sds.record_agreement(&Scope::new(Track::Act, &format!("event:{kind}"), &form), "ok", *ok);
                     if let Some(v) = value {
-                        self.sds.record_baseline(&Scope::new(Track::Act, &format!("event:{kind}:ts"), ground), "value", *v as f64);
+                        sds.record_baseline(&Scope::new(Track::Act, &format!("event:{kind}:ts"), ground), "value", *v as f64);
                     }
                     if act == "walk" && matches!(kind.as_str(), "foot_slip" | "fall") {
-                        self.sds.record_transition(&Scope::new(Track::Act, "walk", &form), "slip", if kind == "fall" { "fall" } else { "recover" });
+                        sds.record_transition(&Scope::new(Track::Act, "walk", &form), "slip", if kind == "fall" { "fall" } else { "recover" });
                     }
                 }
                 _ => {}
@@ -212,21 +218,22 @@ impl Runtime {
         let Some((g, ground, _)) = self.world.walk.plan.clone() else { return };
         let body = &self.world.body;
         let cargo = self.world.carried_kg();
-        let s2 = Scope::new(Track::Act, "walk:ts", ground.id());
         let leg = body.dims.hip_m;
-        for (k, v) in [("speed_mps", g.speed), ("step_m", g.step_m), ("step_s", g.step_s), ("ds_frac", g.ds_frac), ("rcof", g.rcof), ("froude", g.speed * g.speed / (G * leg))] {
-            self.sds.record_baseline(&s2, k, v as f64);
-        }
         let (pose, loads, phase) = gait::pose_at(body, &g, 0, 0.5, cargo);
         let k = kin::solve_fast(body, &pose, &loads);
-        let s3 = Scope::new(Track::Act, "walk>part", phase);
-        for j in k.joints.iter().filter(|j| !j.structural) {
-            self.sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
-        }
         let mu = noto_core::surface::available_mu(body.base, ground.surface().props());
+        let s2 = Scope::new(Track::Act, "walk:ts", ground.id());
+        let s3 = Scope::new(Track::Act, "walk>part", phase);
         let s4 = Scope::new(Track::Act, "nn:walk", "foot");
-        self.sds.record_baseline(&s4, "foot>sole:rcof_over_mu", (g.rcof / mu.max(1e-3)) as f64);
-        self.sds.record_baseline(&s4, "margin", k.margin as f64);
+        let sds = self.active_sds_mut();
+        for (k, v) in [("speed_mps", g.speed), ("step_m", g.step_m), ("step_s", g.step_s), ("ds_frac", g.ds_frac), ("rcof", g.rcof), ("froude", g.speed * g.speed / (G * leg))] {
+            sds.record_baseline(&s2, k, v as f64);
+        }
+        for j in k.joints.iter().filter(|j| !j.structural) {
+            sds.record_baseline(&s3, &format!("{}:ratio", j.name), j.ratio as f64);
+        }
+        sds.record_baseline(&s4, "foot>sole:rcof_over_mu", (g.rcof / mu.max(1e-3)) as f64);
+        sds.record_baseline(&s4, "margin", k.margin as f64);
     }
 
     fn record_drive_layers(&mut self) {
@@ -236,16 +243,17 @@ impl Runtime {
         let st = drive::state(&self.world.body, &props, slope, 0.0, self.world.carried_kg(), 0.0);
         let part = if self.world.body.base == BaseKind::Track { "track" } else { "wheel" };
         let s2 = Scope::new(Track::Act, "drive:ts", ground.id());
-        self.sds.record_baseline(&s2, "slip_cruise", st.slip as f64);
-        self.sds.record_baseline(&s2, "speed_factor", st.speed_factor as f64);
         let s3 = Scope::new(Track::Act, "drive>part", part);
-        self.sds.record_baseline(&s3, "front_share_cruise", (st.front_n / (st.front_n + st.rear_n).max(1e-3)) as f64);
-        if let Some(p) = st.pressure_kpa {
-            self.sds.record_baseline(&s3, "track_pressure_max_kpa", p[0].max(p[1]) as f64);
-        }
         let s4 = Scope::new(Track::Act, "nn:drive", part);
-        self.sds.record_baseline(&s4, "slope>drive:need_over_limit", (st.need_n / st.limit_n.max(1e-3)) as f64);
-        self.sds.record_baseline(&s4, "margin", st.margin as f64);
+        let sds = self.active_sds_mut();
+        sds.record_baseline(&s2, "slip_cruise", st.slip as f64);
+        sds.record_baseline(&s2, "speed_factor", st.speed_factor as f64);
+        sds.record_baseline(&s3, "front_share_cruise", (st.front_n / (st.front_n + st.rear_n).max(1e-3)) as f64);
+        if let Some(p) = st.pressure_kpa {
+            sds.record_baseline(&s3, "track_pressure_max_kpa", p[0].max(p[1]) as f64);
+        }
+        sds.record_baseline(&s4, "slope>drive:need_over_limit", (st.need_n / st.limit_n.max(1e-3)) as f64);
+        sds.record_baseline(&s4, "margin", st.margin as f64);
     }
 }
 

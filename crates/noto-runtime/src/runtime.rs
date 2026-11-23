@@ -1,11 +1,12 @@
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use noto_core::{BodyStatus, NotoConfig};
 use noto_quest::{Labels, Quest, QuestBook};
-use noto_sds::{AuditLog, Level, LogLine, SdsStatus, SdsStore};
+use noto_sds::{AuditLog, DriftState, Level, LogLine, SdsStatus, SdsStore, Window};
 use noto_search::semantic::PhraseEmbedder;
 use noto_search::{Lexicon, ParsedCommand, Parser, Plan};
 use noto_ts::Forecast;
@@ -157,6 +158,8 @@ pub struct Detection {
     pub reason: String,
     pub bbox: [f32; 4],
     pub landmark: Option<u32>,
+    pub floor_source: String,
+    pub temporal: Option<noto_ts::TemporalVerdict>,
 }
 
 pub struct DepthView {
@@ -278,6 +281,9 @@ fn new_world(cfg: &RuntimeConfig) -> Result<World> {
 pub struct Runtime {
     pub cfg: RuntimeConfig,
     pub(crate) nn_live: crate::nnlive::NnLive,
+    pub(crate) holds: crate::progress::HoldLog,
+    pub(crate) ts: crate::tshub::TsHub,
+    pub(crate) clock_seq: u64,
     pub(crate) world: World,
     pub(crate) cam: Camera,
     parser: Parser,
@@ -285,6 +291,14 @@ pub struct Runtime {
     pub(crate) recognizer: Box<dyn Recognizer>,
     pub(crate) gates: PrecisionGates,
     pub(crate) sds: SdsStore,
+    pub(crate) eval_sds: SdsStore,
+    pub(crate) sds_watch: crate::sdsview::SdsWatch,
+    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) prev_wear: BTreeMap<String, (f32, f64)>,
+    pub(crate) traj_digests: Vec<(u64, String)>,
+    pub(crate) last_traj_hash: String,
+    pub(crate) feedback: crate::feedback::FeedbackHub,
+    pub(crate) foreuse: crate::foreuse::ForeUseHub,
     pub(crate) audit: AuditLog,
     pub(crate) quests: QuestBook,
     pub(crate) task: Option<Task>,
@@ -329,12 +343,20 @@ impl Runtime {
         let parser = Parser::new(lex);
         let world = new_world(&cfg)?;
         let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let (sds, audit, db) = match data_dir {
-            Some(dir) => (SdsStore::open_with(&dir.join("sds"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)), AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?, noto_sds::TestDb::open(&dir.join("db"))),
-            None => (SdsStore::memory(), AuditLog::memory(4000), noto_sds::TestDb::memory()),
+        let (mut sds, eval_sds, audit, db) = match data_dir {
+            Some(dir) => (
+                SdsStore::open_with(&dir.join("sds"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
+                SdsStore::open_with(&dir.join("sds").join("eval"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
+                AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?,
+                noto_sds::TestDb::open(&dir.join("db")),
+            ),
+            None => (SdsStore::memory(), SdsStore::memory(), AuditLog::memory(4000), noto_sds::TestDb::memory()),
         };
+        sds.set_generation_id(&crate::generation_id());
         let cam = cfg.camera.camera();
         let gates = PrecisionGates::new(cfg.gates.clone());
+        let run_id_init = format!("s{ms}-live");
+        let ts = crate::tshub::TsHub::new(data_dir.map(Path::to_path_buf), &run_id_init, world.tick, world_sim::TICK_S as f64);
         let mut rt = Runtime {
             cfg,
             world,
@@ -344,6 +366,14 @@ impl Runtime {
             recognizer,
             gates,
             sds,
+            eval_sds,
+            sds_watch: crate::sdsview::SdsWatch::default(),
+            data_dir: data_dir.map(Path::to_path_buf),
+            prev_wear: BTreeMap::new(),
+            traj_digests: Vec::new(),
+            last_traj_hash: String::new(),
+            feedback: crate::feedback::FeedbackHub::live(),
+            foreuse: crate::foreuse::ForeUseHub::default(),
             audit,
             quests: QuestBook::new(),
             task: None,
@@ -355,12 +385,15 @@ impl Runtime {
             scan_seq: 0,
             last_device: String::new(),
             nn_live: crate::nnlive::NnLive::default(),
+            holds: crate::progress::HoldLog::default(),
+            ts,
+            clock_seq: 0,
             eval: EvalCounters::default(),
             last_flush_tick: 0,
             focus: None,
             db,
             pass: "game".into(),
-            run_id: format!("s{ms}-live"),
+            run_id: run_id_init,
             session_id: format!("s{ms}"),
             test_seq: 0,
             recording: None,
@@ -374,6 +407,15 @@ impl Runtime {
             iso: crate::views::IsoFollow::default(),
             crew: crate::crew::Crew::default(),
         };
+        rt.nn_live.sync_run(
+            &rt.run_id,
+            &rt.pass,
+            1,
+            &rt.world.cfg.body,
+            rt.world.cfg.noto.base,
+            rt.world.cfg.noto.fingers,
+            crate::nnlive::Clock { seq: 0, tick: rt.world.tick, time_s: rt.world.time_s },
+        );
         let msg = format!(
             "월드 시작: seed {} · {}×{}칸 · 베이스 {:?} · 손가락 {} · 인식기 {}",
             rt.cfg.seed,
@@ -388,7 +430,7 @@ impl Runtime {
     }
 
     pub(crate) fn log(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<Value>) {
-        self.audit.log(cat, level, msg, data.map(tidy));
+        self.audit.log_with_tick(cat, level, msg, data.map(tidy), Some(self.world.tick));
     }
 
     pub fn note_device(&mut self, msg: &str) {
@@ -426,7 +468,22 @@ impl Runtime {
                 WorldEvent::Act { act, kind, label, ok, .. } => (if *ok { Level::Debug } else { Level::Warn }, format!("[{act}:{kind}] {label}")),
                 WorldEvent::Crew { worker, label, ok, .. } => (if *ok { Level::Info } else { Level::Warn }, format!("[작업자 {worker}] {label}")),
                 WorldEvent::Rider { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
-                WorldEvent::Hold { worker, label, .. } => (Level::Info, format!("[작업자 {worker}] {label}")),
+                WorldEvent::Hold { worker, other, gap_m, label } => {
+                    self.holds.push(crate::progress::HoldItem {
+                        tick: te.tick,
+                        worker: *worker,
+                        domain: "traffic",
+                        code: "yield".into(),
+                        verdict: "held",
+                        subject: format!("작업자 {other}"),
+                        measured: Some(*gap_m as f64),
+                        limit: None,
+                        band: None,
+                        unit: "m",
+                        detail_ko: label.clone(),
+                    });
+                    (Level::Info, format!("[작업자 {worker}] {label}"))
+                }
                 WorldEvent::Bump { worker, label, fell, .. } => (if *fell { Level::Error } else { Level::Warn }, format!("[작업자 {worker}] {label}")),
                 WorldEvent::CargoSlip { worker, label, .. } => (Level::Warn, format!("[작업자 {worker}] {label}")),
                 WorldEvent::CargoLost { worker, label, .. } => (Level::Error, format!("[작업자 {worker}] {label}")),
@@ -438,9 +495,296 @@ impl Runtime {
 
     pub(crate) fn flush_sds(&mut self) {
         self.last_flush_tick = self.world.tick;
-        for l in self.sds.flush() {
+        for (scope, axis, prev, next) in self.sds.drain_drift_transitions() {
+            let level = if matches!(next, DriftState::Shifted { .. }) { Level::Warn } else { Level::Info };
+            self.audit.log(
+                "sds",
+                level,
+                format!("드리프트 전이 {scope}::{axis}: {prev:?} → {next:?}"),
+                Some(tidy(json!({"scope": scope, "axis": axis, "prev": prev, "next": next, "tick": self.world.tick}))),
+            );
+        }
+        let lines = self.sds.flush();
+        for l in lines {
             self.audit.info("sds", l);
         }
+        let _ = self.eval_sds.flush();
+        self.ts.flush_l1();
+        if self.data_dir.is_some() {
+            let digests = self.sds.ledger_digests();
+            let gen = self.sds.generation_id().unwrap_or(noto_core::bench::ENGINE_REV).to_string();
+            self.audit.log(
+                "sds_seal",
+                Level::Info,
+                format!("원장 봉인 ({gen})"),
+                Some(json!({"generation": gen, "digests": digests, "tick": self.world.tick})),
+            );
+            self.audit.sync_anchor();
+        }
+    }
+
+    pub fn eval_sds(&self) -> &SdsStore {
+        &self.eval_sds
+    }
+
+    pub fn ts(&self) -> &crate::tshub::TsHub {
+        &self.ts
+    }
+
+    pub fn foreuse(&self) -> &crate::foreuse::ForeUseHub {
+        &self.foreuse
+    }
+
+    pub fn foreuse_mut(&mut self) -> &mut crate::foreuse::ForeUseHub {
+        &mut self.foreuse
+    }
+
+    fn foreuse_tick(&mut self, events: &[TimedEvent]) {
+        let tick = self.world.tick.saturating_sub(1);
+        let time_s = self.world.time_s;
+        // Propagate calibrated forecast control flag strictly when control uses are Calibrated.
+        self.world.forecast_control = self.foreuse.trust("cargo_slip_ahead") == crate::foreuse::Trust::Calibrated
+            || self.foreuse.trust("step_crouch_ahead") == crate::foreuse::Trust::Calibrated
+            || self.foreuse.trust("brake_stop_ahead") == crate::foreuse::Trust::Calibrated;
+
+        // Resolve observed physical limit crossings for Brier audit.
+        for te in events {
+            if let WorldEvent::CargoSlip { worker, .. } | WorldEvent::CargoLost { worker, .. } = &te.event {
+                let sds = if self.is_eval_pass() { &mut self.eval_sds } else { &mut self.sds };
+                self.foreuse.observe_outcome("cargo_slip_ahead", *worker, true, te.time_s, sds);
+            }
+        }
+        // Expire pending warnings whose horizon elapsed cleanly.
+        {
+            let sds = if self.is_eval_pass() { &mut self.eval_sds } else { &mut self.sds };
+            self.foreuse.expire(tick, time_s, sds);
+        }
+        // Thermal crossing advisory check every 50 ticks (Advise grade only).
+        if tick > 0 && tick % 50 == 0 {
+            if let Some(rep) = self.world.latest_balance().cloned() {
+                for j in &rep.joints {
+                    let e2 = j.effort * j.effort;
+                    if let Some(t_cross) = self.world.heat_crossing_s(&j.joint, e2) {
+                        if t_cross > 0.0 && t_cross <= 300.0 {
+                            self.foreuse.issue(
+                                crate::foreuse::ForecastWarn {
+                                    kind: "forecast_warn",
+                                    use_id: "thermal_wear_rest".into(),
+                                    tick,
+                                    time_s,
+                                    stage: "all".into(),
+                                    worker: 1,
+                                    grade: crate::foreuse::Grade::Advise,
+                                    trust: self.foreuse.trust("thermal_wear_rest"),
+                                    series: format!("joint.heat:{}", j.joint),
+                                    limit_kind: crate::foreuse::Limit::ThermalCont.as_str().into(),
+                                    limit_value: 1.0,
+                                    t_cross_s: Some(t_cross as f64),
+                                    act_s: 30.0,
+                                    p: (1.0 - (t_cross as f64 / 300.0)).clamp(0.1, 0.95),
+                                    method: "thermal_ode".into(),
+                                    effect: None,
+                                    resolved: None,
+                                    expire_tick: tick + 200,
+                                },
+                                200,
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn ts_tick(&mut self, events: &[TimedEvent]) {
+        let t = self.world.tick.saturating_sub(1);
+        let form = format!(
+            "{}:{:?}:f{}",
+            self.world.cfg.body.id(),
+            self.world.cfg.noto.base,
+            u8::from(self.world.cfg.noto.fingers)
+        )
+        .to_lowercase();
+        self.ts.register_worker(1, &form, "primary");
+        for w in &self.world.crew {
+            self.ts.register_worker(w.id, w.form.id(), "crew");
+        }
+
+        // Balance & joint channels from latest BalanceReport.
+        if let Some(rep) = self.world.latest_balance().cloned() {
+            for j in &rep.joints {
+                self.ts.track_joint_peak(&j.joint, j.peak_ratio);
+            }
+            if t % 2 == 0 {
+                self.ts.record(1, "bal.margin", "", t, rep.margin);
+                self.ts.record(1, "bal.margin_x", "", t, rep.margin_x);
+                self.ts.record(1, "bal.margin_y", "", t, rep.margin_y);
+                self.ts.record(1, "bal.head_pitch", "", t, rep.head_pitch_deg);
+                self.ts.record(1, "bal.trunk_lean", "", t, rep.trunk_lean_deg);
+                self.ts.record(1, "bal.effort_sum", "", t, rep.effort_sum);
+            }
+            if t % 10 == 0 {
+                for j in &rep.joints {
+                    self.ts.record(1, "joint.effort", &j.joint, t, j.effort);
+                    let pk = self.ts.take_joint_peak(&j.joint, j.peak_ratio);
+                    self.ts.record(1, "joint.peak_ratio", &j.joint, t, pk);
+                    if let Some(&h) = self.world.heat.get(&j.joint) {
+                        self.ts.record(1, "joint.heat", &j.joint, t, h);
+                    }
+                }
+            }
+        }
+
+        // Wear cumulative counters (50-tick cadence).
+        if t % 50 == 0 {
+            let wear_snap: Vec<(String, f32)> = self.world.wear.iter().map(|(k, &v)| (k.clone(), v)).collect();
+            for (joint, life) in wear_snap {
+                self.ts.record(1, "wear.life_used", &joint, t, life);
+            }
+        }
+
+        // Cargo ride channels (2-tick while carrying & moving, primary + crew).
+        if t % 2 == 0 {
+            if self.world.carried_kg() > 0.0 && self.world.agent.speed_mps > 0.02 {
+                self.ts.record(1, "cargo.use_ratio", "", t, self.world.ride.use_ratio);
+                self.ts.record(1, "cargo.shift_m", "", t, self.world.ride.shift_m());
+            }
+            let crew_cargo: Vec<(u32, f32, f32)> = self
+                .world
+                .crew
+                .iter()
+                .filter(|w| !w.carried.is_empty() && w.speed_mps > 0.02)
+                .map(|w| (w.id, w.ride.use_ratio, w.ride.shift_m()))
+                .collect();
+            for (wid, use_ratio, shift_m) in crew_cargo {
+                self.ts.record(wid, "cargo.use_ratio", "", t, use_ratio);
+                self.ts.record(wid, "cargo.shift_m", "", t, shift_m);
+            }
+        }
+
+        // Always-on belief position error every 5 ticks (independent of recording).
+        if t % 5 == 0 {
+            self.ts.record(1, "nav.belief_err_m", "", t, self.world.belief_error_m());
+        }
+
+        // Drive slip every 10 ticks while wheeled/tracked base is moving.
+        if t % 10 == 0 && !self.world.body.legged() && self.world.agent.speed_mps > 0.02 {
+            let (post, _, sense) = self.world.posture_scored();
+            let gnd = self.world.ground_here().surface();
+            let ds = noto_core::act::drive::state(
+                &self.world.body,
+                gnd.props(),
+                post.slope_deg,
+                sense.accel_meas_mps2,
+                self.world.carried_kg(),
+                0.0,
+            );
+            self.ts.record(1, "drive.slip", "", t, ds.slip);
+        }
+
+        // Sub-tick dynamics rollout samples (capped at ROLLOUT_SAMPLE_CAP per rollout).
+        if let Some(m) = self.world.motion.as_ref() {
+            if self.ts.should_emit_rollout(m.start_s) && !m.rollout.samples.is_empty() {
+                let samples = &m.rollout.samples;
+                let cap = crate::tshub::ROLLOUT_SAMPLE_CAP;
+                let step = (samples.len() + cap - 1) / cap;
+                let pts: Vec<(u16, f32, f32)> = samples
+                    .iter()
+                    .step_by(step.max(1))
+                    .take(cap)
+                    .map(|s| {
+                        let sub_ms = (s.t.max(0.0) * 1000.0).round().min(u16::MAX as f32) as u16;
+                        let rmax = s.ratio.iter().copied().fold(0.0f32, f32::max);
+                        (sub_ms, s.margin, rmax)
+                    })
+                    .collect();
+                for (sub_ms, margin, rmax) in pts {
+                    self.ts.record_sub(1, "roll.margin", "", t, sub_ms, margin, 0);
+                    self.ts.record_sub(1, "roll.ratio_max", "", t, sub_ms, rmax, 0);
+                }
+            }
+        }
+
+        // Discrete event markers.
+        for te in events {
+            let et = te.tick;
+            match &te.event {
+                WorldEvent::CargoSlip { worker, .. } => self.ts.record(*worker, "ev.cargo_slip", "", et, 1.0),
+                WorldEvent::CargoLost { worker, .. } => self.ts.record(*worker, "ev.cargo_lost", "", et, 1.0),
+                WorldEvent::StepSeen { worker, .. } => self.ts.record(*worker, "ev.step_seen", "", et, 1.0),
+                WorldEvent::StepTaken { worker, .. } => self.ts.record(*worker, "ev.step_taken", "", et, 1.0),
+                WorldEvent::Bump { worker, .. } => self.ts.record(*worker, "ev.bump", "", et, 1.0),
+                WorldEvent::Hold { worker, .. } => self.ts.record(*worker, "ev.hold", "", et, 1.0),
+                WorldEvent::CurbClimbed { .. } => self.ts.record(1, "ev.curb", "", et, 1.0),
+                WorldEvent::Act { act, .. } => self.ts.record(1, "ev.act", act, et, 1.0),
+                WorldEvent::NodeBroken { .. } => self.ts.record(1, "ev.node_broken", "", et, 1.0),
+                WorldEvent::ItemPicked { .. } => self.ts.record(1, "ev.item_picked", "", et, 1.0),
+                WorldEvent::Delivered { .. } => self.ts.record(1, "ev.delivered", "", et, 1.0),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn is_eval_pass(&self) -> bool {
+        matches!(self.pass.as_str(), "holdout" | "eval")
+    }
+
+    pub fn active_sds_mut(&mut self) -> &mut SdsStore {
+        if self.is_eval_pass() {
+            &mut self.eval_sds
+        } else {
+            &mut self.sds
+        }
+    }
+
+    pub fn set_pass(&mut self, pass: &str) {
+        self.pass = pass.to_string();
+    }
+
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    pub fn traj_digests(&self) -> &[(u64, String)] {
+        &self.traj_digests
+    }
+
+    pub fn clear_traj_digests(&mut self) {
+        self.traj_digests.clear();
+        self.last_traj_hash.clear();
+    }
+
+    /// Compute the deterministic 50-tick trajectory digest chaining the previous digest,
+    /// quantized main-worker kinematics, and N:N span signature (Phase 2 – Part 3 · D6).
+    pub(crate) fn compute_traj_digest(&self) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        mix(self.last_traj_hash.as_bytes());
+        mix(&self.world.tick.to_le_bytes());
+        let a = &self.world.agent;
+        let speed = self.world.sense().speed_mps;
+        let cargo = self.world.carried_kg();
+        for v in [a.x, a.z, a.yaw, speed, cargo] {
+            let q = ((v as f64) * 1000.0).round() as i64;
+            mix(&q.to_le_bytes());
+        }
+        for (scn, ph, s, e, why) in self.nn_live.span_signature() {
+            mix(scn.as_bytes());
+            mix(b"|");
+            mix(ph.as_bytes());
+            mix(&s.to_le_bytes());
+            mix(&e.unwrap_or(0).to_le_bytes());
+            if let Some(w) = why {
+                mix(w.as_bytes());
+            }
+        }
+        format!("{h:016x}")
     }
 
     pub fn world(&self) -> &World {
@@ -718,11 +1062,68 @@ impl Runtime {
 
     pub fn load_ttm(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
         let t0 = Instant::now();
-        let ttm = noto_ts::ttm::TtmForecaster::load(dir, device).map_err(|e| anyhow!("Granite TTM 을 {} 에서 읽지 못했습니다: {e}", dir.display()))?;
+        let pref = noto_ts::ttm_device_pref();
+        let mut chosen = if pref == "cpu" { candle_core::Device::Cpu } else { device.clone() };
+        if !matches!(chosen, candle_core::Device::Cpu) {
+            match noto_ts::ttm_parity_check(dir, &chosen, 1e-3) {
+                Ok(diff) => {
+                    self.log("ts", Level::Debug, format!("TTM GPU/CPU 대조 통과 (최대 오차 {diff:.2e})"), None);
+                }
+                Err(reason) => {
+                    self.log("ts", Level::Warn, format!("{reason} → CPU로 전환"), None);
+                    chosen = candle_core::Device::Cpu;
+                }
+            }
+        }
+        let ttm = noto_ts::ttm::TtmForecaster::load(dir, &chosen).map_err(|e| anyhow!("Granite TTM 을 {} 에서 읽지 못했습니다: {e}", dir.display()))?;
+        let fp = ttm.fingerprint().clone();
         self.attach_ttm(Some(Arc::new(ttm)));
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
-        self.log("ts", Level::Info, format!("Granite TTM 로드 완료 ({ms:.0} ms) · {}", dir.display()), Some(json!({"ms": ms})));
+        self.log(
+            "ts",
+            Level::Info,
+            format!(
+                "Granite TTM 로드 완료 ({ms:.0} ms) · 장치 {} · fp8 {} · {} · {}",
+                noto_ml::device_label(&chosen),
+                fp.fp8,
+                if fp.verified { "공식 해시 검증됨" } else { "미검증 사용자 가중치" },
+                dir.display()
+            ),
+            Some(json!({"ms": ms, "device": noto_ml::device_label(&chosen), "fp8": fp.fp8, "verified": fp.verified, "context": fp.context, "prediction": fp.prediction})),
+        );
+        for w in &fp.warnings {
+            self.log("ts", Level::Warn, w.clone(), Some(json!({"fp8": fp.fp8})));
+        }
         Ok(())
+    }
+
+    pub fn feedback(&self) -> &crate::feedback::FeedbackHub {
+        &self.feedback
+    }
+
+    pub fn set_sds_mode(&mut self, mode: crate::feedback::SdsMode) {
+        self.feedback.set_mode(mode, &self.sds);
+        if self.feedback.effective_mode(crate::feedback::FeedbackPath::F) == crate::feedback::Mode::Off {
+            self.world.ff_gains.clear();
+        }
+        let m = self.feedback.mode().clone();
+        self.log(
+            "fb",
+            Level::Info,
+            format!("SDS 되먹임 모드 변경: {:?}{}", m.default, if m.overrides.is_empty() { String::new() } else { format!(" (예외 {}건)", m.overrides.len()) }),
+            Some(json!({"mode": m})),
+        );
+    }
+
+    pub(crate) fn flush_feedback_audit(&mut self) {
+        for ch in self.feedback.drain_changes() {
+            self.log(
+                "fb",
+                Level::Debug,
+                format!("되먹임 경로 {} ({:?}): {:?} [{} · n={}]", ch.path.id(), ch.mode, ch.value, ch.key.as_deref().unwrap_or("—"), ch.n),
+                Some(json!({"path": ch.path.id(), "mode": ch.mode, "value": ch.value, "key": ch.key, "n": ch.n, "tick": ch.tick})),
+            );
+        }
     }
 
     pub fn use_oracle(&mut self) {
@@ -764,14 +1165,34 @@ impl Runtime {
         if let Some(h) = hand {
             next.noto = h;
         }
+        self.nn_live.close_all(
+            crate::nnlive::CloseWhy::Reset,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         let world = new_world(&next)?;
         self.cfg = next;
         self.world = world;
+        self.nn_live.sync_run(
+            &self.run_id,
+            &self.pass,
+            1,
+            &self.world.cfg.body,
+            self.world.cfg.noto.base,
+            self.world.cfg.noto.fingers,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         self.crew = crate::crew::Crew { mode: self.crew.mode, ..crate::crew::Crew::default() };
         self.task = None;
         self.ml_task = None;
         self.quests.clear();
         self.gates.clear();
+        self.recognizer.reset();
+        self.step_odo_m = 0.0;
+        self.pending_fix = None;
+        self.prev_wear.clear();
+        self.clear_traj_digests();
+        self.ts.mark_reset(self.world.tick);
+        self.holds.clear();
         self.last_scan = None;
         self.gaze_check = None;
         self.fork_cross = None;
@@ -796,6 +1217,10 @@ impl Runtime {
 
     pub fn reset_world(&mut self) -> Result<()> {
         self.cancel();
+        self.nn_live.close_all(
+            crate::nnlive::CloseWhy::Reset,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         self.world.reset_world_keep_body().map_err(|e| anyhow!("월드를 되돌릴 수 없습니다: {e}"))?;
         let mode = self.crew.mode;
         self.crew = crate::crew::Crew { mode, ..crate::crew::Crew::default() };
@@ -806,6 +1231,13 @@ impl Runtime {
         self.ml_task = None;
         self.quests.clear();
         self.gates.clear();
+        self.recognizer.reset();
+        self.step_odo_m = 0.0;
+        self.pending_fix = None;
+        self.prev_wear.clear();
+        self.clear_traj_digests();
+        self.ts.mark_reset(self.world.tick);
+        self.holds.clear();
         self.last_scan = None;
         self.gaze_check = None;
         self.fork_cross = None;
@@ -820,6 +1252,10 @@ impl Runtime {
     pub fn reset_body(&mut self) {
         let (battery, strikes) = (self.world.battery_ratio(), self.world.agent.strikes);
         let worn = self.world.most_worn().map(|(j, d)| format!(", 가장 닳은 관절 {j} 수명 {:.2}% → 0", d * 100.0)).unwrap_or_default();
+        self.nn_live.close_all(
+            crate::nnlive::CloseWhy::Reset,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         self.world.reset_body();
         self.log("world", Level::Info, format!("신체 상태 리셋: 배터리 {:.0}% → 100%, 채취 타격 {strikes} → 0, 관절 발열 초기화{worn}", battery * 100.0), None);
     }
@@ -838,14 +1274,44 @@ impl Runtime {
 
     pub fn tick(&mut self) -> Vec<TimedEvent> {
         let events = self.world.tick();
+        self.clock_seq += 1;
+        let clk = crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick.saturating_sub(1), time_s: self.world.time_s };
+        let (post, _, sense) = self.world.posture_scored();
+        let (sm, pr) = self.world.latest_balance().map_or((0.0, 0.0), |r| (r.margin, r.worst().map_or(0.0, |w| w.peak_ratio)));
+        self.nn_live.observe(
+            clk,
+            &self.run_id,
+            &self.pass,
+            &self.world.cfg.body,
+            self.world.cfg.noto.base,
+            self.world.cfg.noto.fingers,
+            &self.world.body,
+            &post,
+            &sense,
+            sm,
+            pr,
+            &events,
+        );
         self.log_world_events(&events);
         self.drive(&events);
         self.crew_tick(&events);
         self.record_balance_events();
+        self.ts_tick(&events);
+        self.foreuse_tick(&events);
         self.record_tick();
         self.record_act_keyframes(&events);
         self.record_act_sds(&events);
         self.record_bench_sds(&events);
+        self.sds_watch.sample_if_due(self.world.tick, &self.sds);
+        self.flush_feedback_audit();
+        if self.world.tick > 0 && self.world.tick % world_sim::world::BALANCE_RESAMPLE_TICKS == 0 {
+            let d = self.compute_traj_digest();
+            self.last_traj_hash = d.clone();
+            self.traj_digests.push((self.world.tick, d));
+            if self.traj_digests.len() > 4096 {
+                self.traj_digests.remove(0);
+            }
+        }
         if self.world.tick.saturating_sub(self.last_flush_tick) >= 600 {
             self.flush_sds();
         }
@@ -884,7 +1350,7 @@ impl Runtime {
         if let Some(Plan::Fetch { targets, .. }) | Some(Plan::Collect { targets }) = &parsed.plan {
             for t in targets {
                 let scope = Scope::new(Track::Search, &t.resource, &format!("{:?}", t.via));
-                self.sds.record_baseline(&scope, "score", t.score as f64);
+                self.active_sds_mut().record_baseline(&scope, "score", t.score as f64);
             }
         }
         let mut out = Submission { ok: false, stopped: false, quest_id: None, error: None, error_code: None, mode, parsed };
@@ -957,7 +1423,23 @@ impl Runtime {
             c.world = c.world.map(|(x, z)| self.world.belief_of(x, z));
         }
         let mem = self.mem_ctx();
-        let judged = self.gates.judge_with(cands, tick, &mut self.sds, &mem);
+        let judged = if self.is_eval_pass() {
+            self.gates.judge_with_split(cands, tick, &self.sds, &mut self.eval_sds, &mem, &self.feedback)
+        } else {
+            self.gates.judge_with_fb(cands, tick, &mut self.sds, &mem, &self.feedback)
+        };
+        self.flush_feedback_audit();
+        for j in &judged {
+            if let Some(lm) = j.landmark {
+                let subj = format!("{}:lm{lm}", j.cand.label);
+                let extra_q = if j.temporal.as_ref().is_some_and(|tv| tv.outcome == noto_ts::TemporalOutcome::Held) {
+                    noto_ts::series::q::HELD
+                } else {
+                    0
+                };
+                self.ts.record_sub(1, "vision.score", &subj, tick.saturating_sub(1).max(self.ts.start_tick()), 0, j.cand.score, extra_q);
+            }
+        }
         self.relocalize_from(&judged);
         if oracle {
             self.eval.add(&truths, &judged);
@@ -997,7 +1479,7 @@ impl Runtime {
     }
 
     pub(crate) fn drift_rate(&self) -> DriftRate {
-        DriftRate::learned(&self.sds, &self.base_id(), self.world.body.legged())
+        DriftRate::learned_with(&self.sds, &self.base_id(), self.world.body.legged(), &self.feedback, self.world.tick)
     }
 
     pub(crate) fn pose_sigma_m(&self) -> f32 {
@@ -1009,7 +1491,18 @@ impl Runtime {
     pub(crate) fn mem_ctx(&self) -> MemCtx {
         let base = self.base_id();
         let obs_key = if self.stereo() { format!("{base}|stereo") } else { base.clone() };
-        let floor = self.sds.adaptive_baseline(&Scope::new(Track::Memory, &obs_key, "obs"), "scatter_var_m2").map_or(0.0, |b| (b.0 as f32).max(0.0).sqrt());
+        let scope = Scope::new(Track::Memory, &obs_key, "obs");
+        let floor = self
+            .feedback
+            .estimate_mean(crate::feedback::FeedbackPath::H, &self.sds, &scope, "scatter_var_m2", Window::Auto, self.world.tick)
+            .map_or(0.0, |est| {
+                let v = if est.thin.is_some() || matches!(est.state, DriftState::Shifted { .. }) {
+                    est.hi.max(est.value)
+                } else {
+                    est.value
+                };
+                (v as f32).max(0.0).sqrt()
+            });
         MemCtx { odo_m: self.world.odom.travelled_m, rate: self.drift_rate(), base, camera: self.sigma_camera(), obs_floor_m: floor, obs_key }
     }
 
@@ -1164,15 +1657,92 @@ impl Runtime {
                 }
             }
             if let Some(v) = &j.temporal {
-                if v.outcome == noto_ts::TemporalOutcome::Held {
-                    let msg = format!("시계열 게이트가 {}의 점수 {:.2}를 보류: {}", j.cand.label, v.observed, v.reason);
-                    self.audit.log(
-                        "ts",
-                        Level::Warn,
-                        msg,
-                        Some(tidy(json!({"label": j.cand.label, "observed": v.observed, "expected": v.expected, "lo": v.lo, "hi": v.hi, "method": v.method}))),
-                    );
+                match v.outcome {
+                    noto_ts::TemporalOutcome::Held => {
+                        let msg = format!("시계열 게이트가 {}의 점수 {:.2}를 보류: {}", j.cand.label, v.observed, v.reason);
+                        self.holds.push(crate::progress::HoldItem {
+                            tick: r.tick,
+                            worker: 1,
+                            domain: "precision",
+                            code: "temporal".into(),
+                            verdict: "held",
+                            subject: j.cand.label.clone(),
+                            measured: Some(v.observed),
+                            limit: v.expected,
+                            band: v.lo.zip(v.hi).map(|(lo, hi)| [lo, hi]),
+                            unit: "",
+                            detail_ko: v.reason.clone(),
+                        });
+                        self.audit.log(
+                            "ts",
+                            Level::Warn,
+                            msg,
+                            Some(tidy(json!({
+                                "label": j.cand.label,
+                                "outcome": "held",
+                                "band": "gate",
+                                "observed": v.observed,
+                                "expected": v.expected,
+                                "lo": v.lo,
+                                "hi": v.hi,
+                                "z": v.z,
+                                "severity": v.severity,
+                                "method": v.method,
+                            }))),
+                        );
+                    }
+                    noto_ts::TemporalOutcome::Warn => {
+                        let msg = format!("시계열 게이트 경고 {} 점수 {:.2}: {}", j.cand.label, v.observed, v.reason);
+                        self.audit.log(
+                            "vision",
+                            Level::Debug,
+                            msg,
+                            Some(tidy(json!({
+                                "label": j.cand.label,
+                                "outcome": "warn",
+                                "band": "cal80",
+                                "observed": v.observed,
+                                "expected": v.expected,
+                                "lo": v.lo,
+                                "hi": v.hi,
+                                "z": v.z,
+                                "severity": v.severity,
+                                "method": v.method,
+                            }))),
+                        );
+                    }
+                    _ => {}
                 }
+            } else if let Some(tg) = j.gates.iter().find(|g| g.gate == "temporal" && !g.applied && g.detail.contains("이력")) {
+                let hist_n = j.landmark.and_then(|id| self.gates.landmark(id)).map(|l| l.history.len() as f64);
+                self.holds.push(crate::progress::HoldItem {
+                    tick: r.tick,
+                    worker: 1,
+                    domain: "precision",
+                    code: "temporal".into(),
+                    verdict: "abstained",
+                    subject: j.cand.label.clone(),
+                    measured: hist_n,
+                    limit: Some(self.cfg.gates.temporal_min_history as f64),
+                    band: None,
+                    unit: "점",
+                    detail_ko: tg.detail.clone(),
+                });
+            }
+            if let Some(bg) = j.blocked_by().filter(|&b| b != "temporal") {
+                self.holds.push(crate::progress::HoldItem {
+                    tick: r.tick,
+                    worker: 1,
+                    domain: "precision",
+                    code: bg.to_string(),
+                    verdict: "held",
+                    subject: j.cand.label.clone(),
+                    measured: Some(j.cand.score as f64),
+                    limit: Some(j.floor as f64),
+                    band: None,
+                    unit: "",
+                    detail_ko: j.reason_ko(),
+                });
             }
         }
     }
@@ -1196,7 +1766,7 @@ impl Runtime {
     pub fn ts_view(&self, label: Option<&str>, horizon: usize) -> TsView {
         let labels = self.gates.series_labels();
         let label = label.map(String::from).or_else(|| labels.first().map(|l| l.0.clone())).unwrap_or_default();
-        TsView { history: self.gates.series(&label).to_vec(), forecast: self.gates.forecast_for(&label, horizon, &self.sds), label, labels }
+        TsView { history: self.gates.series(&label).to_vec(), forecast: self.gates.forecast_for_with(&label, horizon, &self.sds, &self.feedback, self.world.tick), label, labels }
     }
 
     pub fn log_tail(&self, after_seq: u64, limit: usize, cat: Option<&str>) -> (Vec<LogLine>, u64) {
@@ -1293,6 +1863,8 @@ impl Runtime {
                                 reason: j.reason_ko(),
                                 bbox: j.cand.bbox,
                                 landmark: j.landmark,
+                                floor_source: j.floor_source.clone(),
+                                temporal: j.temporal.clone(),
                             })
                             .collect()
                     })

@@ -748,7 +748,12 @@ impl World {
         // It stops where it comes within reach, which can be well short of the route's end.
         let stop_in = m.follow.stop_within.map_or(left, |(p, reach)| left.min(((pos.0 - p.0).hypot(pos.1 - p.1) - reach).max(0.0)));
         let brake = self.planned_accel(e.slope_deg, self.ground_at(e.to), -1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
-        v = v.min((2.0 * brake * stop_in).sqrt() + 0.05);
+        let stop_eff = if self.forecast_control {
+            (stop_in - self.agent.speed_mps * noto_core::balance::REACTION_DELAY_S).max(0.0)
+        } else {
+            stop_in
+        };
+        v = v.min((2.0 * brake * stop_eff).sqrt() + 0.05);
         let pull = self.planned_accel(e.slope_deg, self.ground_at(e.to), 1.0).max(0.3).min(load.unwrap_or(f32::INFINITY));
         let was = self.agent.speed_mps;
         v = v.min(was + pull * dt);

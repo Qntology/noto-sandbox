@@ -1,7 +1,173 @@
 use candle_core::{Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Padding strategy for histories shorter than `context_length` (Phase 4 – Part 1 · D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PadMode {
+    Zero,
+    #[default]
+    Mean,
+    Edge,
+}
+
+impl PadMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PadMode::Zero => "zero",
+            PadMode::Mean => "mean",
+            PadMode::Edge => "edge",
+        }
+    }
+}
+
+/// Unified input normalization and padding policy (Phase 4 – Part 1 · D2).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TtmInputPolicy {
+    pub pad: PadMode,
+    pub scale_floor: Option<f64>,
+    pub min_real: usize,
+}
+
+impl Default for TtmInputPolicy {
+    fn default() -> Self {
+        TtmInputPolicy {
+            pad: PadMode::Mean,
+            scale_floor: None,
+            min_real: 8,
+        }
+    }
+}
+
+impl TtmInputPolicy {
+    pub fn tag(&self) -> String {
+        match self.scale_floor {
+            Some(sf) => format!("{}:min{}:sf{:.1e}", self.pad.as_str(), self.min_real, sf),
+            None => format!("{}:min{}", self.pad.as_str(), self.min_real),
+        }
+    }
+}
+
+/// Runtime call telemetry for a loaded [`TtmForecaster`] (Phase 4 – Part 1 · D5).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TtmCallStats {
+    pub calls: u64,
+    pub cache_hits: u64,
+    pub p50_ms: f32,
+    pub p95_ms: f32,
+    pub device: String,
+}
+
+/// Preferred device override from `NOTO_TTM_DEVICE` (`"cpu"` or `"shared"`).
+pub fn ttm_device_pref() -> &'static str {
+    match std::env::var("NOTO_TTM_DEVICE").ok().as_deref().map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("cpu") => "cpu",
+        Some("shared") => "shared",
+        _ => "shared",
+    }
+}
+
+/// Parity probe comparing a target device against CPU on 3 fixed synthetic series (Phase 4 – Part 1 · D5).
+/// Returns max absolute deviation (`Ok(max_diff)`) or an error message if it exceeds `tol`.
+pub fn ttm_parity_check(dir: &Path, device: &Device, tol: f64) -> std::result::Result<f64, String> {
+    if matches!(device, Device::Cpu) {
+        return Ok(0.0);
+    }
+    let cpu = TtmForecaster::load(dir, &Device::Cpu)?;
+    let dev = TtmForecaster::load(dir, device)?;
+    let probes: [Vec<f64>; 3] = [
+        (0..52).map(|i| 0.6 + 0.08 * (i as f64 * 0.25).sin()).collect(),
+        (0..20).map(|i| 0.3 + 0.015 * i as f64).collect(),
+        (0..12).map(|i| 0.75 + 0.02 * ((i % 3) as f64 - 1.0)).collect(),
+    ];
+    let mut max_diff = 0.0f64;
+    for s in &probes {
+        let a = cpu.forecast(s)?;
+        let b = dev.forecast(s)?;
+        for (x, y) in a.point.iter().zip(&b.point) {
+            if !y.is_finite() {
+                return Err("TTM GPU 출력에 비유한 값이 포함됨".into());
+            }
+            max_diff = max_diff.max((x - y).abs());
+        }
+    }
+    if max_diff > tol {
+        Err(format!("TTM 장치 대조 오차 {max_diff:.2e} > 허용치 {tol:.2e}"))
+    } else {
+        Ok(max_diff)
+    }
+}
+
+/// Official Granite TTM-R3 (52-16) revision and file hashes (matching `src-tauri/src/models.rs`).
+pub const OFFICIAL_REVISION: &str = "7d99b7e35b3dc18f9db3b2b73cc9699dea6c9508";
+pub const OFFICIAL_CONFIG_SHA256: &str = "2c69af1a0ba3b3582b5a84adb309c3eb0ed24dec204576fcf23d7894c3a10f07";
+pub const OFFICIAL_WEIGHTS_SHA256: &str = "710403c80572c022702ae6a2fad069c309c22b04ea96f17838f0ce7c8e4bba9c";
+
+/// Cryptographic identity & config audit of a loaded TTM model (Phase 4 – Part 1 · D6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TtmFingerprint {
+    pub revision: String,
+    pub config_sha256: String,
+    pub weights_sha256: String,
+    pub fp8: String,
+    pub context: usize,
+    pub prediction: usize,
+    pub quantile_levels: Vec<f64>,
+    pub input_policy: String,
+    pub verified: bool,
+    pub warnings: Vec<String>,
+}
+
+fn sha256_file(path: &Path) -> std::result::Result<String, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn sha256_files(paths: &[PathBuf]) -> std::result::Result<String, String> {
+    if paths.len() == 1 {
+        return sha256_file(&paths[0]);
+    }
+    let mut h = Sha256::new();
+    for p in paths {
+        let fh = sha256_file(p)?;
+        h.update(p.file_name().and_then(|n| n.to_str()).unwrap_or("").as_bytes());
+        h.update(b":");
+        h.update(fh.as_bytes());
+        h.update(b"\n");
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+fn compute_fp8(config_sha: &str, weights_sha: &str, input_policy: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(config_sha.as_bytes());
+    h.update(b"|");
+    h.update(weights_sha.as_bytes());
+    h.update(b"|");
+    h.update(input_policy.as_bytes());
+    let full = format!("{:x}", h.finalize());
+    full.chars().take(8).collect()
+}
+
+fn config_warnings(cfg: &TtmConfig) -> Vec<String> {
+    let mut w = Vec::new();
+    if let Some(pfl) = cfg.prediction_filter_length {
+        if pfl != cfg.prediction_length {
+            w.push(format!("TTM config: prediction_filter_length={pfl} 는 현재 무시됩니다 (prediction_length={})", cfg.prediction_length));
+        }
+    }
+    if cfg.patch_length > 0 && cfg.context_length % cfg.patch_length != 0 {
+        let dropped = cfg.context_length % cfg.patch_length;
+        w.push(format!("TTM config: context_length={} 이 patch_length={} 의 배수가 아니어서 선두 {dropped}점이 버려집니다", cfg.context_length, cfg.patch_length));
+    }
+    w
+}
 
 fn d1() -> usize {
     1
@@ -205,32 +371,96 @@ impl Scaling {
         }
     }
 
-    fn apply(&self, data: &[f64], observed: &[bool]) -> (Vec<f64>, f64, f64) {
-        match self {
-            Scaling::Nop => (data.to_vec(), 0.0, 1.0),
+    /// Scale the observed slice first, then pad the prefix according to `policy` so padded tokens
+    /// never become extreme out-of-distribution values (Phase 4 – Part 1 · D2).
+    /// Returns `(scaled_ctx, obs_start, loc, scale)`.
+    fn prepare_input(&self, series: &[f64], sl: usize, policy: &TtmInputPolicy) -> (Vec<f64>, usize, f64, f64) {
+        let obs_slice = if series.len() >= sl {
+            &series[series.len() - sl..]
+        } else {
+            series
+        };
+        let obs_start = sl.saturating_sub(obs_slice.len());
+        let var_floor = policy.scale_floor.unwrap_or(1e-5).max(1e-12);
+        let (loc, scale) = match self {
+            Scaling::Nop => (0.0, 1.0),
             Scaling::Std => {
-                let cnt = observed.iter().filter(|o| **o).count().max(1) as f64;
-                let loc = data.iter().zip(observed).filter(|(_, o)| **o).map(|(x, _)| *x).sum::<f64>() / cnt;
-                let var = data
-                    .iter()
-                    .zip(observed)
-                    .map(|(x, o)| if *o { (x - loc) * (x - loc) } else { 0.0 })
-                    .sum::<f64>()
-                    / cnt;
-                let scale = (var + 1e-5).sqrt();
-                (data.iter().map(|x| (x - loc) / scale).collect(), loc, scale)
+                let cnt = obs_slice.len().max(1) as f64;
+                let loc = obs_slice.iter().sum::<f64>() / cnt;
+                let var = obs_slice.iter().map(|x| (x - loc) * (x - loc)).sum::<f64>() / cnt;
+                let scale = (var + var_floor).sqrt();
+                (loc, scale)
             }
             Scaling::Mean => {
-                let cnt = observed.iter().filter(|o| **o).count();
-                let s: f64 = data.iter().zip(observed).filter(|(_, o)| **o).map(|(x, _)| x.abs()).sum();
-                let mut scale = if cnt > 0 { s / cnt as f64 } else { s };
-                if scale < 1e-10 {
-                    scale = 1e-10;
-                }
-                (data.iter().map(|x| x / scale).collect(), 0.0, scale)
+                let cnt = obs_slice.len().max(1) as f64;
+                let s: f64 = obs_slice.iter().map(|x| x.abs()).sum();
+                let scale = (s / cnt).max(var_floor.sqrt().min(1e-10));
+                (0.0, scale)
             }
-        }
+        };
+        let scaled_obs: Vec<f64> = obs_slice.iter().map(|&x| (x - loc) / scale).collect();
+        let pad_val = match policy.pad {
+            PadMode::Mean => 0.0,
+            PadMode::Edge => scaled_obs.first().copied().unwrap_or(0.0),
+            PadMode::Zero => (0.0 - loc) / scale,
+        };
+        let mut out = vec![pad_val; sl];
+        out[obs_start..].copy_from_slice(&scaled_obs);
+        (out, obs_start, loc, scale)
     }
+}
+
+/// Public helper exposing prepared `(scaled_context, obs_start, loc, scale)` for tests & diagnostics.
+pub fn prepare_scaled(series: &[f64], context_length: usize, policy: &TtmInputPolicy) -> (Vec<f64>, usize, f64, f64) {
+    Scaling::Std.prepare_input(series, context_length.max(1), policy)
+}
+
+/// Top-`k` DFT frequency indices computed strictly over the observed slice so frequency selection
+/// is completely invariant to padding length (Phase 4 – Part 1 · D2).
+pub fn fft_top_indices(obs: &[f64], k: usize, max_bins: usize, ignore_dc: bool) -> Vec<usize> {
+    fft_top_indices_lut(obs, k, max_bins, ignore_dc, None)
+}
+
+/// Same as [`fft_top_indices`], using an L1-resident cos/sin twiddle LUT of length `obs.len()` when given
+/// (valid only for unpadded full-context slices; results are identical to the trig path).
+pub fn fft_top_indices_lut(obs: &[f64], k: usize, max_bins: usize, ignore_dc: bool, lut: Option<(&[f64], &[f64])>) -> Vec<usize> {
+    let n = obs.len().max(1);
+    let lut = lut.filter(|(c, s)| c.len() == n && s.len() == n);
+    let bins = (n / 2 + 1).min(max_bins.max(1));
+    let mut mag: Vec<(usize, f64)> = (0..bins)
+        .map(|kf| {
+            if ignore_dc && kf == 0 {
+                return (0, 0.0);
+            }
+            let mut re = 0.0;
+            let mut im = 0.0;
+            if let Some((cos_lut, sin_lut)) = lut {
+                let step = kf % n;
+                let mut idx = 0usize;
+                for &v in obs {
+                    re += v * cos_lut[idx];
+                    im += v * sin_lut[idx];
+                    idx += step;
+                    if idx >= n {
+                        idx -= n;
+                    }
+                }
+            } else {
+                for (tt, &v) in obs.iter().enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / n as f64;
+                    re += v * a.cos();
+                    im += v * a.sin();
+                }
+            }
+            (kf, (re * re + im * im).sqrt())
+        })
+        .collect();
+    mag.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let mut out: Vec<usize> = mag.iter().take(k).map(|(i, _)| *i).collect();
+    while out.len() < k {
+        out.push(0);
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -947,50 +1177,60 @@ impl Predictor {
         })
     }
 
-    fn forward(&self, series: &[f64]) -> Result<(Vec<f64>, Option<Vec<Vec<f64>>>)> {
-        let sl = self.sc.context_length;
-        let mut vals = vec![0f64; sl];
-        let mut obs = vec![false; sl];
-        if series.len() >= sl {
-            vals.copy_from_slice(&series[series.len() - sl..]);
-            obs.iter_mut().for_each(|o| *o = true);
-        } else {
-            let off = sl - series.len();
-            vals[off..].copy_from_slice(series);
-            for o in obs[off..].iter_mut() {
-                *o = true;
-            }
+    fn forward(&self, series: &[f64], policy: &TtmInputPolicy) -> Result<(Vec<f64>, Option<Vec<Vec<f64>>>)> {
+        let mut out = self.forward_batch(&[series], policy)?;
+        Ok(out.remove(0))
+    }
+
+    /// Batched channel-independent forward pass `(B, 1, n_patches, d)` (Phase 4 – Part 1 · D5, Part 2 · D2).
+    fn forward_batch(&self, batch: &[&[f64]], policy: &TtmInputPolicy) -> Result<Vec<(Vec<f64>, Option<Vec<Vec<f64>>>)>> {
+        let bsz = batch.len();
+        if bsz == 0 {
+            return Ok(Vec::new());
         }
-        let (scaled, loc, scale) = self.sc.scaling.apply(&vals, &obs);
+        let sl = self.sc.context_length;
         let pl = self.sc.patch_length;
         let n = self.sc.n_base_patches;
         let start = sl - n * pl;
-        let body: Vec<f64> = scaled[start..].to_vec();
         let d = self.sc.d_model;
-        let mut tokens: Vec<Tensor> = Vec::new();
-        match &self.patcher {
+
+        let mut prepared: Vec<(Vec<f64>, usize, f64, f64)> = Vec::with_capacity(bsz);
+        for s in batch {
+            prepared.push(self.sc.scaling.prepare_input(s, sl, policy));
+        }
+
+        let mut x = match &self.patcher {
             Patcher::Single(lin) => {
-                let t = Tensor::from_vec(body.iter().map(|x| *x as f32).collect::<Vec<f32>>(), (1, 1, n, pl), &self.device)?;
-                tokens.push(t.apply(lin)?);
+                let mut flat = Vec::with_capacity(bsz * n * pl);
+                for (scaled, _, _, _) in &prepared {
+                    flat.extend(scaled[start..].iter().map(|v| *v as f32));
+                }
+                let t = Tensor::from_vec(flat, (bsz, 1, n, pl), &self.device)?;
+                t.apply(lin)?
             }
             Patcher::Multi(projs) => {
-                let s = body.len();
+                let s_len = sl - start;
                 let mut outs: Vec<Tensor> = Vec::new();
                 let mut i = 0u32;
                 loop {
                     let factor = 1usize << i;
-                    if s < factor || s / factor < pl {
+                    if s_len < factor || s_len / factor < pl {
                         break;
                     }
-                    let ds: Vec<f64> = (0..s / factor)
-                        .map(|w| body[w * factor..(w + 1) * factor].iter().sum::<f64>() / factor as f64)
-                        .collect();
-                    let np = ds.len() / pl;
+                    let ds_len = s_len / factor;
+                    let np = ds_len / pl;
                     if np == 0 {
                         break;
                     }
-                    let tail: Vec<f32> = ds[ds.len() - np * pl..].iter().map(|x| *x as f32).collect();
-                    let t = Tensor::from_vec(tail, (1, 1, np, pl), &self.device)?;
+                    let mut flat = Vec::with_capacity(bsz * np * pl);
+                    for (scaled, _, _, _) in &prepared {
+                        let body = &scaled[start..];
+                        let ds: Vec<f64> = (0..ds_len)
+                            .map(|w| body[w * factor..(w + 1) * factor].iter().sum::<f64>() / factor as f64)
+                            .collect();
+                        flat.extend(ds[ds.len() - np * pl..].iter().map(|v| *v as f32));
+                    }
+                    let t = Tensor::from_vec(flat, (bsz, 1, np, pl), &self.device)?;
                     let proj = projs
                         .get(i as usize)
                         .ok_or_else(|| candle_core::Error::Msg("TTM multi-scale projector 부족".into()))?;
@@ -998,59 +1238,39 @@ impl Predictor {
                     i += 1;
                 }
                 outs.reverse();
-                tokens.push(Tensor::cat(&outs, 2)?);
+                Tensor::cat(&outs, 2)?
             }
-        }
-        let mut x = tokens.remove(0);
+        };
+
         if let Some(r) = &self.register {
-            x = Tensor::cat(&[&r.unsqueeze(0)?.unsqueeze(0)?, &x], 2)?;
+            let reg = r.unsqueeze(0)?.unsqueeze(0)?.broadcast_as((bsz, 1, r.dim(0)?, r.dim(1)?))?.contiguous()?;
+            x = Tensor::cat(&[&reg, &x], 2)?;
         }
         if let Some(f) = &self.fft {
-            let raw = &scaled[..sl];
             let bins = f.max_bins;
-            let use_lut = sl == f.context_length;
-            let mut mag: Vec<(usize, f64)> = (0..bins)
-                .map(|kf| {
-                    if f.ignore_dc && kf == 0 {
-                        return (0, 0.0);
+            let mut fft_rows: Vec<Tensor> = Vec::with_capacity(bsz);
+            for (scaled, obs_start, _, _) in &prepared {
+                // Frequency selection runs strictly on the observed slice so padding never distorts FFT tokens.
+                let obs_slice = &scaled[*obs_start..sl];
+                let lut = (obs_slice.len() == f.context_length).then(|| (f.cos_lut.as_slice(), f.sin_lut.as_slice()));
+                let idx_usize = fft_top_indices_lut(obs_slice, f.k, bins, f.ignore_dc, lut);
+                let idx: Vec<u32> = idx_usize.into_iter().map(|v| v as u32).collect();
+                let emb = match &f.embed {
+                    FftEmbed::Table(tab) => tab.index_select(&Tensor::from_vec(idx, f.k, &self.device)?, 0)?,
+                    FftEmbed::Mlp(l1, l2) => {
+                        let v: Vec<f32> = idx.iter().map(|i| *i as f32 / bins as f32).collect();
+                        Tensor::from_vec(v, (f.k, 1), &self.device)?.apply(l1)?.relu()?.apply(l2)?
                     }
-                    let mut re = 0.0;
-                    let mut im = 0.0;
-                    if use_lut {
-                        let step = kf % sl;
-                        let mut idx = 0usize;
-                        for &v in raw {
-                            re += v * f.cos_lut[idx];
-                            im += v * f.sin_lut[idx];
-                            idx += step;
-                            if idx >= sl {
-                                idx -= sl;
-                            }
-                        }
-                    } else {
-                        for (tt, &v) in raw.iter().enumerate() {
-                            let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / sl as f64;
-                            re += v * a.cos();
-                            im += v * a.sin();
-                        }
-                    }
-                    (kf, (re * re + im * im).sqrt())
-                })
-                .collect();
-            mag.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
-            let idx: Vec<u32> = mag.iter().take(f.k).map(|(i, _)| *i as u32).collect();
-            let emb = match &f.embed {
-                FftEmbed::Table(tab) => tab.index_select(&Tensor::from_vec(idx.clone(), idx.len(), &self.device)?, 0)?,
-                FftEmbed::Mlp(l1, l2) => {
-                    let v: Vec<f32> = idx.iter().map(|i| *i as f32 / bins as f32).collect();
-                    Tensor::from_vec(v, (idx.len(), 1), &self.device)?.apply(l1)?.relu()?.apply(l2)?
-                }
-            };
-            let tok = match &f.one {
-                Some((proj, df)) => emb.reshape((1, f.k * df))?.apply(proj)?,
-                None => emb,
-            };
-            x = Tensor::cat(&[&tok.unsqueeze(0)?.unsqueeze(0)?, &x], 2)?;
+                };
+                let tok = match &f.one {
+                    Some((proj, df)) => emb.reshape((1, f.k * df))?.apply(proj)?,
+                    None => emb,
+                };
+                fft_rows.push(tok.unsqueeze(0)?.unsqueeze(0)?);
+            }
+            let fft_refs: Vec<&Tensor> = fft_rows.iter().collect();
+            let fft_cat = Tensor::cat(&fft_refs, 0)?;
+            x = Tensor::cat(&[&fft_cat, &x], 2)?;
         }
         if let Some(p) = &self.pos {
             x = x.broadcast_add(p)?;
@@ -1063,7 +1283,7 @@ impl Predictor {
             )));
         }
         if let Some(bn) = &self.base_norm {
-            x = x.reshape((1, 1, p_total * d))?.apply(bn)?.reshape((1, 1, p_total, d))?;
+            x = x.reshape((bsz, 1, p_total * d))?.apply(bn)?.reshape((bsz, 1, p_total, d))?;
         }
         let mut h = self.encoder.forward(&x)?;
         if let Some(a) = &self.adapter {
@@ -1073,20 +1293,28 @@ impl Predictor {
             h = dec.forward(&h)?;
         }
         let dd = h.dim(3)?;
-        let flat = h.reshape((1, 1, p_total * dd))?;
-        let y = flat.apply(&self.head)?.flatten_all()?.to_vec1::<f32>()?;
-        let y: Vec<f64> = y.into_iter().map(|v| v as f64).collect();
-        let (point, quant) = match &self.mq {
-            Some(mq) => {
-                let dec2 = h.i((0, 0))?;
-                let q = mq.forward(&y, &dec2)?;
-                let med = q[q.len() / 2].clone();
-                (med, Some(q))
-            }
-            None => (y, None),
-        };
-        let inv = |v: &Vec<f64>| -> Vec<f64> { v.iter().map(|a| a * scale + loc).collect() };
-        Ok((inv(&point), quant.map(|q| q.iter().map(|r| inv(r)).collect())))
+        let flat = h.reshape((bsz, 1, p_total * dd))?;
+        let head_out = flat.apply(&self.head)?; // (bsz, 1, pred_len)
+        let pred_len = head_out.dim(2)?;
+        let y_all = head_out.flatten_all()?.to_vec1::<f32>()?;
+
+        let mut results = Vec::with_capacity(bsz);
+        for bi in 0..bsz {
+            let (_, _, loc, scale) = prepared[bi];
+            let y: Vec<f64> = y_all[bi * pred_len..(bi + 1) * pred_len].iter().map(|v| *v as f64).collect();
+            let (point, quant) = match &self.mq {
+                Some(mq) => {
+                    let dec2 = h.i((bi, 0))?;
+                    let q = mq.forward(&y, &dec2)?;
+                    let med = q[q.len() / 2].clone();
+                    (med, Some(q))
+                }
+                None => (y, None),
+            };
+            let inv = |v: &Vec<f64>| -> Vec<f64> { v.iter().map(|a| a * scale + loc).collect() };
+            results.push((inv(&point), quant.map(|q| q.iter().map(|r| inv(r)).collect())));
+        }
+        Ok(results)
     }
 }
 
@@ -1207,11 +1435,100 @@ pub struct TtmOutput {
     pub quantiles: Option<Vec<Vec<f64>>>,
 }
 
+#[derive(Debug, Default)]
+struct TtmCacheState {
+    map: HashMap<u64, TtmOutput>,
+    order: VecDeque<u64>,
+    calls: u64,
+    cache_hits: u64,
+    lat_ms: VecDeque<f32>,
+}
+
+impl TtmCacheState {
+    const CACHE_CAP: usize = 128;
+    const LAT_CAP: usize = 256;
+
+    fn hash_input(series: &[f64], policy_tag: &str, fp8: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut mix = |bytes: &[u8]| {
+            for b in bytes {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        mix(fp8.as_bytes());
+        mix(b"|");
+        mix(policy_tag.as_bytes());
+        mix(&(series.len() as u64).to_le_bytes());
+        for &v in series {
+            mix(&v.to_bits().to_le_bytes());
+        }
+        h
+    }
+
+    fn get(&mut self, key: u64) -> Option<TtmOutput> {
+        if let Some(v) = self.map.get(&key).cloned() {
+            self.cache_hits = self.cache_hits.saturating_add(1);
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, key: u64, val: TtmOutput, elapsed_ms: f32) {
+        self.calls = self.calls.saturating_add(1);
+        self.lat_ms.push_back(elapsed_ms);
+        while self.lat_ms.len() > Self::LAT_CAP {
+            self.lat_ms.pop_front();
+        }
+        if !self.map.contains_key(&key) {
+            self.order.push_back(key);
+            while self.order.len() > Self::CACHE_CAP {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                }
+            }
+        }
+        self.map.insert(key, val);
+    }
+
+    fn stats(&self, device: &Device) -> TtmCallStats {
+        let mut sorted: Vec<f32> = self.lat_ms.iter().copied().collect();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let pct = |p: f64| -> f32 {
+            if sorted.is_empty() {
+                0.0
+            } else {
+                let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+                sorted[idx.min(sorted.len() - 1)]
+            }
+        };
+        let dev_str = match device {
+            Device::Cpu => "CPU".to_string(),
+            Device::Cuda(_) => "CUDA".to_string(),
+            Device::Metal(_) => "Metal".to_string(),
+            Device::Rocm(_) => "ROCm".to_string(),
+            Device::OpenCl(_) => "OpenCL".to_string(),
+            Device::Vulkan(_) => "Vulkan".to_string(),
+        };
+        TtmCallStats {
+            calls: self.calls,
+            cache_hits: self.cache_hits,
+            p50_ms: pct(0.50),
+            p95_ms: pct(0.95),
+            device: dev_str,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TtmForecaster {
     pub config: TtmConfig,
     kind: Kind,
     pub dir: PathBuf,
+    fingerprint: TtmFingerprint,
+    policy: TtmInputPolicy,
+    state: Arc<Mutex<TtmCacheState>>,
 }
 
 impl TtmForecaster {
@@ -1262,14 +1579,98 @@ impl TtmForecaster {
             let sc = SubConfig::derive(&cfg, "plain")?;
             Kind::Plain(Predictor::load(&cfg, sc, vb).map_err(|e| format!("TTM 로드 실패: {}", e))?)
         };
-        Ok(Self { config: cfg, kind, dir })
+        let policy = TtmInputPolicy::default();
+        let input_policy = policy.tag();
+        let cfg_digest = format!(
+            "{:x}",
+            Sha256::digest(
+                format!(
+                    "ctx={} pred={} pl={} d={} q={:?} dec={}",
+                    cfg.context_length, cfg.prediction_length, cfg.patch_length, cfg.d_model, cfg.quantile_levels, cfg.decompose
+                )
+                .as_bytes()
+            )
+        );
+        let weights_digest = format!("{:x}", Sha256::digest(dir.to_string_lossy().as_bytes()));
+        let fp8 = compute_fp8(&cfg_digest, &weights_digest, &input_policy);
+        let fingerprint = TtmFingerprint {
+            revision: "custom".into(),
+            config_sha256: cfg_digest,
+            weights_sha256: weights_digest,
+            fp8,
+            context: cfg.context_length,
+            prediction: cfg.prediction_length,
+            quantile_levels: if cfg.multi_quantile_head { cfg.quantile_levels.clone() } else { vec![] },
+            input_policy,
+            verified: false,
+            warnings: config_warnings(&cfg),
+        };
+        Ok(Self { config: cfg, kind, dir, fingerprint, policy, state: Arc::new(Mutex::new(TtmCacheState::default())) })
     }
 
     pub fn load(dir: &Path, device: &Device) -> std::result::Result<Self, String> {
-        let v = crate::io::read_json(&dir.join("config.json"))?;
+        let cfg_path = dir.join("config.json");
+        let v = crate::io::read_json(&cfg_path)?;
         let cfg: TtmConfig = serde_json::from_value(v).map_err(|e| format!("TTM config: {}", e))?;
+        let weight_files = crate::io::safetensor_files(dir)?;
+        let config_sha256 = sha256_file(&cfg_path)?;
+        let weights_sha256 = sha256_files(&weight_files)?;
         let vb = crate::io::load_varbuilder(dir, device)?;
-        Self::from_varbuilder(cfg, vb, dir.to_path_buf())
+        let mut model = Self::from_varbuilder(cfg, vb, dir.to_path_buf())?;
+        let verified = config_sha256 == OFFICIAL_CONFIG_SHA256 && weights_sha256 == OFFICIAL_WEIGHTS_SHA256;
+        let revision = if verified { OFFICIAL_REVISION.to_string() } else { "custom".to_string() };
+        let fp8 = compute_fp8(&config_sha256, &weights_sha256, &model.fingerprint.input_policy);
+        let mut warnings = model.fingerprint.warnings.clone();
+        if !verified {
+            warnings.push(format!("TTM 가중치/설정 해시가 공식 R3 명세와 다릅니다 (fp8={fp8})"));
+        }
+        model.fingerprint = TtmFingerprint {
+            revision,
+            config_sha256,
+            weights_sha256,
+            fp8,
+            context: model.config.context_length,
+            prediction: model.config.prediction_length,
+            quantile_levels: if model.config.multi_quantile_head { model.config.quantile_levels.clone() } else { vec![] },
+            input_policy: model.fingerprint.input_policy,
+            verified,
+            warnings,
+        };
+        Ok(model)
+    }
+
+    pub fn fingerprint(&self) -> &TtmFingerprint {
+        &self.fingerprint
+    }
+
+    pub fn fp8(&self) -> &str {
+        &self.fingerprint.fp8
+    }
+
+    /// Evaluate whether TTM can join a fusion call of `n_real` points and requested `horizon` (Phase 4 – Part 1 · D1).
+    pub fn eligibility(&self, n_real: usize, horizon: usize, history_n: u64) -> crate::fusion::TtmEligibility {
+        let hz = crate::fusion::HOLDOUT.min(n_real / 3).max(2);
+        let backtest_points = n_real.saturating_sub(hz);
+        let ctx = self.config.context_length;
+        let padded = ctx.saturating_sub(n_real);
+        let pl = self.config.patch_length.max(1);
+        let dropped_by_align = ctx % pl;
+        let min_h = self.min_history();
+        let max_hz = self.prediction_length();
+        let (joins, reason) = if n_real < crate::fusion::MIN_POINTS {
+            (false, Some(format!("이력 {n_real}점 < 백테스트 최소 {}점", crate::fusion::MIN_POINTS)))
+        } else if horizon > max_hz {
+            (false, Some(format!("예측 수평선 {horizon} > 최대 {max_hz}")))
+        } else if backtest_points < min_h {
+            if n_real >= min_h && history_n >= crate::fusion::HISTORY_ONLY_MIN_N {
+                (true, None)
+            } else {
+                (false, Some(format!("이력 {n_real}점 (백테스트 분할 {backtest_points}점 < 최소 {min_h}점, 11점부터 참여)")))
+            }
+        } else {
+            (true, None)
+        };
+        crate::fusion::TtmEligibility { real_points: n_real, backtest_points, padded, dropped_by_align, joins, reason }
     }
 
     pub fn context_length(&self) -> usize {
@@ -1288,12 +1689,92 @@ impl TtmForecaster {
     }
 
     pub fn min_history(&self) -> usize {
-        8
+        self.policy.min_real.max(1)
+    }
+
+    pub fn input_policy(&self) -> &TtmInputPolicy {
+        &self.policy
+    }
+
+    pub fn with_policy(mut self, policy: TtmInputPolicy) -> Self {
+        let tag = policy.tag();
+        self.policy = policy;
+        let fp8 = compute_fp8(&self.fingerprint.config_sha256, &self.fingerprint.weights_sha256, &tag);
+        self.fingerprint.input_policy = tag;
+        self.fingerprint.fp8 = fp8;
+        self.state = Arc::new(Mutex::new(TtmCacheState::default()));
+        self
+    }
+
+    pub fn call_stats(&self) -> TtmCallStats {
+        self.state
+            .lock()
+            .map(|s| s.stats(self.device()))
+            .unwrap_or_default()
+    }
+
+    pub fn clear_cache(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.map.clear();
+            st.order.clear();
+        }
     }
 
     pub fn forecast(&self, series: &[f64]) -> std::result::Result<TtmOutput, String> {
-        let out = self.forecast_inner(series);
-        out
+        let key = TtmCacheState::hash_input(series, &self.fingerprint.input_policy, &self.fingerprint.fp8);
+        if let Ok(mut st) = self.state.lock() {
+            if let Some(hit) = st.get(key) {
+                return Ok(hit);
+            }
+        }
+        let t0 = Instant::now();
+        let out = self.forecast_inner(series)?;
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if let Ok(mut st) = self.state.lock() {
+            st.insert(key, out.clone(), ms);
+        }
+        Ok(out)
+    }
+
+    /// Batched channel-independent forecast over multiple independent series (Phase 4 – Part 1 · D5).
+    /// Matches individual `forecast` calls within f32 rounding tolerance while sharing one forward pass.
+    pub fn forecast_batch(&self, batch: &[&[f64]]) -> std::result::Result<Vec<TtmOutput>, String> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        for s in batch {
+            if s.len() < self.min_history() {
+                return Err(format!("TTM 입력이 너무 짧습니다 ({} < {})", s.len(), self.min_history()));
+            }
+            if s.iter().any(|v| !v.is_finite()) {
+                return Err("TTM 입력에 NaN/Inf 가 있습니다".into());
+            }
+        }
+        let t0 = Instant::now();
+        let levels = self.config.quantile_levels.clone();
+        let results: Vec<TtmOutput> = match &self.kind {
+            Kind::Plain(p) => {
+                let raw = p.forward_batch(batch, &self.policy).map_err(|e| e.to_string())?;
+                raw.into_iter()
+                    .map(|(point, quantiles)| TtmOutput { point, quantile_levels: levels.clone(), quantiles })
+                    .collect()
+            }
+            Kind::Decomposed { .. } => {
+                let mut out = Vec::with_capacity(batch.len());
+                for s in batch {
+                    out.push(self.forecast_inner(s)?);
+                }
+                out
+            }
+        };
+        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+        if let Ok(mut st) = self.state.lock() {
+            for (s, out) in batch.iter().zip(&results) {
+                let key = TtmCacheState::hash_input(s, &self.fingerprint.input_policy, &self.fingerprint.fp8);
+                st.insert(key, out.clone(), ms / batch.len() as f32);
+            }
+        }
+        Ok(results)
     }
 
     fn forecast_inner(&self, series: &[f64]) -> std::result::Result<TtmOutput, String> {
@@ -1306,7 +1787,7 @@ impl TtmForecaster {
         let levels = self.config.quantile_levels.clone();
         match &self.kind {
             Kind::Plain(p) => {
-                let (point, q) = p.forward(series).map_err(|e| e.to_string())?;
+                let (point, q) = p.forward(series, &self.policy).map_err(|e| e.to_string())?;
                 Ok(TtmOutput {
                     point,
                     quantile_levels: levels,
@@ -1321,23 +1802,17 @@ impl TtmForecaster {
                 via_variance,
             } => {
                 let ctx = self.config.context_length.max(1);
-                let mut past = vec![0f64; ctx];
-                let mut obs = vec![false; ctx];
-                if series.len() >= ctx {
-                    past.copy_from_slice(&series[series.len() - ctx..]);
-                    obs.iter_mut().for_each(|o| *o = true);
-                } else {
-                    let pad = ctx - series.len();
-                    past[pad..].copy_from_slice(series);
-                    obs[pad..].iter_mut().for_each(|o| *o = true);
-                }
-                let (scaled, loc, scale) = scaling.apply(&past, &obs);
-                let tr = robust_lowess_like(&scaled, 0.15, 2);
+                let (scaled, obs_start, loc, scale) = scaling.prepare_input(series, ctx, &self.policy);
+                // Run LOWESS strictly on the observed slice so prefix padding never biases trend extraction.
+                let obs_slice = &scaled[obs_start..ctx];
+                let tr_obs = robust_lowess_like(obs_slice, 0.15, 2);
+                let mut resid_obs: Vec<f64> = obs_slice.iter().zip(&tr_obs).map(|(a, b)| a - b).collect();
                 let l_res = residual_context.map(|r| r.min(ctx)).unwrap_or(ctx);
-                let off = ctx - l_res;
-                let rsig: Vec<f64> = (off..ctx).map(|i| scaled[i] - tr[i]).collect();
-                let (tp, tq) = trend.forward(&scaled).map_err(|e| e.to_string())?;
-                let (rp, rq) = resid.forward(&rsig).map_err(|e| e.to_string())?;
+                if resid_obs.len() > l_res {
+                    resid_obs = resid_obs[resid_obs.len() - l_res..].to_vec();
+                }
+                let (tp, tq) = trend.forward(&tr_obs, &self.policy).map_err(|e| e.to_string())?;
+                let (rp, rq) = resid.forward(&resid_obs, &self.policy).map_err(|e| e.to_string())?;
                 let point: Vec<f64> = tp.iter().zip(rp.iter()).map(|(a, b)| (a + b) * scale + loc).collect();
                 let quantiles = match (tq, rq) {
                     (Some(tq), Some(rq)) => {

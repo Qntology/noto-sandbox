@@ -1,10 +1,10 @@
 use noto_core::balance::{Body, FeedForward};
-use noto_core::nn::{evaluate, holdout, library, shift_index, ScenarioResult};
+use noto_core::bench::holdout_seed;
+use noto_core::nn::{def_by_id, evaluate, evaluate_aggregate, holdout, library, shift_index, ScenarioResult};
 use noto_core::parts::BodyPlan;
 use noto_core::{BaseKind, FingerCount};
 
 const PLANS: [&str; 4] = ["budget", "mid", "pro", "pro_arms"];
-const HOLDOUT_SEED: u64 = 20261024;
 
 fn print_result(plan: &str, base: BaseKind, r: &ScenarioResult, cells: bool) {
     if let Some(why) = &r.skipped {
@@ -65,8 +65,10 @@ fn composite_scenarios_against_the_references() {
             }
             let by = |id: &str| results.iter().find(|r| r.id == id).unwrap();
             assert_eq!(by("S2").skipped.is_some(), base != BaseKind::HumanFoot, "the 17 cm step needs legs");
-            let sli = shift_index(&[(by("S1"), 120.0), (by("S2"), 60.0), (by("S4"), 60.0)]);
-            println!("[NN-SUM] {plan:<8} {base:?} S7 근무 교대 합성 SLI {} (1 넘으면 교대를 버티지 못함; NIOSH SLI, Waters 2007 — 토크비 대응은 이 프로젝트의 적용)", sli.map_or("—".into(), |v| format!("{v:.2}")));
+            let s7 = evaluate_aggregate(def_by_id("S7").expect("S7 def"), &results);
+            let sli_manual = shift_index(&[(by("S1"), 120.0), (by("S2"), 60.0), (by("S4"), 60.0)]);
+            assert_eq!(s7.sli, sli_manual, "S7 aggregate def must match shift_index");
+            println!("[NN-SUM] {plan:<8} {base:?} S7 근무 교대 합성 SLI {} (1 넘으면 교대를 버티지 못함; NIOSH SLI, Waters 2007 — 토크비 대응은 이 프로젝트의 적용)", s7.sli.map_or("—".into(), |v| format!("{v:.2}")));
         }
     }
 }
@@ -74,19 +76,20 @@ fn composite_scenarios_against_the_references() {
 #[test]
 fn held_out_scenarios_are_counted_not_tuned() {
     let ff = FeedForward::default();
+    let seed = holdout_seed("NN");
     for plan in ["mid", "pro"] {
         for base in [BaseKind::HumanFoot, BaseKind::Wheel] {
             let body = Body::new(&BodyPlan::named(plan).unwrap(), base, FingerCount::Five);
-            let held = holdout(&body, HOLDOUT_SEED, 8);
+            let held = holdout(&body, seed, 8);
             let results: Vec<ScenarioResult> = held.iter().map(|s| evaluate(&body, s, &ff)).collect();
             let run: Vec<&ScenarioResult> = results.iter().filter(|r| r.skipped.is_none()).collect();
             let passed = run.iter().filter(|r| r.passed).count();
-            println!("[NN-HELD] {plan:<8} {base:?} 시드 {HOLDOUT_SEED}: 통과 {passed} / {} (DARPA 방식, 과제당 1점)", run.len());
+            println!("[NN-HELD] {plan:<8} {base:?} 시드 {seed}: 통과 {passed} / {} (DARPA 방식, 과제당 1점)", run.len());
             for r in &run {
                 let p = &r.phases[0];
                 println!("[NN-HELD]   {} {} {} 점수 {:.0} · 항목 {} · 동적 여유 {:.2} · 피크 {:.0}%{}", r.id, r.name_ko, p.id, p.score, p.item, p.min_margin, p.peak_ratio * 100.0, if r.gated { format!(" · {}", r.gates.join("; ")) } else { String::new() });
             }
-            let again: Vec<bool> = holdout(&body, HOLDOUT_SEED, 8).iter().map(|s| evaluate(&body, s, &ff).passed).collect();
+            let again: Vec<bool> = holdout(&body, seed, 8).iter().map(|s| evaluate(&body, s, &ff).passed).collect();
             assert_eq!(again, results.iter().map(|r| r.passed).collect::<Vec<_>>());
         }
     }

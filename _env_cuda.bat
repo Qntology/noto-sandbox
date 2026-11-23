@@ -12,6 +12,10 @@ if errorlevel 1 exit /b 1
 
 where nvcc > nul 2>&1
 if errorlevel 1 (
+    if defined CUDA_PATH if exist "%CUDA_PATH%\bin\x64\nvcc.exe" set "PATH=%CUDA_PATH%\bin\x64;%PATH%"
+)
+where nvcc > nul 2>&1
+if errorlevel 1 (
     if defined CUDA_PATH if exist "%CUDA_PATH%\bin\nvcc.exe" set "PATH=%CUDA_PATH%\bin;%PATH%"
 )
 where nvcc > nul 2>&1

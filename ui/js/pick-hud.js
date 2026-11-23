@@ -7,6 +7,7 @@
 // 다리 몸(카메라 2대)은 지게차의 포크 카메라 자리에 머리 카메라의 SGBM 깊이를 띄우고(응시 → 쥐기), 응시 확인이 그 깊이로
 // 읽은 물건의 놓인 각도·크기를 적으며, 자세를 낮추고 쥐고 드는 동안 팔 관절과 손가락 패드 접촉을 함께 그린다.
 import { $, clear, el, fmt } from './util.js';
+import { state } from './state.js';
 import { drawFocus } from './focus-view.js';
 
 const STATE_KO = { done: '완료', active: '진행', pending: '대기', failed: '실패' };
@@ -131,9 +132,9 @@ export function wantsEyeDepth(p) {
   return !!p && p.act != null && p.mechanism === 'hand' && p.depth_procedure === 'sgbm' && ['look', 'check', 'bend', 'grip'].includes(p.stage);
 }
 
-/** 팔·손가락 화면: 자세를 낮추고 쥐고 드는 동안 (런타임이 그때 world_frame 에 focus 를 싣는다). */
+/** 팔·손가락 화면: 자세를 낮추고 쥐고 들고 수납하는 동안 (런타임이 그때 world_frame 에 focus 를 싣는다). */
 function wantsHandViews(p, focus) {
-  return !!p && !!focus && p.mechanism === 'hand' && ['bend', 'grip', 'lift'].includes(p.stage);
+  return !!p && !!focus && p.mechanism === 'hand' && ['bend', 'grip', 'lift', 'stow', 'look_up'].includes(p.stage);
 }
 
 const FORM_KO = { bar: '막대형 (원목처럼 긴 것)', block: '덩어리형' };
@@ -194,11 +195,13 @@ export function renderProcedureBrief(box, p) {
   const stages = p.stages ?? [];
   const at = stages.findIndex((s) => s.state === 'active' || s.state === 'failed');
   const [cls, text] = p.mechanism === 'fork' ? crossBrief(p.cross) : checkBrief(p);
+  const nnNow = state.progress?.nn?.now?.[0];
   box.append(
     el('div', { class: 'cp-title', text: title(p) }),
     el('ol', { class: 'cp-steps', aria: { hidden: 'true' } }, ...stages.map((s) => el('li', { class: s.state, title: s.label_ko }))),
     el('div', { class: 'cp-now', text: at >= 0 ? `${at + 1}/${stages.length} ${stages[at].label_ko}` : '' }),
-    el('div', { class: `cp-check ${cls}`, text }));
+    el('div', { class: `cp-check ${cls}`, text }),
+    ...(nnNow ? [el('div', { class: 'cp-now', text: `N:N ${nnNow.scenario}/${nnNow.phase} ${fmt.n(nnNow.score, 0)}` })] : []));
   return true;
 }
 

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::store::write_atomic;
+
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+const ANCHORS_FILE: &str = "anchors.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +24,8 @@ pub enum Level {
 pub struct LogLine {
     pub seq: u64,
     pub ts: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick: Option<u64>,
     pub cat: String,
     pub level: Level,
     pub msg: String,
@@ -34,6 +39,39 @@ struct FileLine {
     line: LogLine,
     prev: String,
     hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnchorEntry {
+    pub session: String,
+    pub file: String,
+    pub seq: u64,
+    pub hash: String,
+    pub updated_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct AnchorFile {
+    #[serde(default)]
+    last_session: Option<String>,
+    #[serde(default)]
+    sessions: BTreeMap<String, AnchorEntry>,
+}
+
+fn load_anchors(dir: &Path) -> AnchorFile {
+    let p = dir.join(ANCHORS_FILE);
+    std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|t| serde_json::from_str::<AnchorFile>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_anchor(dir: &Path, entry: AnchorEntry) -> std::io::Result<()> {
+    let mut af = load_anchors(dir);
+    af.last_session = Some(entry.session.clone());
+    af.sessions.insert(entry.session.clone(), entry);
+    let txt = serde_json::to_string_pretty(&af).unwrap_or_default();
+    write_atomic(&dir.join(ANCHORS_FILE), txt.as_bytes())
 }
 
 fn chain_hash(prev: &str, line: &LogLine) -> String {
@@ -55,6 +93,19 @@ pub struct VerifyOk {
 pub struct VerifyError {
     pub line_no: usize,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionVerifyReport {
+    pub session: String,
+    pub file: String,
+    pub lines: usize,
+    pub chain_ok: bool,
+    pub broken_at: Option<usize>,
+    pub reason: Option<String>,
+    pub anchor_ok: Option<bool>,
+    pub seal_ok: Option<bool>,
+    pub linked_from: Option<String>,
 }
 
 pub fn verify_file(path: &Path) -> Result<VerifyOk, VerifyError> {
@@ -86,13 +137,97 @@ pub fn verify_file(path: &Path) -> Result<VerifyOk, VerifyError> {
     Ok(VerifyOk { lines: count, last_hash: prev })
 }
 
+/// Verify all session audit files in `log_dir` against their hash chains, `anchors.json`
+/// (detecting tail truncation), and optional live `sds_digests` (detecting external ledger edits)
+/// (Phase 2 – Part 3 · D4).
+pub fn verify_dir(log_dir: &Path, sds_digests: Option<&BTreeMap<String, String>>) -> Vec<SessionVerifyReport> {
+    let anchors = load_anchors(log_dir);
+    let mut files: Vec<PathBuf> = std::fs::read_dir(log_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok().map(|x| x.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+
+    let mut out = Vec::with_capacity(files.len());
+    let total = files.len();
+    for (idx, path) in files.iter().enumerate() {
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let session = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let mut linked_from = None;
+        let mut last_seal: Option<BTreeMap<String, String>> = None;
+        if let Ok(txt) = std::fs::read_to_string(path) {
+            for raw in txt.lines() {
+                if let Ok(fl) = serde_json::from_str::<FileLine>(raw) {
+                    if fl.line.cat == "session_link" && linked_from.is_none() {
+                        linked_from = fl.line.data.as_ref().and_then(|d| d.get("prev_file")).and_then(|v| v.as_str()).map(String::from);
+                    }
+                    if fl.line.cat == "sds_seal" {
+                        if let Some(map) = fl.line.data.as_ref().and_then(|d| d.get("digests")).and_then(|v| v.as_object()) {
+                            let mut parsed = BTreeMap::new();
+                            for (k, v) in map {
+                                if let Some(s) = v.as_str() {
+                                    parsed.insert(k.clone(), s.to_string());
+                                }
+                            }
+                            last_seal = Some(parsed);
+                        }
+                    }
+                }
+            }
+        }
+        match verify_file(path) {
+            Ok(ok) => {
+                let anchor_ok = anchors.sessions.get(&session).map(|a| ok.lines as u64 == a.seq && ok.last_hash == a.hash);
+                let seal_ok = if idx + 1 == total {
+                    match (last_seal.as_ref(), sds_digests) {
+                        (Some(sealed), Some(cur)) => Some(sealed.iter().all(|(k, v)| cur.get(k) == Some(v))),
+                        _ => None,
+                    }
+                } else {
+                    last_seal.as_ref().map(|_| true)
+                };
+                out.push(SessionVerifyReport {
+                    session,
+                    file: fname,
+                    lines: ok.lines,
+                    chain_ok: true,
+                    broken_at: None,
+                    reason: None,
+                    anchor_ok,
+                    seal_ok,
+                    linked_from,
+                });
+            }
+            Err(err) => {
+                out.push(SessionVerifyReport {
+                    session,
+                    file: fname,
+                    lines: err.line_no.saturating_sub(1),
+                    chain_ok: false,
+                    broken_at: Some(err.line_no),
+                    reason: Some(err.reason),
+                    anchor_ok: Some(false),
+                    seal_ok: Some(false),
+                    linked_from,
+                });
+            }
+        }
+    }
+    out
+}
+
 pub struct AuditLog {
     ring: VecDeque<LogLine>,
     cap: usize,
     next_seq: u64,
     prev_hash: String,
+    session: String,
     file: Option<(PathBuf, BufWriter<File>)>,
     pub write_error: Option<String>,
+    anchor_dirty: bool,
 }
 
 fn now_ms() -> i64 {
@@ -101,16 +236,43 @@ fn now_ms() -> i64 {
 
 impl AuditLog {
     pub fn memory(cap: usize) -> Self {
-        AuditLog { ring: VecDeque::new(), cap: cap.max(16), next_seq: 1, prev_hash: GENESIS.into(), file: None, write_error: None }
+        AuditLog {
+            ring: VecDeque::new(),
+            cap: cap.max(16),
+            next_seq: 1,
+            prev_hash: GENESIS.into(),
+            session: "memory".into(),
+            file: None,
+            write_error: None,
+            anchor_dirty: false,
+        }
     }
 
     pub fn open(dir: &Path, session: &str, cap: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
         let safe: String = session.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
         let path = dir.join(format!("{safe}.jsonl"));
+        let prev_anchor = {
+            let af = load_anchors(dir);
+            af.last_session.as_deref().and_then(|s| af.sessions.get(s).cloned())
+        };
         let f = OpenOptions::new().create_new(true).append(true).open(&path)?;
         let mut log = AuditLog::memory(cap);
+        log.session = safe;
         log.file = Some((path, BufWriter::new(f)));
+        if let Some(prev) = prev_anchor {
+            log.log(
+                "session_link",
+                Level::Info,
+                format!("이전 세션 {} (seq {})와 체인 연결", prev.file, prev.seq),
+                Some(serde_json::json!({
+                    "prev_session": prev.session,
+                    "prev_file": prev.file,
+                    "prev_seq": prev.seq,
+                    "prev_hash": prev.hash,
+                })),
+            );
+        }
         Ok(log)
     }
 
@@ -118,8 +280,34 @@ impl AuditLog {
         self.file.as_ref().map(|(p, _)| p.as_path())
     }
 
-    pub fn log(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<serde_json::Value>) -> u64 {
-        let line = LogLine { seq: self.next_seq, ts: now_ms(), cat: cat.to_string(), level, msg: msg.into(), data };
+    pub fn dir(&self) -> Option<&Path> {
+        self.file.as_ref().and_then(|(p, _)| p.parent())
+    }
+
+    /// Atomically persist the current session's latest `(seq, hash)` into `anchors.json`.
+    pub fn sync_anchor(&mut self) {
+        if self.last_seq() == 0 {
+            return;
+        }
+        let Some((path, _)) = &self.file else { return };
+        let Some(dir) = path.parent() else { return };
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let entry = AnchorEntry {
+            session: self.session.clone(),
+            file: fname,
+            seq: self.last_seq(),
+            hash: self.prev_hash.clone(),
+            updated_ms: now_ms(),
+        };
+        if let Err(e) = save_anchor(dir, entry) {
+            self.write_error = Some(format!("anchor: {e}"));
+        } else {
+            self.anchor_dirty = false;
+        }
+    }
+
+    pub fn log_with_tick(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<serde_json::Value>, tick: Option<u64>) -> u64 {
+        let line = LogLine { seq: self.next_seq, ts: now_ms(), tick, cat: cat.to_string(), level, msg: msg.into(), data };
         let hash = chain_hash(&self.prev_hash, &line);
         if let Some((_, w)) = self.file.as_mut() {
             let fl = FileLine { line: line.clone(), prev: self.prev_hash.clone(), hash: hash.clone() };
@@ -127,7 +315,17 @@ impl AuditLog {
                 writeln!(w, "{s}").and_then(|_| w.flush()).map_err(|e| e.to_string())
             });
             if let Err(e) = res {
+                let err_msg = e.clone();
                 self.write_error = Some(e);
+                self.ring.push_back(LogLine {
+                    seq: self.next_seq,
+                    ts: now_ms(),
+                    tick,
+                    cat: "audit".into(),
+                    level: Level::Warn,
+                    msg: format!("감사 로그 쓰기 오류: {err_msg}"),
+                    data: None,
+                });
             }
         }
         self.prev_hash = hash;
@@ -137,7 +335,17 @@ impl AuditLog {
         while self.ring.len() > self.cap {
             self.ring.pop_front();
         }
+        self.anchor_dirty = true;
+        if self.file.is_some()
+            && (seq == 1 || seq % 16 == 0 || matches!(cat, "session_link" | "sds_seal" | "sds_purge" | "sds_prune" | "replay"))
+        {
+            self.sync_anchor();
+        }
         seq
+    }
+
+    pub fn log(&mut self, cat: &str, level: Level, msg: impl Into<String>, data: Option<serde_json::Value>) -> u64 {
+        self.log_with_tick(cat, level, msg, data, None)
     }
 
     pub fn info(&mut self, cat: &str, msg: impl Into<String>) -> u64 {
@@ -170,6 +378,14 @@ impl AuditLog {
             }
         }
         (out, next)
+    }
+}
+
+impl Drop for AuditLog {
+    fn drop(&mut self) {
+        if self.anchor_dirty && self.file.is_some() {
+            self.sync_anchor();
+        }
     }
 }
 
@@ -258,6 +474,42 @@ mod tests {
     }
 
     #[test]
+    fn the_audit_chain_links_sessions_and_seals_ledgers() {
+        let dir = tmpdir("seal_link");
+        let mut digests = BTreeMap::new();
+        digests.insert("body".to_string(), "aaa111".to_string());
+        {
+            let mut s1 = AuditLog::open(&dir, "s01", 64).unwrap();
+            s1.info("world", "first session");
+            s1.info("world", "second line");
+        }
+        let s2_path = {
+            let mut s2 = AuditLog::open(&dir, "s02", 64).unwrap();
+            s2.log("sds_seal", Level::Info, "seal", Some(serde_json::json!({"generation": "g1", "digests": digests})));
+            s2.path().unwrap().to_path_buf()
+        };
+        let rep = verify_dir(&dir, Some(&digests));
+        assert_eq!(rep.len(), 2);
+        assert!(rep[0].chain_ok && rep[0].anchor_ok == Some(true));
+        assert!(rep[1].chain_ok && rep[1].anchor_ok == Some(true) && rep[1].seal_ok == Some(true));
+        assert_eq!(rep[1].linked_from.as_deref(), Some("s01.jsonl"));
+
+        // External ledger edit -> seal_ok becomes false
+        let mut altered = digests.clone();
+        altered.insert("body".to_string(), "tampered".to_string());
+        let rep_edit = verify_dir(&dir, Some(&altered));
+        assert_eq!(rep_edit[1].seal_ok, Some(false), "external ledger edit must fail seal check");
+
+        // Tail truncation -> anchor_ok becomes false
+        let txt = std::fs::read_to_string(&s2_path).unwrap();
+        let first_line = txt.lines().next().unwrap().to_string() + "\n";
+        std::fs::write(&s2_path, first_line).unwrap();
+        let rep_trunc = verify_dir(&dir, Some(&digests));
+        assert_eq!(rep_trunc[1].anchor_ok, Some(false), "tail truncation must fail anchor check");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tail_is_incremental_and_filters_by_category() {
         let mut log = AuditLog::memory(100);
         for i in 0..10 {
@@ -305,6 +557,30 @@ mod tests {
         assert_eq!(second.line.cat, "vision");
         assert_eq!(second.line.data.unwrap()["tree"], 0.71);
         assert_eq!(second.line.level, Level::Debug);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audit_old_lines_still_verify() {
+        let dir = tmpdir("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("legacy.jsonl");
+        let body1 = r#"{"seq":1,"ts":1700000000000,"cat":"world","level":"info","msg":"legacy line 1"}"#;
+        let h1: String = Sha256::digest(format!("{GENESIS}|{body1}").as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let line1 = format!(r#"{{"seq":1,"ts":1700000000000,"cat":"world","level":"info","msg":"legacy line 1","prev":"{GENESIS}","hash":"{h1}"}}"#);
+        let body2 = r#"{"seq":2,"ts":1700000001000,"cat":"quest","level":"info","msg":"legacy line 2"}"#;
+        let h2: String = Sha256::digest(format!("{h1}|{body2}").as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let line2 = format!(r#"{{"seq":2,"ts":1700000001000,"cat":"quest","level":"info","msg":"legacy line 2","prev":"{h1}","hash":"{h2}"}}"#);
+        std::fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
+        let ok = verify_file(&path).expect("pre-tick audit file must verify");
+        assert_eq!(ok.lines, 2);
+        assert_eq!(ok.last_hash, h2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

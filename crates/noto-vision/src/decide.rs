@@ -1,4 +1,4 @@
-use noto_ts::{forecast, Predictor};
+use noto_ts::{forecast, Pos2Filter, Pos2Model, Pos2Obs, Predictor, CHI2_2DOF_99, POS2_RING_CAP};
 use serde::{Deserialize, Serialize};
 
 use crate::camera::{wrap_angle, Pose};
@@ -101,6 +101,12 @@ pub struct DecisionReport {
     pub prediction: Option<Prediction>,
     pub forecast_method: String,
     pub band: Option<[f32; 4]>,
+    #[serde(default)]
+    pub cov: Option<[f32; 3]>,
+    #[serde(default)]
+    pub pos_model: Option<String>,
+    #[serde(default)]
+    pub realized_pos_err: Option<(f32, f32)>,
     pub note: String,
 }
 
@@ -109,6 +115,7 @@ pub struct Decider {
     rays: Vec<Sighting>,
     est_x: Vec<f64>,
     est_z: Vec<f64>,
+    pos2: Pos2Filter,
     last_fix: Option<Fix>,
     prediction: Option<Prediction>,
     side: f32,
@@ -118,7 +125,22 @@ pub struct Decider {
 
 impl Decider {
     pub fn new(cfg: DecideCfg) -> Decider {
-        Decider { cfg, rays: Vec::new(), est_x: Vec::new(), est_z: Vec::new(), last_fix: None, prediction: None, side: 1.0, lost: 0, turned_deg: 0.0 }
+        Decider {
+            cfg,
+            rays: Vec::new(),
+            est_x: Vec::new(),
+            est_z: Vec::new(),
+            pos2: Pos2Filter::default(),
+            last_fix: None,
+            prediction: None,
+            side: 1.0,
+            lost: 0,
+            turned_deg: 0.0,
+        }
+    }
+
+    pub fn pos2(&self) -> &Pos2Filter {
+        &self.pos2
     }
 
     pub fn side(&self) -> f32 {
@@ -146,13 +168,42 @@ impl Decider {
         self.prediction = None;
     }
 
-    fn forecast_position(&self, extra: &[&dyn Predictor]) -> Option<(f32, f32, [f32; 4], String)> {
+    fn forecast_position(
+        &self,
+        at_tick: Option<u64>,
+        extra: &[&dyn Predictor],
+    ) -> Option<(f32, f32, [f32; 4], [f32; 3], String)> {
+        if let Some(est) = self.pos2.estimate(at_tick) {
+            let sigmas = CHI2_2DOF_99.sqrt();
+            let band = est.band_rect(sigmas, 0.0);
+            let method = match est.model {
+                Pos2Model::Static => "static_ivw".to_string(),
+                Pos2Model::Dynamic => {
+                    if self.est_x.len() >= 6 && !extra.is_empty() {
+                        let fx = forecast(&self.est_x, 1, extra, &[]);
+                        let fz = forecast(&self.est_z, 1, extra, &[]);
+                        let b = [fx.p10[0] as f32, fx.p90[0] as f32, fz.p10[0] as f32, fz.p90[0] as f32];
+                        return Some((fx.point[0] as f32, fz.point[0] as f32, b, est.cov, format!("dynamic:{}", fx.method)));
+                    }
+                    "dynamic_cv".to_string()
+                }
+            };
+            return Some((est.mean[0] as f32, est.mean[1] as f32, band, est.cov, method));
+        }
         if self.est_x.is_empty() {
             return None;
         }
         let fx = forecast(&self.est_x, 1, extra, &[]);
         let fz = forecast(&self.est_z, 1, extra, &[]);
-        Some((fx.point[0] as f32, fz.point[0] as f32, [fx.p10[0] as f32, fx.p90[0] as f32, fz.p10[0] as f32, fz.p90[0] as f32], fx.method))
+        let sx = ((fx.p90[0] - fx.p10[0]) * 0.5 / 1.2816).max(0.02) as f32;
+        let sz = ((fz.p90[0] - fz.p10[0]) * 0.5 / 1.2816).max(0.02) as f32;
+        Some((
+            fx.point[0] as f32,
+            fz.point[0] as f32,
+            [fx.p10[0] as f32, fx.p90[0] as f32, fz.p10[0] as f32, fz.p90[0] as f32],
+            [sx * sx, 0.0, sz * sz],
+            fx.method,
+        ))
     }
 
     pub fn observe(&mut self, pose: &Pose, sighting: Option<Sighting>, holonomic: bool, extra: &[&dyn Predictor], depth_scale: Option<f32>) -> DecisionReport {
@@ -166,6 +217,9 @@ impl Decider {
             prediction: None,
             forecast_method: String::new(),
             band: None,
+            cov: None,
+            pos_model: None,
+            realized_pos_err: None,
             note: String::new(),
         };
         let predicted = self.prediction.take();
@@ -181,11 +235,13 @@ impl Decider {
 
         let Some(s) = sighting else {
             self.lost += 1;
-            if let Some((x, z, band, method)) = self.forecast_position(extra) {
+            if let Some((x, z, band, cov, method)) = self.forecast_position(None, extra) {
                 let dist = (x - pose.x).hypot(z - pose.z);
                 let rel = wrap_angle((z - pose.z).atan2(x - pose.x) - pose.yaw).to_degrees();
-                rep.forecast_method = method;
+                rep.forecast_method = method.clone();
+                rep.pos_model = Some(method);
                 rep.band = Some(band);
+                rep.cov = Some(cov);
                 if self.lost == 1 && dist <= 1.8 {
                     let pitch_deg = calc_pitch(pose.eye_m, dist);
                     let turn_deg = if rel.abs() > 5.0 { rel } else { 0.0 };
@@ -228,11 +284,21 @@ impl Decider {
                 if let Some(d) = s.depth_range_m.filter(|_| scale_usable(&fix, &s)) {
                     rep.depth_scale = Some(fix.range_m / d);
                 }
-                if let Some((x, z, band, _)) = self.forecast_position(extra) {
-                    let w = self.cfg.band_widen_sigma * fix.sigma_m;
-                    let outside = fix.x < band[0] - w || fix.x > band[1] + w || fix.z < band[2] - w || fix.z > band[3] + w;
-                    if outside && self.est_x.len() >= 2 {
-                        rep.note = format!("새 측량점이 예측 띠 밖 ({:.1}, {:.1}) vs ({x:.1}, {z:.1})", fix.x, fix.z);
+                let obs_sigma = fix.sigma_m.max(0.02) as f64;
+                if let Some(est) = self.pos2.estimate(Some(s.keyframe as u64)) {
+                    rep.realized_pos_err = Some((fix.x - est.mean[0] as f32, fix.z - est.mean[1] as f32));
+                    if self.pos2.len() >= 2 && !est.accepts(fix.x as f64, fix.z as f64, obs_sigma) {
+                        let d2 = est.mahalanobis_sq(fix.x as f64, fix.z as f64, obs_sigma);
+                        rep.note = format!(
+                            "새 측량점이 99% 타원 밖 d²={d2:.2} > 9.21 ({:.1}, {:.1}) vs ({:.1}, {:.1})",
+                            fix.x, fix.z, est.mean[0], est.mean[1]
+                        );
+                        rep.band = Some(est.band_rect(CHI2_2DOF_99.sqrt(), obs_sigma));
+                        rep.cov = Some(est.cov);
+                        rep.pos_model = Some(match est.model {
+                            Pos2Model::Static => "static_ivw".into(),
+                            Pos2Model::Dynamic => "dynamic_cv".into(),
+                        });
                         rep.fix = Some(fix);
                         self.rays.clear();
                         self.rays.push(s);
@@ -240,8 +306,13 @@ impl Decider {
                         return rep;
                     }
                 }
+                self.pos2.push(Pos2Obs { x: fix.x as f64, z: fix.z as f64, sigma_m: obs_sigma, tick: s.keyframe as u64 });
                 self.est_x.push(fix.x as f64);
                 self.est_z.push(fix.z as f64);
+                if self.est_x.len() > POS2_RING_CAP {
+                    self.est_x.remove(0);
+                    self.est_z.remove(0);
+                }
                 self.last_fix = Some(fix.clone());
                 rep.fix = Some(fix);
             }
@@ -289,11 +360,13 @@ impl Decider {
             return rep;
         }
 
-        let (x, z, band, method) = self.forecast_position(extra).expect("a good fix implies a series");
+        let (x, z, band, cov, method) = self.forecast_position(Some(s.keyframe as u64), extra).expect("a good fix implies a series");
         let sigma = good.map(|f| f.sigma_m).unwrap_or(1.0);
         let range = (x - pose.x).hypot(z - pose.z);
-        rep.forecast_method = method;
+        rep.forecast_method = method.clone();
+        rep.pos_model = Some(method);
         rep.band = Some(band);
+        rep.cov = Some(cov);
         rep.estimate = Some(Estimate { x, z, range_m: range, sigma_m: sigma, source: if self.est_x.len() > 1 { "forecast".into() } else { "triangulation".into() } });
         if range <= self.cfg.reach_m + 0.25 {
             let look_pitch_deg = calc_pitch(pose.eye_m, range);
@@ -321,7 +394,7 @@ impl Decider {
 
     pub fn predict(&mut self, pose: &Pose, extra: &[&dyn Predictor], extra_sigma_m: f32) -> Option<DecisionReport> {
         let good = self.last_fix.clone().filter(|f| f.sigma_m <= (self.cfg.max_sigma_frac * f.range_m).max(0.25))?;
-        let (x, z, band, method) = self.forecast_position(extra)?;
+        let (x, z, band, cov, method) = self.forecast_position(None, extra)?;
         let sigma = good.sigma_m.hypot(extra_sigma_m);
         let range = (x - pose.x).hypot(z - pose.z);
         let mut rep = DecisionReport {
@@ -332,8 +405,11 @@ impl Decider {
             depth_scale: None,
             residual_deg: None,
             prediction: None,
-            forecast_method: method,
+            forecast_method: method.clone(),
             band: Some(band),
+            cov: Some(cov),
+            pos_model: Some(method),
+            realized_pos_err: None,
             note: String::new(),
         };
         self.prediction = None;
@@ -511,5 +587,37 @@ mod tests {
             .collect();
         let fix = triangulate(&wide, 6.0).unwrap();
         assert!(scale_usable(&fix, &tree), "the same tree from 4 m of baseline ({fix:?})");
+    }
+
+    #[test]
+    fn a_still_target_uses_the_weighted_mean() {
+        let mut d = Decider::new(DecideCfg::default());
+        // Seed 3 static fixes with different variances and verify inverse-variance weighted mean within 1e-6.
+        let obs = [
+            Pos2Obs { x: 6.00, z: 2.00, sigma_m: 0.20, tick: 1 },
+            Pos2Obs { x: 6.10, z: 2.04, sigma_m: 0.10, tick: 2 },
+            Pos2Obs { x: 5.96, z: 1.98, sigma_m: 0.05, tick: 3 },
+        ];
+        for o in obs {
+            d.pos2.push(o);
+            d.est_x.push(o.x);
+            d.est_z.push(o.z);
+        }
+        let est = d.pos2.estimate(Some(4)).unwrap();
+        let wsum: f64 = obs.iter().map(|o| 1.0 / (o.sigma_m * o.sigma_m)).sum();
+        let wx: f64 = obs.iter().map(|o| o.x / (o.sigma_m * o.sigma_m)).sum::<f64>() / wsum;
+        let wz: f64 = obs.iter().map(|o| o.z / (o.sigma_m * o.sigma_m)).sum::<f64>() / wsum;
+        assert!((est.mean[0] - wx).abs() < 1e-6, "mean x {} != {wx}", est.mean[0]);
+        assert!((est.mean[1] - wz).abs() < 1e-6, "mean z {} != {wz}", est.mean[1]);
+        assert!(!est.accepts(9.5, 5.5, 0.10), "d² > 9.21 outlier must be rejected");
+
+        // Verify Decider::observe emits Hold { reason: "band" } on a triangulated outlier (d² > 9.21).
+        let p0 = Pose { x: 0.0, z: 0.0, yaw: 0.0, eye_m: 0.5 };
+        let p1 = Pose { x: 0.0, z: 2.5, yaw: 0.0, eye_m: 0.5 };
+        let outlier = (9.5, 5.5);
+        let _ = d.observe(&p0, Some(sight(10, p0, outlier, 9)), true, &[], None);
+        let rep = d.observe(&p1, Some(sight(11, p1, outlier, 9)), true, &[], None);
+        assert_eq!(rep.decision, Decision::Hold { reason: "band".into() }, "{rep:?}");
+        assert!(rep.cov.is_some());
     }
 }

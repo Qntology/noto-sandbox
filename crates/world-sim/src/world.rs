@@ -44,7 +44,13 @@ pub const TURN_RATE_RAD_S: f32 = 1.2;
 const FACE_DONE_RAD: f32 = 0.03;
 pub const TWO_ARM_LIFT_FACTOR: f32 = 1.5;
 pub const ACCEL_TIME_S: f32 = 0.5;
-const BALANCE_RESAMPLE_TICKS: u64 = 50;
+const SENSE_ACCEL_TAU_S: f32 = 0.08;
+const REST_SPEED_MPS: f32 = 1e-3;
+const REST_MIN_S: f32 = ACCEL_TIME_S;
+const SENSE_SLOPE_ON_DEG: f32 = 3.0;
+const SENSE_ACCEL_ON: f32 = 0.15;
+const SENSE_ACCEL_OFF: f32 = 0.075;
+pub const BALANCE_RESAMPLE_TICKS: u64 = 50;
 pub const DROP_TIME_S: f32 = 1.0;
 pub const DROP_AHEAD_M: f32 = 0.45;
 pub const AMOUNT_EPS: f32 = 1e-3;
@@ -80,6 +86,28 @@ impl Default for WorldConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StanceSupport {
+    #[default]
+    Double,
+    Single,
+    Wheels,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct BodySense {
+    pub speed_mps: f32,
+    pub accel_meas_mps2: f32,
+    pub accel_plan_mps2: f32,
+    pub pitch_deg: f32,
+    pub roll_deg: f32,
+    pub support: StanceSupport,
+    pub rest_s: f32,
+    pub cargo_use_ratio: f32,
+    pub cargo_accel_body: [f32; 2],
+}
+
 #[derive(Clone, Debug)]
 pub struct BalanceEvent {
     pub tick: u64,
@@ -88,6 +116,7 @@ pub struct BalanceEvent {
     pub report: BalanceReport,
     pub dynamics: Option<DynDigest>,
     pub posture: Posture,
+    pub sense: BodySense,
 }
 
 #[derive(Clone, Debug)]
@@ -408,6 +437,14 @@ pub struct World {
     /// The sub-worker standing in for the first worker in the motion code this moment, and the robots it must miss.
     pub(crate) crew_turn: Option<u32>,
     pub(crate) turn_others: Vec<traffic::RobotOutline>,
+    prev_speed: f32,
+    accel_meas: f32,
+    rest_s: f32,
+    start_armed: bool,
+    brake_latched: bool,
+    /// Enables monotonic forecast-based tightening in cargo/step/brake motion caps (Phase 3 – Part 3 · D4/D6).
+    /// Defaults to `false` (Cold trust) so deterministic baseline trajectories remain bit-identical.
+    pub forecast_control: bool,
 }
 
 impl Clone for World {
@@ -459,6 +496,12 @@ impl Clone for World {
             stride: self.stride.clone(),
             crew_turn: self.crew_turn,
             turn_others: self.turn_others.clone(),
+            prev_speed: self.prev_speed,
+            accel_meas: self.accel_meas,
+            rest_s: self.rest_s,
+            start_armed: self.start_armed,
+            brake_latched: self.brake_latched,
+            forecast_control: self.forecast_control,
         }
     }
 }
@@ -762,6 +805,12 @@ impl World {
             stride: Stride::default(),
             crew_turn: None,
             turn_others: Vec::new(),
+            prev_speed: 0.0,
+            accel_meas: 0.0,
+            rest_s: REST_MIN_S,
+            start_armed: true,
+            brake_latched: false,
+            forecast_control: false,
         })
     }
 
@@ -797,6 +846,11 @@ impl World {
         self.last_posture = Posture::quiet(self.carried_kg());
         self.fallen_until = None;
         self.gaze = None;
+        self.prev_speed = 0.0;
+        self.accel_meas = 0.0;
+        self.rest_s = REST_MIN_S;
+        self.start_armed = true;
+        self.brake_latched = false;
     }
 
     pub fn grasp_info(&self, item: ItemKind) -> &GraspInfo {
@@ -1346,6 +1400,32 @@ impl World {
         self.odom.update(before, after, dt, self.odom_over);
         self.odom_over = 0.0;
         self.eye.advance(before, after, dt);
+        let raw_a = (self.agent.speed_mps - self.prev_speed) / dt.max(1e-6);
+        let keep = (dt / (SENSE_ACCEL_TAU_S + dt)).clamp(0.0, 1.0);
+        self.accel_meas += keep * (raw_a - self.accel_meas);
+        self.prev_speed = self.agent.speed_mps;
+        if self.agent.speed_mps <= REST_SPEED_MPS {
+            self.rest_s += dt;
+            if self.rest_s >= REST_MIN_S {
+                self.start_armed = true;
+            }
+            self.brake_latched = false;
+        } else {
+            self.rest_s = 0.0;
+            if self.accel_meas < SENSE_ACCEL_OFF && self.agent.speed_mps > 0.15 {
+                self.start_armed = false;
+            }
+            if self.brake_latched {
+                if self.accel_meas > -SENSE_ACCEL_OFF {
+                    self.brake_latched = false;
+                }
+            } else if self.accel_meas <= -SENSE_ACCEL_ON {
+                self.brake_latched = true;
+            }
+        }
+        if events.iter().any(|e| matches!(e.event, WorldEvent::Hold { worker: 1, .. })) {
+            self.start_armed = true;
+        }
         if !self.crew.is_empty() {
             self.step_crew(dt, &mut events);
         }
@@ -1815,17 +1895,129 @@ impl World {
         (Posture { ground: self.ground_here().surface(), ..post }, state)
     }
 
+    fn slope_bucket(deg: f32, step: f32) -> String {
+        if step > 0.0 {
+            "step".into()
+        } else if deg.abs() < SENSE_SLOPE_ON_DEG {
+            "flat".into()
+        } else {
+            format!("{}_{}", if deg > 0.0 { "up" } else { "down" }, if deg.abs() < 10.0 { "lo" } else { "hi" })
+        }
+    }
+
+    fn sense_from(&self, post_raw: &Posture) -> BodySense {
+        let (pitch_rad, roll_rad) = self.chassis_attitude(self.agent.x, self.agent.z, self.agent.yaw);
+        let accel_plan_mps2 = if post_raw.source == Source::Accel { post_raw.accel_mps2 } else { 0.0 };
+        let support = if !self.body.legged() {
+            StanceSupport::Wheels
+        } else if post_raw.single_support && self.rest_s < REST_MIN_S {
+            StanceSupport::Single
+        } else {
+            StanceSupport::Double
+        };
+        BodySense {
+            speed_mps: self.agent.speed_mps,
+            accel_meas_mps2: self.accel_meas,
+            accel_plan_mps2,
+            pitch_deg: pitch_rad.to_degrees(),
+            roll_deg: roll_rad.to_degrees(),
+            support,
+            rest_s: self.rest_s,
+            cargo_use_ratio: self.ride.use_ratio,
+            cargo_accel_body: self.ride.accel_body(),
+        }
+    }
+
+    /// Physical kinematic and terrain sensing snapshot of the primary body (pure Group A physics).
+    pub fn sense(&self) -> BodySense {
+        let (post_raw, _) = self.posture_action();
+        self.sense_from(&post_raw)
+    }
+
+    /// Measured posture for balance updates and live analysis: augments `posture_now()` with
+    /// chassis pitch during work/idle, rest detection during holds, and measured start/brake acceleration.
+    pub fn posture_scored(&self) -> (Posture, String, BodySense) {
+        let (mut post, mut state) = self.posture_now();
+        let mut sense = self.sense_from(&post);
+        match &self.active {
+            Some((_, Active::Move(m))) => {
+                if self.rest_s >= REST_MIN_S {
+                    post.moving = false;
+                    post.single_support = false;
+                    post.accel_mps2 = 0.0;
+                    let deg = if post.slope_deg.abs() >= SENSE_SLOPE_ON_DEG { post.slope_deg } else { sense.pitch_deg };
+                    post.slope_deg = deg;
+                    if deg.abs() >= SENSE_SLOPE_ON_DEG {
+                        post.source = Source::Slope;
+                    } else {
+                        post.source = if post.cargo_kg > 0.0 { Source::CarryFront } else { Source::Quiet };
+                    }
+                    let b = Self::slope_bucket(deg, 0.0);
+                    state = format!("{b}|hold");
+                    if self.body.legged() {
+                        sense.support = StanceSupport::Double;
+                    }
+                } else if m.pause_left <= 0.0 {
+                    let meas = sense.accel_meas_mps2;
+                    let b = Self::slope_bucket(post.slope_deg, 0.0);
+                    if self.start_armed && meas >= SENSE_ACCEL_ON {
+                        post.source = Source::Accel;
+                        post.accel_mps2 = meas;
+                        post.single_support = false;
+                        state = format!("{b}|move");
+                    } else if self.brake_latched || meas <= -SENSE_ACCEL_ON {
+                        post.source = Source::Accel;
+                        post.accel_mps2 = meas.min(-SENSE_ACCEL_OFF);
+                        post.single_support = false;
+                        state = format!("{b}|brake");
+                    } else if post.source == Source::Accel {
+                        post.accel_mps2 = 0.0;
+                        if self.body.legged() {
+                            post.source = Source::FootLift;
+                            post.single_support = true;
+                        } else if post.cargo_kg > 0.0 {
+                            post.source = Source::CarryFront;
+                        } else if post.slope_deg.abs() >= SENSE_SLOPE_ON_DEG {
+                            post.source = Source::Slope;
+                        } else {
+                            post.source = Source::Quiet;
+                        }
+                        state = format!("{b}|move");
+                    }
+                }
+            }
+            Some((_, Active::Work(w))) => {
+                post.slope_deg = sense.pitch_deg;
+                let b = Self::slope_bucket(sense.pitch_deg, 0.0);
+                let act = state.splitn(2, '|').nth(1).unwrap_or("work");
+                state = format!("{b}|{act}");
+                if matches!(w.kind, WorkKind::Look { .. }) && sense.pitch_deg.abs() >= SENSE_SLOPE_ON_DEG {
+                    post.source = Source::Slope;
+                    post.moving = false;
+                }
+            }
+            Some((_, Active::Push(_))) => {
+                post.slope_deg = sense.pitch_deg;
+                let b = Self::slope_bucket(sense.pitch_deg, 0.0);
+                state = format!("{b}|push");
+            }
+            _ => {
+                post.slope_deg = sense.pitch_deg;
+                let b = Self::slope_bucket(sense.pitch_deg, 0.0);
+                let act = state.splitn(2, '|').nth(1).unwrap_or("idle");
+                state = format!("{b}|{act}");
+                if sense.pitch_deg.abs() >= SENSE_SLOPE_ON_DEG {
+                    post.source = Source::Slope;
+                    post.moving = false;
+                }
+            }
+        }
+        (post, state, sense)
+    }
+
     fn posture_action(&self) -> (Posture, String) {
         let cargo = self.carried_kg();
-        let bucket = |deg: f32, step: f32| -> String {
-            if step > 0.0 {
-                "step".into()
-            } else if deg.abs() < 3.0 {
-                "flat".into()
-            } else {
-                format!("{}_{}", if deg > 0.0 { "up" } else { "down" }, if deg.abs() < 10.0 { "lo" } else { "hi" })
-            }
-        };
+        let bucket = Self::slope_bucket;
         match &self.active {
             Some((_, Active::Move(m))) => {
                 let Some(e) = m.edges.get(m.idx) else { return (Posture::quiet(cargo), "flat|move".into()) };
@@ -1874,7 +2066,7 @@ impl World {
     }
 
     fn update_balance(&mut self, dt: f32) {
-        let (post, state) = self.posture_now();
+        let (post, state, sense) = self.posture_scored();
         let grip = match &self.active {
             Some((_, Active::Work(WorkState { kind: WorkKind::Pick { drop, .. }, .. }))) => self.drop_item(*drop).map(|d| self.grip_capacity_for(d.kind, d.amount)),
             _ => None,
@@ -1884,7 +2076,7 @@ impl World {
         for j in &rep.joints {
             let Some(act) = self.joint_actuator(&j.joint) else { continue };
             let h = self.heat.entry(j.joint.clone()).or_insert(0.0);
-            *h += (dt / act.thermal_tau_s).min(1.0) * (j.effort * j.effort - *h);
+            *h = noto_core::wear::heat_step(*h, j.effort, dt, act.thermal_tau_s);
             *self.wear.entry(j.joint.clone()).or_insert(0.0) += noto_core::wear::damage(&act, j.torque_nm, dt);
         }
         let key = format!("{}|{state}", post.source.id());
@@ -1901,10 +2093,14 @@ impl World {
         if changed || self.tick.saturating_sub(self.balance_since) >= BALANCE_RESAMPLE_TICKS {
             self.balance_since = self.tick;
             if self.balance_events.len() < 2000 {
-                self.balance_events.push(BalanceEvent { tick: self.tick, time_s: self.time_s, state: state.clone(), report: rep.clone(), dynamics: digest, posture: post });
+                self.balance_events.push(BalanceEvent { tick: self.tick, time_s: self.time_s, state: state.clone(), report: rep.clone(), dynamics: digest, posture: post, sense });
             }
         }
         self.balance = Some((key, rep));
+    }
+
+    pub fn latest_balance(&self) -> Option<&BalanceReport> {
+        self.balance.as_ref().map(|(_, r)| r)
     }
 
     pub fn body_pose(&self) -> Option<BodyPose> {
@@ -1947,6 +2143,33 @@ impl World {
 
     pub fn most_worn(&self) -> Option<(String, f32)> {
         self.wear.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, v)| (k.clone(), *v))
+    }
+
+    /// Closed-form time (s) until `joint` reaches thermal continuous rating `1.0` under constant `e2 = effort²`
+    /// (Phase 3 – Part 3 · D5). Matches discrete EMA `h += (dt/tau)(e2 - h)` within 1 tick.
+    pub fn heat_crossing_s(&self, joint: &str, e2: f32) -> Option<f32> {
+        let act = self.joint_actuator(joint)?;
+        let h0 = self.heat.get(joint).copied().unwrap_or(0.0);
+        if h0 >= 1.0 {
+            return Some(0.0);
+        }
+        if e2 <= 1.0 + 1e-6 || act.thermal_tau_s <= 0.0 {
+            return None;
+        }
+        let ratio = (e2 - h0) / (e2 - 1.0);
+        if ratio <= 1.0 {
+            Some(0.0)
+        } else {
+            Some(act.thermal_tau_s * ratio.ln())
+        }
+    }
+
+    /// Effective stopping distance including reaction delay: `v² / (2 * a_eff) + v * REACTION_DELAY_S`
+    /// (Phase 3 – Part 3 · D4).
+    pub fn braking_distance_eff_m(&self, speed_mps: f32, a_eff: f32) -> f32 {
+        let v = speed_mps.max(0.0);
+        let a = a_eff.max(0.3);
+        (v * v) / (2.0 * a) + v * noto_core::balance::REACTION_DELAY_S
     }
 
     pub fn balance_summary(&self) -> Option<BalanceSummary> {
@@ -2457,7 +2680,7 @@ mod tests {
         mine_nearest(&mut w, NodeKind::Tree);
         let events = w.take_balance_events();
         let raise = events.iter().find(|e| e.report.source == Source::ArmRaise).expect("an arm-raise state");
-        assert_eq!(raise.state, "flat|mine");
+        assert!(raise.state.ends_with("|mine"), "expected *|mine, got {}", raise.state);
         assert!(raise.report.couplings.iter().any(|c| c.target == noto_core::Segment::Foot));
         let mut cold = world_with(BodyPlan { arm: noto_core::Tier::Budget, ..BodyPlan::default() }, BaseKind::Track);
         cold.heat.insert("elbow_r".into(), 2.0);

@@ -11,6 +11,47 @@ impl Runtime {
     pub(crate) fn record_bench_sds(&mut self, events: &[TimedEvent]) {
         self.record_contact_sds(events);
         self.record_coop_sds(events);
+        self.record_world_event_sds(events);
+    }
+
+    /// WorldEvent physics adapter (Phase 2 – Part 3 · D3): Report-only Track::Act scopes.
+    pub(crate) fn record_world_event_sds(&mut self, events: &[TimedEvent]) {
+        let form = noto_core::bench::form_id(&self.world.body);
+        let sds = self.active_sds_mut();
+        for e in events {
+            match &e.event {
+                WorldEvent::Bump { peak_n, a_g, fell, .. } => {
+                    let sc = Scope::new(Track::Act, "world:bump", &form);
+                    sds.record_baseline(&sc, "peak_n", *peak_n as f64);
+                    sds.record_baseline(&sc, "a_g", *a_g as f64);
+                    sds.record_agreement(&sc, "ok", !*fell);
+                }
+                WorldEvent::Hold { gap_m, .. } => {
+                    let sc = Scope::new(Track::Act, "world:hold", &form);
+                    sds.record_baseline(&sc, "gap_m", *gap_m as f64);
+                }
+                WorldEvent::CargoSlip { shift_m, use_ratio, .. } => {
+                    let sc = Scope::new(Track::Act, "world:cargo_slip", &form);
+                    sds.record_baseline(&sc, "shift_m", *shift_m as f64);
+                    sds.record_baseline(&sc, "use_ratio", *use_ratio as f64);
+                }
+                WorldEvent::CargoLost { .. } => {
+                    let sc = Scope::new(Track::Act, "world:cargo_lost", &form);
+                    sds.record_agreement(&sc, "ok", false);
+                }
+                WorldEvent::StepSeen { height_m, .. } => {
+                    let sc = Scope::new(Track::Act, "world:step_seen", &form);
+                    sds.record_baseline(&sc, "height_m", *height_m as f64);
+                }
+                WorldEvent::StepTaken { height_m, a_z, .. } => {
+                    let sc = Scope::new(Track::Act, "world:step_taken", &form);
+                    sds.record_baseline(&sc, "height_m", *height_m as f64);
+                    sds.record_baseline(&sc, "a_z", *a_z as f64);
+                    sds.record_agreement(&sc, "ok", true);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn record_contact_sds(&mut self, events: &[TimedEvent]) {
@@ -32,10 +73,11 @@ impl Runtime {
 
     fn record_moment(&mut self, primary: &str, ok: bool, value: Option<f32>) {
         let form = noto_core::bench::form_id(&self.world.body);
-        self.sds.record_agreement(&Scope::new(Track::Act, primary, &form), "ok", ok);
+        let ground = self.world.ground_here().id();
+        let sds = self.active_sds_mut();
+        sds.record_agreement(&Scope::new(Track::Act, primary, &form), "ok", ok);
         if let Some(v) = value {
-            let ground = self.world.ground_here().id();
-            self.sds.record_baseline(&Scope::new(Track::Act, &format!("{primary}:ts"), ground), "value", v as f64);
+            sds.record_baseline(&Scope::new(Track::Act, &format!("{primary}:ts"), ground), "value", v as f64);
         }
     }
 }

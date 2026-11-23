@@ -96,6 +96,7 @@ pub trait Recognizer: Send {
     }
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput>;
     fn set_noise(&mut self, _noise: &NoiseCfg) {}
+    fn reset(&mut self) {}
 }
 
 #[derive(Clone, Debug, Default)]
@@ -367,6 +368,10 @@ impl Recognizer for OraclePerception {
 
     fn set_noise(&mut self, noise: &NoiseCfg) {
         OraclePerception::set_noise(self, noise.clone());
+    }
+
+    fn reset(&mut self) {
+        self.rng = Rng::new(self.noise.seed);
     }
 
     fn scan(&mut self, input: ScanInput<'_>) -> Result<ScanOutput> {

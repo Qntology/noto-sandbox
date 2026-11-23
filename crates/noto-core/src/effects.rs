@@ -360,7 +360,7 @@ pub fn cells(body: &Body, s: &FxScenario, p: &Probe) -> Vec<FxCell> {
     }
     v.push(cell(Effect::JointLoad, "peak_ratio", Some(p.peak_ratio), Rule::AtMost { limit: 1.0 }, CITE_SIZING));
     v.push(cell(Effect::JointLoad, "rms_over_cont", Some(p.effort), Rule::AtMost { limit: 1.0 }, CITE_SIZING));
-    let ctx = RefCtx { load_ratio: 0.0, load_dist_m: 0.0, slope_deg: s.slope_deg };
+    let ctx = RefCtx { load_ratio: 0.0, load_dist_m: 0.0, slope_deg: s.slope_deg, single_support: false };
     let limb_ref = match s.task {
         Task::Mine { .. } => reference(Source::ArmRaise, Segment::Arm, "peak_ratio", &ctx),
         Task::Travel if p.single_support => reference(Source::FootLift, Segment::Leg, "peak_ratio", &ctx),

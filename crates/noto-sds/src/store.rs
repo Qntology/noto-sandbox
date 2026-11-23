@@ -1,11 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::scope::{ring_for_key, Ledger, Scope, Track};
-use crate::stats::{decay_shape, ConfusionStat, GateStat, ScopeStat, Welford};
+use crate::catalog::ContactLog;
+use crate::estimate::{effective_n, factor_ci, mean_ci, spread_ci, wilson_ci};
+use crate::schema::{chain_keys, validate_key};
+use crate::scope::{key_depth, ring_for_key, track_of_key, AxisKind, Ledger, Scope, ScopeKey, Track, Window};
+use crate::stats::{decay_shape, ConfusionStat, DriftState, GateStat, ScopeStat, Temporal, Welford};
 
 pub const SDS_RECIPE: &str = "noto-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic";
 const SDS_RECIPE_LEGACY: &str = "hand-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic";
@@ -154,6 +159,66 @@ pub struct LedgerStatus {
     pub engine_revs: Vec<String>,
 }
 
+/// How an [`SdsEstimate`] was resolved along the hierarchy (Phase 2 – Part 2 · D3/D4/D5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Level {
+    #[default]
+    Exact,
+    Pooled {
+        borrowed: f64,
+    },
+    Mixed,
+}
+
+/// Uncertainty-aware SDS read result (Phase 2 – Part 2 · D3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SdsEstimate {
+    pub value: f64,
+    pub se: f64,
+    pub lo: f64,
+    pub hi: f64,
+    pub n: u64,
+    pub n_eff: f64,
+    pub rho: f64,
+    pub window: Window,
+    pub key: String,
+    pub level: Level,
+    pub state: DriftState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thin: Option<String>,
+}
+
+/// Generation metadata persisted in `sds/index.json` (Phase 2 – Part 3 · D2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenerationEntry {
+    pub id: String,
+    pub parent: Option<String>,
+    pub engine_rev: String,
+    pub engine_fp: String,
+    pub inherit: String,
+    pub created_ms: i64,
+    pub recipe: String,
+    pub observations: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GenIndex {
+    pub current: Option<String>,
+    #[serde(default)]
+    pub generations: Vec<GenerationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenStatus {
+    pub current: Option<String>,
+    pub parent: Option<String>,
+    pub inherit: String,
+    pub generations: Vec<GenerationEntry>,
+    pub archive_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxisStatus {
     pub scope: String,
@@ -164,6 +229,24 @@ pub struct AxisStatus {
     pub sd: f64,
     pub recent: f64,
     pub drift_z: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<Window>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n_eff: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rho: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lo: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<DriftState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seeded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axis_kind: Option<AxisKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -251,30 +334,276 @@ fn sanitize_label(raw: &str) -> String {
 
 pub struct SdsStore {
     dir: Option<PathBuf>,
+    root_dir: Option<PathBuf>,
+    generation_id: Option<String>,
+    parent_generation: Option<String>,
+    inherit_mode: String,
     bases: HashMap<Ledger, SdsFile>,
     runs: HashMap<Ledger, RunBuf>,
     dirty: HashSet<Ledger>,
     write_tick: u32,
+    rev: u64,
     last_flush: Option<Instant>,
     log: Vec<String>,
     cap_bytes: usize,
     engine_rev: String,
     policies: HashMap<Track, ScopePolicy>,
+    contacts: Option<Mutex<ContactLog>>,
+    drift_transitions: Vec<(String, String, DriftState, DriftState)>,
+}
+
+/// Event-scoped batch writer deduplicating upstream scope keys so multi-match events
+/// (e.g. S1/slope + S6/slope) count once at shared ancestor scopes (Phase 2 – Part 1 · D2).
+pub struct Batch<'a> {
+    store: &'a mut SdsStore,
+    seen_baseline: HashSet<(String, String)>,
+    seen_agreement: HashSet<(String, String)>,
+    seen_extrema: HashSet<(String, String)>,
+}
+
+impl<'a> Batch<'a> {
+    pub fn record_baseline(&mut self, scope: &Scope, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        self.store.note_write(scope, axis);
+        let keys: Vec<String> = scope
+            .write_keys()
+            .into_iter()
+            .filter(|k| self.seen_baseline.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_baseline(scope.track, &keys, axis, value);
+    }
+
+    pub fn record_agreement(&mut self, scope: &Scope, axis: &str, agreed: bool) {
+        self.store.note_write(scope, axis);
+        let keys: Vec<String> = scope
+            .write_keys()
+            .into_iter()
+            .filter(|k| self.seen_agreement.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_agreement(scope.track, &keys, axis, agreed);
+    }
+
+    pub fn record_extrema(&mut self, scope: &Scope, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        let keys: Vec<String> = scope
+            .write_keys()
+            .into_iter()
+            .filter(|k| self.seen_extrema.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_extrema(scope.track, &keys, axis, value);
+    }
+
+    pub fn record_v2_baseline(&mut self, key: &ScopeKey, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let keys: Vec<String> = chain_keys(key)
+            .into_iter()
+            .filter(|k| self.seen_baseline.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_baseline(key.track, &keys, axis, value);
+    }
+
+    pub fn record_v2_agreement(&mut self, key: &ScopeKey, axis: &str, agreed: bool) {
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let keys: Vec<String> = chain_keys(key)
+            .into_iter()
+            .filter(|k| self.seen_agreement.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_agreement(key.track, &keys, axis, agreed);
+    }
+
+    pub fn record_v2_extrema(&mut self, key: &ScopeKey, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let keys: Vec<String> = chain_keys(key)
+            .into_iter()
+            .filter(|k| self.seen_extrema.insert((k.clone(), axis.to_string())))
+            .collect();
+        self.store.write_keys_extrema(key.track, &keys, axis, value);
+    }
+
+    pub fn record_v2_gates(&mut self, key: &ScopeKey, items: &[(String, u8, bool, bool)]) {
+        if items.is_empty() {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let keys: Vec<String> = chain_keys(key)
+            .into_iter()
+            .filter(|k| self.seen_baseline.insert((k.clone(), "__gates__".to_string())))
+            .collect();
+        let ledger = key.track.ledger();
+        let ring = key.track.ring_len();
+        let run = self.store.open_run(ledger, key.track.as_str());
+        for k in keys {
+            let s = run.scopes.entry(k).or_default();
+            for (id, sev, blocked, sole) in items {
+                let g: &mut GateStat = s.gates.entry(id.clone()).or_default();
+                g.evaluated += 1;
+                if *blocked {
+                    g.blocked += 1;
+                }
+                if *sole {
+                    g.sole += 1;
+                }
+                g.severity.push(*sev as f64, ring);
+            }
+            s.updated_at = now_ms();
+        }
+        self.store.finish_write(ledger);
+    }
+
+    pub fn record_v2_transition(&mut self, key: &ScopeKey, from: &str, to: &str) {
+        if from.is_empty() || to.is_empty() {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let tkey = format!("{from}>{to}");
+        let keys: Vec<String> = chain_keys(key)
+            .into_iter()
+            .filter(|k| self.seen_baseline.insert((k.clone(), format!("__tr:{tkey}"))))
+            .collect();
+        let ledger = key.track.ledger();
+        let run = self.store.open_run(ledger, key.track.as_str());
+        for k in keys {
+            let s = run.scopes.entry(k).or_default();
+            *s.transition.entry(tkey.clone()).or_insert(0) += 1;
+            s.updated_at = now_ms();
+        }
+        self.store.finish_write(ledger);
+    }
+
+    /// Record reference cell detail only on the schema's `detail_rungs` (e.g. `+ph` and `+form`),
+    /// avoiding 7× write amplification at global/root rungs (Phase 2 – Part 1 · D2).
+    pub fn record_v2_reference_detail(&mut self, key: &ScopeKey, axis: &str, value: f64, reference: f64, tolerance: f64) {
+        if !value.is_finite() || !reference.is_finite() || !(tolerance.is_finite() && tolerance > 0.0) {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let all = chain_keys(key);
+        let detail_indices = crate::schema::schema_for(key.track, &key.subject).detail_rungs;
+        // `chain_keys` prepends `[track/, track/subject, ...rungs]`; rung `r` is at index `r + 1`.
+        let mut keys = Vec::new();
+        for &r in detail_indices {
+            if let Some(k) = all.get(r + 1) {
+                if self.seen_baseline.insert((k.clone(), format!("__ref:{axis}"))) {
+                    keys.push(k.clone());
+                }
+            }
+        }
+        if keys.is_empty() {
+            return;
+        }
+        let dev = (value - reference) / tolerance;
+        let abs = dev.abs();
+        self.store.write_keys_baseline(key.track, &keys, axis, value);
+        self.store.write_keys_baseline(key.track, &keys, &format!("{axis}:dev"), dev);
+        self.store.write_keys_baseline(key.track, &keys, &format!("{axis}:absdev"), abs);
+        self.store.write_keys_baseline(key.track, &keys, &format!("{axis}:dev2"), dev * dev);
+        self.store.write_keys_baseline(key.track, &keys, &format!("{axis}:ref"), reference);
+        self.store.write_keys_baseline(key.track, &keys, &format!("{axis}:tol"), tolerance);
+        self.store.write_keys_agreement(key.track, &keys, &format!("{axis}:in_band"), abs <= 1.0);
+    }
+
+    pub fn record_v2_exact_baseline(&mut self, key: &ScopeKey, axis: &str, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
+        if validate_key(key).is_err() {
+            self.store.note_rejected(key.track);
+            return;
+        }
+        let k = key.to_string();
+        if self.seen_baseline.insert((k.clone(), axis.to_string())) {
+            self.store.write_keys_baseline(key.track, &[k], axis, value);
+        }
+    }
+}
+
+fn should_track_temporal(track: Track, axis: &str) -> bool {
+    matches!(
+        (track, axis),
+        (Track::Vision, "score" | "score_all" | "touch")
+            | (Track::Locate, "score")
+            | (Track::Depth, "scale")
+            | (Track::Balance, "ff" | "score" | "min_margin" | "peak_ratio")
+            | (Track::Memory, "drift_var_per_m2" | "scatter_var_m2")
+            | (Track::Tracker, "iou_prev")
+            | (Track::Act, "value" | "ok")
+    ) || axis.starts_with("fusion_mse:")
+}
+
+fn dir_size_bytes(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                total += dir_size_bytes(&p);
+            } else if let Ok(m) = e.metadata() {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+fn archive_file(base_dir: &Path, tag: &str, src: &Path) -> Option<PathBuf> {
+    if !src.exists() {
+        return None;
+    }
+    let arch = base_dir.join("archive").join(format!("{}-{tag}", now_ms()));
+    let _ = std::fs::create_dir_all(&arch);
+    let name = src.file_name()?;
+    let dst = arch.join(name);
+    std::fs::rename(src, &dst).ok().map(|_| dst)
 }
 
 impl SdsStore {
     pub fn memory() -> Self {
         let mut s = SdsStore {
             dir: None,
+            root_dir: None,
+            generation_id: None,
+            parent_generation: None,
+            inherit_mode: "fresh".into(),
             bases: HashMap::new(),
             runs: HashMap::new(),
             dirty: HashSet::new(),
             write_tick: 0,
+            rev: 0,
             last_flush: None,
             log: Vec::new(),
             cap_bytes: DEFAULT_CAP_BYTES,
             engine_rev: String::new(),
             policies: HashMap::new(),
+            contacts: None,
+            drift_transitions: Vec::new(),
         };
         for l in Ledger::ALL {
             s.bases.insert(l, fresh_file());
@@ -290,6 +619,7 @@ impl SdsStore {
     pub fn open_with(dir: &Path, opts: OpenOptions) -> Self {
         let mut store = SdsStore::memory();
         store.dir = Some(dir.to_path_buf());
+        store.root_dir = Some(dir.to_path_buf());
         store.engine_rev = opts.engine_rev.clone();
         store.log.clear();
         let _ = std::fs::create_dir_all(dir);
@@ -324,13 +654,25 @@ impl SdsStore {
                             file = f;
                         }
                     }
-                    Ok(f) => store.log.push(format!(
-                        "[SDS] [{}] 레시피 세대 불일치 ('{}' vs '{}') — 원장을 폐기하고 새로 시작합니다",
-                        l.as_str(),
-                        f.recipe,
-                        SDS_RECIPE
-                    )),
-                    Err(e) => store.log.push(format!("[SDS] [{}] 원장 읽기/파싱 실패({}) — 새로 시작합니다", l.as_str(), e)),
+                    Ok(f) => {
+                        let moved = archive_file(dir, "recipe", &path);
+                        store.log.push(format!(
+                            "[SDS] [{}] 레시피 세대 불일치 ('{}' vs '{}') — 원장을 보관({})하고 새로 시작합니다",
+                            l.as_str(),
+                            f.recipe,
+                            SDS_RECIPE,
+                            moved.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "실패".into())
+                        ));
+                    }
+                    Err(e) => {
+                        let moved = archive_file(dir, "recipe", &path);
+                        store.log.push(format!(
+                            "[SDS] [{}] 원장 읽기/파싱 실패({}) — 보관({})하고 새로 시작합니다",
+                            l.as_str(),
+                            e,
+                            moved.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "실패".into())
+                        ));
+                    }
                 }
             }
             store.bases.insert(l, file);
@@ -343,8 +685,373 @@ impl SdsStore {
         store
     }
 
+    /// Open a generational ledger under `<root_dir>/gen/<engine_rev>+<engine_fp>/`
+    /// tracking parent lineage in `<root_dir>/index.json` (Phase 2 – Part 3 · D2).
+    /// - When `engine_rev` changes: opens a `Fresh` generation.
+    /// - When only `engine_fp` changes: opens an `Inherit` generation, copying `Prior`-eligible
+    ///   scopes with counts shrunk to `min(n_parent, track.min_obs().1)` and skipping `Never`
+    ///   axes (`Balance::ff`).
+    pub fn open_generation(root_dir: &Path, engine_rev: &str, engine_fp: &str) -> Self {
+        let _ = std::fs::create_dir_all(root_dir);
+        let gen_id = if engine_fp.is_empty() {
+            engine_rev.to_string()
+        } else {
+            format!("{engine_rev}+{engine_fp}")
+        };
+        let index_path = root_dir.join("index.json");
+        let mut index: GenIndex = std::fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let gen_dir = root_dir.join("gen").join(&gen_id);
+        let existed = gen_dir.exists();
+        let prev_entry = index.current.as_deref().and_then(|cur| {
+            if cur == gen_id {
+                None
+            } else {
+                index.generations.iter().find(|g| g.id == cur).cloned()
+            }
+        });
+
+        let mut store = SdsStore::open_with(&gen_dir, OpenOptions::stamped(engine_rev));
+        store.root_dir = Some(root_dir.to_path_buf());
+        store.generation_id = Some(gen_id.clone());
+
+        let (parent_id, inherit_mode) = match prev_entry {
+            Some(prev) if !existed => {
+                let same_rev = prev.engine_rev == engine_rev;
+                let mode = if same_rev { "inherit" } else { "fresh" };
+                if same_rev {
+                    let parent_dir = root_dir.join("gen").join(&prev.id);
+                    if parent_dir.exists() {
+                        let parent_store = SdsStore::open_with(&parent_dir, OpenOptions::stamped(&prev.engine_rev));
+                        store.inherit_prior_from(&parent_store);
+                    }
+                }
+                (Some(prev.id), mode.to_string())
+            }
+            Some(prev) => (Some(prev.id), "existing".to_string()),
+            None => (None, if existed { "existing".into() } else { "fresh".into() }),
+        };
+        store.parent_generation = parent_id.clone();
+        store.inherit_mode = inherit_mode.clone();
+
+        if !index.generations.iter().any(|g| g.id == gen_id) {
+            index.generations.push(GenerationEntry {
+                id: gen_id.clone(),
+                parent: parent_id,
+                engine_rev: engine_rev.into(),
+                engine_fp: engine_fp.into(),
+                inherit: inherit_mode,
+                created_ms: now_ms(),
+                recipe: SDS_RECIPE.into(),
+                observations: store.total_observations(),
+                state: "active".into(),
+            });
+        }
+        for g in &mut index.generations {
+            g.state = if g.id == gen_id { "active".into() } else { "archived".into() };
+        }
+        index.current = Some(gen_id);
+        if let Ok(txt) = serde_json::to_string_pretty(&index) {
+            let _ = write_atomic(&index_path, txt.as_bytes());
+        }
+        store
+    }
+
+    fn inherit_prior_from(&mut self, parent: &SdsStore) {
+        for l in Ledger::ALL {
+            let Some(pf) = parent.bases.get(&l) else { continue };
+            let target = self.bases.entry(l).or_insert_with(fresh_file);
+            for (k, st) in &pf.scopes {
+                let Some(tr) = track_of_key(k) else { continue };
+                let cap_n = tr.min_obs().1.max(1);
+                let shrink = |w: &Welford| -> Welford {
+                    if w.n == 0 {
+                        return Welford::default();
+                    }
+                    let n_new = w.n.min(cap_n);
+                    let m2_new = if n_new > 1 { w.variance() * (n_new - 1) as f64 } else { 0.0 };
+                    let pol = tr.temporal_policy();
+                    let mut out = Welford { n: n_new, mean: w.mean, m2: m2_new, ring: w.ring.clone(), t: None };
+                    if should_track_temporal(tr, "") || w.t.is_some() {
+                        out.t = Some(Temporal::seed_from(&out, pol.m_short, pol.m_long));
+                    }
+                    out
+                };
+                let entry = target.scopes.entry(k.clone()).or_default();
+                for (a, w) in &st.baseline {
+                    if tr == Track::Balance && a == "ff" {
+                        continue; // Path F is Inherit::Never
+                    }
+                    entry.baseline.insert(a.clone(), shrink(w));
+                }
+                for (a, w) in &st.calibration {
+                    if tr == Track::Balance && a == "ff" {
+                        continue; // Path F is Inherit::Never
+                    }
+                    entry.calibration.insert(a.clone(), shrink(w));
+                }
+                for (a, w) in &st.agreement {
+                    entry.agreement.insert(a.clone(), shrink(w));
+                }
+                entry.updated_at = now_ms();
+            }
+            self.dirty.insert(l);
+        }
+    }
+
+    pub fn generation_id(&self) -> Option<&str> {
+        self.generation_id.as_deref()
+    }
+
+    pub fn set_generation_id(&mut self, gen: &str) {
+        self.generation_id = Some(gen.to_string());
+    }
+
+    pub fn prune_archive(&self, keep: usize) -> Vec<String> {
+        let Some(root) = self.root_dir.as_deref().or(self.dir.as_deref()) else { return Vec::new() };
+        let arch = root.join("archive");
+        let Ok(rd) = std::fs::read_dir(&arch) else { return Vec::new() };
+        let mut entries: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut removed = Vec::new();
+        while entries.len() > keep {
+            let (name, path) = entries.remove(0);
+            let ok = if path.is_dir() {
+                std::fs::remove_dir_all(&path).is_ok()
+            } else {
+                std::fs::remove_file(&path).is_ok()
+            };
+            if ok {
+                removed.push(name);
+            }
+        }
+        removed
+    }
+
+    pub fn list_archive(&self) -> Vec<(String, u64)> {
+        let Some(root) = self.root_dir.as_deref().or(self.dir.as_deref()) else { return Vec::new() };
+        let arch = root.join("archive");
+        let Ok(rd) = std::fs::read_dir(&arch) else { return Vec::new() };
+        let mut out: Vec<(String, u64)> = rd
+            .flatten()
+            .map(|e| (e.file_name().to_string_lossy().into_owned(), dir_size_bytes(&e.path())))
+            .collect();
+        out.sort_by(|a, b| b.0.cmp(&a.0));
+        out
+    }
+
+    pub fn total_observations(&self) -> u64 {
+        Ledger::ALL
+            .iter()
+            .map(|l| {
+                let b: u64 = self.bases.get(l).map(|f| f.scopes.values().map(ScopeStat::observations).sum()).unwrap_or(0);
+                let r: u64 = self.runs.get(l).map(|rb| rb.observations).unwrap_or(0);
+                b + r
+            })
+            .sum()
+    }
+
+    pub fn archive_bytes(&self) -> u64 {
+        let Some(root) = self.root_dir.as_deref().or(self.dir.as_deref()) else { return 0 };
+        dir_size_bytes(&root.join("archive"))
+    }
+
+    pub fn generations_status(&self) -> GenStatus {
+        let Some(root) = self.root_dir.as_deref().or(self.dir.as_deref()) else {
+            return GenStatus {
+                current: self.generation_id.clone(),
+                parent: self.parent_generation.clone(),
+                inherit: self.inherit_mode.clone(),
+                generations: Vec::new(),
+                archive_bytes: 0,
+            };
+        };
+        let index: GenIndex = std::fs::read_to_string(root.join("index.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        GenStatus {
+            current: self.generation_id.clone().or(index.current),
+            parent: self.parent_generation.clone(),
+            inherit: self.inherit_mode.clone(),
+            generations: index.generations,
+            archive_bytes: self.archive_bytes(),
+        }
+    }
+
+    /// Save a content-addressed snapshot under `<snap_root>/<digest>/` (Phase 2 – Part 3 · D6).
+    pub fn save_snapshot(&self, snap_root: &Path) -> std::io::Result<String> {
+        let frozen = self.clone_frozen();
+        let digest = frozen.combined_digest();
+        let dir = snap_root.join(&digest);
+        if dir.exists() {
+            return Ok(digest);
+        }
+        std::fs::create_dir_all(&dir)?;
+        for l in Ledger::ALL {
+            if let Some(f) = frozen.bases.get(&l) {
+                let txt = serde_json::to_string_pretty(f).unwrap_or_default();
+                write_atomic(&dir.join(l.file_name()), txt.as_bytes())?;
+            }
+        }
+        Ok(digest)
+    }
+
+    /// Load a previously saved content-addressed snapshot for reproducible replay.
+    pub fn load_snapshot(snap_root: &Path, digest: &str) -> std::io::Result<SdsStore> {
+        let dir = snap_root.join(digest);
+        if !dir.exists() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("snapshot {digest} not found")));
+        }
+        let store = SdsStore::open_with(&dir, OpenOptions::default());
+        Ok(store.clone_frozen())
+    }
+
+    /// Migrate legacy v1 pipe-delimited keys in place to v2 faceted `ScopeKey` strings,
+    /// preserving a `.v1-<ms>.json` backup when disk-backed (Phase 2 – Part 1 · §5).
+    /// Returns `(migrated_keys, legacy_kept)`.
+    pub fn migrate_v1_to_v2(&mut self) -> (usize, usize) {
+        let mut migrated = 0usize;
+        let mut legacy_kept = 0usize;
+        let stamp = now_ms();
+        for l in Ledger::ALL {
+            if let Some(dir) = &self.dir {
+                let src = dir.join(l.file_name());
+                if src.exists() {
+                    let bak = dir.join(format!("{}.v1-{stamp}.json", l.as_str()));
+                    let _ = std::fs::copy(&src, &bak);
+                }
+            }
+            let Some(base) = self.bases.get_mut(&l) else { continue };
+            let old = std::mem::take(&mut base.scopes);
+            for (k, st) in old {
+                let ring = ring_for_key(&k);
+                match ScopeKey::from_v1(&k) {
+                    Ok(sk) => {
+                        let new_k = sk.to_key_string();
+                        if new_k != k {
+                            migrated += 1;
+                        }
+                        base.scopes.entry(new_k).or_default().absorb(st, ring, stamp);
+                    }
+                    Err(_) => {
+                        legacy_kept += 1;
+                        let leg_k = format!("legacy/{k}");
+                        base.scopes.entry(leg_k).or_default().absorb(st, ring, stamp);
+                    }
+                }
+            }
+            if migrated > 0 || legacy_kept > 0 {
+                self.dirty.insert(l);
+            }
+        }
+        if migrated > 0 || legacy_kept > 0 {
+            self.rev = self.rev.saturating_add(1);
+        }
+        (migrated, legacy_kept)
+    }
+
+    pub fn drain_drift_transitions(&mut self) -> Vec<(String, String, DriftState, DriftState)> {
+        std::mem::take(&mut self.drift_transitions)
+    }
+
     pub fn dir(&self) -> Option<&Path> {
         self.dir.as_deref()
+    }
+
+    /// Monotonic write counter incremented on every write/purge/close_runs.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// Enable in-memory read/write contact logging (for test symmetry verification).
+    pub fn enable_contact_log(&mut self) {
+        if self.contacts.is_none() {
+            self.contacts = Some(Mutex::new(ContactLog::default()));
+        }
+    }
+
+    pub fn contact_snapshot(&self) -> Option<ContactLog> {
+        self.contacts.as_ref().and_then(|m| m.lock().ok().map(|g| g.clone()))
+    }
+
+    fn note_write(&self, scope: &Scope, axis: &str) {
+        if let Some(m) = &self.contacts {
+            if let Ok(mut g) = m.lock() {
+                g.record_write(scope.track, &scope.primary, axis);
+            }
+        }
+    }
+
+    fn note_read(&self, scope: &Scope, axis: &str) {
+        if let Some(m) = &self.contacts {
+            if let Ok(mut g) = m.lock() {
+                g.record_read(scope.track, &scope.primary, axis);
+            }
+        }
+    }
+
+    /// Freeze the current merged ledger state (base + open run buffer) into an isolated memory store
+    /// for `Mode::Frozen` reproducible reads (Phase 2 – Part 3 · D1/D6).
+    pub fn clone_frozen(&self) -> SdsStore {
+        let mut frozen = SdsStore::memory();
+        frozen.engine_rev = self.engine_rev.clone();
+        frozen.policies = self.policies.clone();
+        frozen.rev = self.rev;
+        for l in Ledger::ALL {
+            let mut file = self.bases.get(&l).cloned().unwrap_or_else(fresh_file);
+            if let Some(run) = self.runs.get(&l) {
+                for (k, v) in &run.scopes {
+                    file.scopes.entry(k.clone()).or_default().absorb(v.clone(), ring_for_key(k), file.updated_at);
+                }
+            }
+            file.engine_revs = self.engine_revs(l);
+            frozen.bases.insert(l, file);
+        }
+        frozen
+    }
+
+    /// Canonical SHA-256 hex digest of each ledger's merged scopes (order-independent of HashMap seeds).
+    pub fn ledger_digests(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        for l in Ledger::ALL {
+            let mut keys: Vec<String> = self.bases.get(&l).map(|b| b.scopes.keys().cloned().collect()).unwrap_or_default();
+            if let Some(r) = self.runs.get(&l) {
+                keys.extend(r.scopes.keys().cloned());
+            }
+            keys.sort();
+            keys.dedup();
+            let mut map = serde_json::Map::new();
+            for k in keys {
+                if let Some(st) = self.merged_scope(l, &k) {
+                    if let Ok(v) = serde_json::to_value(&st) {
+                        map.insert(k, canonical_json_no_ts(v));
+                    }
+                }
+            }
+            let bytes = serde_json::to_vec(&serde_json::Value::Object(map)).unwrap_or_default();
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            out.insert(l.as_str().to_string(), digest);
+        }
+        out
+    }
+
+    /// Combined digest across all ledgers in canonical order.
+    pub fn combined_digest(&self) -> String {
+        let map = self.ledger_digests();
+        let mut h = Sha256::new();
+        for (k, v) in map {
+            h.update(k.as_bytes());
+            h.update(b"=");
+            h.update(v.as_bytes());
+            h.update(b"\n");
+        }
+        format!("{:x}", h.finalize())
     }
 
     pub fn set_cap_bytes(&mut self, cap: usize) {
@@ -437,6 +1144,7 @@ impl SdsStore {
             e.updated_at = now_ms();
         }
         self.dirty.insert(ledger);
+        self.rev = self.rev.saturating_add(1);
         self.write_tick = self.write_tick.saturating_add(1);
         let gap_ok = self.last_flush.map(|t| t.elapsed().as_millis() >= AUTO_FLUSH_MIN_GAP_MS).unwrap_or(true);
         if self.dir.is_some() && self.write_tick >= AUTO_FLUSH_EVERY && gap_ok {
@@ -444,29 +1152,234 @@ impl SdsStore {
         }
     }
 
+    fn note_rejected(&mut self, track: Track) {
+        let meta_scope = Scope::new(Track::Quest, "_meta", "");
+        let axis = format!("rejected:{}", track.as_str());
+        self.record_baseline(&meta_scope, &axis, 1.0);
+        self.push_log(format!("[SDS] 스코프 문법 위반 버림 ({})", track.as_str()));
+    }
+
+    fn seed_run_temporal(&mut self, ledger: Ledger, key: &str, axis: &str, kind: u8) {
+        let base_t = self.bases.get(&ledger).and_then(|b| b.scopes.get(key)).and_then(|st| {
+            let map = match kind {
+                0 => &st.baseline,
+                1 => &st.calibration,
+                _ => &st.agreement,
+            };
+            map.get(axis).map(|w| {
+                let pol = track_of_key(key).unwrap_or(Track::Vision).temporal_policy();
+                w.temporal_or_seeded(pol.m_short, pol.m_long)
+            })
+        });
+        if let Some(bt) = base_t {
+            if let Some(run) = self.runs.get_mut(&ledger) {
+                if let Some(st) = run.scopes.get_mut(key) {
+                    let map = match kind {
+                        0 => &mut st.baseline,
+                        1 => &mut st.calibration,
+                        _ => &mut st.agreement,
+                    };
+                    let entry = map.entry(axis.to_string()).or_default();
+                    if entry.t.is_none() {
+                        entry.t = Some(bt);
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_keys_baseline(&mut self, track: Track, keys: &[String], axis: &str, value: f64) {
+        if !value.is_finite() || keys.is_empty() {
+            return;
+        }
+        let ledger = track.ledger();
+        let ring = track.ring_len();
+        let track_t = should_track_temporal(track, axis);
+        let pol = track.temporal_policy();
+        self.open_run(ledger, track.as_str());
+        if track_t {
+            for k in keys {
+                self.seed_run_temporal(ledger, k, axis, 0);
+            }
+        }
+        let mut transitions = Vec::new();
+        if let Some(run) = self.runs.get_mut(&ledger) {
+            run.observations = run.observations.saturating_add(1);
+            for k in keys {
+                let e = run.scopes.entry(k.clone()).or_default();
+                let w = e.baseline.entry(axis.to_string()).or_default();
+                if track_t {
+                    if let Some((prev, next)) = w.push_temporal(value, ring, pol.m_short, pol.m_long, pol.cusum_k, pol.cusum_h) {
+                        transitions.push((k.clone(), axis.to_string(), prev, next));
+                    }
+                } else {
+                    w.push(value, ring);
+                }
+                e.updated_at = now_ms();
+            }
+        }
+        self.drift_transitions.extend(transitions);
+        self.finish_write(ledger);
+    }
+
+    fn write_keys_calibration(&mut self, track: Track, keys: &[String], axis: &str, ratio: f64) {
+        if !ratio.is_finite() || keys.is_empty() {
+            return;
+        }
+        let ledger = track.ledger();
+        let ring = track.ring_len();
+        let track_t = should_track_temporal(track, axis);
+        let pol = track.temporal_policy();
+        self.open_run(ledger, track.as_str());
+        if track_t {
+            for k in keys {
+                self.seed_run_temporal(ledger, k, axis, 1);
+            }
+        }
+        let mut transitions = Vec::new();
+        if let Some(run) = self.runs.get_mut(&ledger) {
+            run.observations = run.observations.saturating_add(1);
+            for k in keys {
+                let e = run.scopes.entry(k.clone()).or_default();
+                let w = e.calibration.entry(axis.to_string()).or_default();
+                if track_t {
+                    if let Some((prev, next)) = w.push_temporal(ratio, ring, pol.m_short, pol.m_long, pol.cusum_k, pol.cusum_h) {
+                        transitions.push((k.clone(), axis.to_string(), prev, next));
+                    }
+                } else {
+                    w.push(ratio, ring);
+                }
+                e.updated_at = now_ms();
+            }
+        }
+        self.drift_transitions.extend(transitions);
+        self.finish_write(ledger);
+    }
+
+    fn write_keys_agreement(&mut self, track: Track, keys: &[String], axis: &str, agreed: bool) {
+        if keys.is_empty() {
+            return;
+        }
+        let ledger = track.ledger();
+        let ring = track.ring_len();
+        let val = if agreed { 1.0 } else { 0.0 };
+        let track_t = should_track_temporal(track, axis);
+        let pol = track.temporal_policy();
+        self.open_run(ledger, track.as_str());
+        if track_t {
+            for k in keys {
+                self.seed_run_temporal(ledger, k, axis, 2);
+            }
+        }
+        let mut transitions = Vec::new();
+        if let Some(run) = self.runs.get_mut(&ledger) {
+            run.observations = run.observations.saturating_add(1);
+            for k in keys {
+                let e = run.scopes.entry(k.clone()).or_default();
+                let w = e.agreement.entry(axis.to_string()).or_default();
+                if track_t {
+                    if let Some((prev, next)) = w.push_temporal(val, ring, pol.m_short, pol.m_long, pol.cusum_k, pol.cusum_h) {
+                        transitions.push((k.clone(), axis.to_string(), prev, next));
+                    }
+                } else {
+                    w.push(val, ring);
+                }
+                e.updated_at = now_ms();
+            }
+        }
+        self.drift_transitions.extend(transitions);
+        self.finish_write(ledger);
+    }
+
+    fn write_keys_extrema(&mut self, track: Track, keys: &[String], axis: &str, value: f64) {
+        if !value.is_finite() || keys.is_empty() {
+            return;
+        }
+        let ledger = track.ledger();
+        let run = self.open_run(ledger, track.as_str());
+        for k in keys {
+            let e = run.scopes.entry(k.clone()).or_default();
+            e.extrema.entry(axis.to_string()).or_default().push(value);
+            e.updated_at = now_ms();
+        }
+        self.finish_write(ledger);
+    }
+
+    fn finish_write(&mut self, ledger: Ledger) {
+        self.dirty.insert(ledger);
+        self.rev = self.rev.saturating_add(1);
+        self.write_tick = self.write_tick.saturating_add(1);
+        let gap_ok = self.last_flush.map(|t| t.elapsed().as_millis() >= AUTO_FLUSH_MIN_GAP_MS).unwrap_or(true);
+        if self.dir.is_some() && self.write_tick >= AUTO_FLUSH_EVERY && gap_ok {
+            self.flush();
+        }
+    }
+
+    /// Execute an event-scoped write batch deduplicating upstream keys (Phase 2 – Part 1 · D2).
+    pub fn record_batch(&mut self, _event_id: &str, f: impl FnOnce(&mut Batch<'_>)) {
+        let mut batch = Batch {
+            store: self,
+            seen_baseline: HashSet::new(),
+            seen_agreement: HashSet::new(),
+            seen_extrema: HashSet::new(),
+        };
+        f(&mut batch);
+    }
+
+    pub fn record_extrema(&mut self, scope: &Scope, axis: &str, value: f64) {
+        let keys = scope.write_keys();
+        self.write_keys_extrema(scope.track, &keys, axis, value);
+    }
+
+    pub fn record_v2_baseline(&mut self, key: &ScopeKey, axis: &str, value: f64) {
+        if validate_key(key).is_err() {
+            self.note_rejected(key.track);
+            return;
+        }
+        let keys = chain_keys(key);
+        self.write_keys_baseline(key.track, &keys, axis, value);
+    }
+
+    pub fn record_v2_agreement(&mut self, key: &ScopeKey, axis: &str, agreed: bool) {
+        if validate_key(key).is_err() {
+            self.note_rejected(key.track);
+            return;
+        }
+        let keys = chain_keys(key);
+        self.write_keys_agreement(key.track, &keys, axis, agreed);
+    }
+
+    pub fn record_v2_extrema(&mut self, key: &ScopeKey, axis: &str, value: f64) {
+        if validate_key(key).is_err() {
+            self.note_rejected(key.track);
+            return;
+        }
+        let keys = chain_keys(key);
+        self.write_keys_extrema(key.track, &keys, axis, value);
+    }
+
     pub fn record_baseline(&mut self, scope: &Scope, axis: &str, value: f64) {
         if !value.is_finite() {
             return;
         }
-        let a = axis.to_string();
-        self.with_scopes(scope, move |s, ring| {
-            s.baseline.entry(a.clone()).or_default().push(value, ring);
-        });
+        self.note_write(scope, axis);
+        let keys = scope.write_keys();
+        self.write_keys_baseline(scope.track, &keys, axis, value);
     }
 
     pub fn record_calibration(&mut self, scope: &Scope, axis: &str, measured: f64, predicted: f64) {
         if !measured.is_finite() || !predicted.is_finite() || predicted.abs() < 1e-9 {
             return;
         }
+        self.note_write(scope, axis);
         let ratio = (measured / predicted).clamp(0.05, 20.0);
-        let a = axis.to_string();
-        self.with_scopes(scope, move |s, ring| {
-            s.calibration.entry(a.clone()).or_default().push(ratio, ring);
-        });
+        let keys = scope.write_keys();
+        self.write_keys_calibration(scope.track, &keys, axis, ratio);
     }
 
     pub fn record_decay(&mut self, scope: &Scope, axis: &str, scores: &[f32]) {
         let Some(shape) = decay_shape(scores) else { return };
+        self.note_write(scope, axis);
         let a = axis.to_string();
         self.with_scopes(scope, move |s, ring| {
             let d = s.decay.entry(a.clone()).or_default();
@@ -481,6 +1394,7 @@ impl SdsStore {
         if winner.is_empty() || loser.is_empty() || winner == loser {
             return;
         }
+        self.note_write(scope, "confusion");
         let (a, b, a_won) = if winner <= loser {
             (winner.to_string(), loser.to_string(), true)
         } else {
@@ -502,16 +1416,16 @@ impl SdsStore {
     }
 
     pub fn record_agreement(&mut self, scope: &Scope, axis: &str, agreed: bool) {
-        let a = axis.to_string();
-        self.with_scopes(scope, move |s, ring| {
-            s.agreement.entry(a.clone()).or_default().push(if agreed { 1.0 } else { 0.0 }, ring);
-        });
+        self.note_write(scope, axis);
+        let keys = scope.write_keys();
+        self.write_keys_agreement(scope.track, &keys, axis, agreed);
     }
 
     pub fn record_reference(&mut self, scope: &Scope, axis: &str, value: f64, reference: f64, tolerance: f64) {
         if !value.is_finite() || !reference.is_finite() || !tolerance.is_finite() || tolerance <= 0.0 {
             return;
         }
+        self.note_write(scope, axis);
         let dev = (value - reference) / tolerance;
         let (a, ad, ab, ar, at) = (axis.to_string(), format!("{axis}:dev"), format!("{axis}:in_band"), format!("{axis}:ref"), format!("{axis}:tol"));
         let (aa, a2) = (format!("{axis}:absdev"), format!("{axis}:dev2"));
@@ -530,6 +1444,7 @@ impl SdsStore {
         if from.is_empty() || to.is_empty() {
             return;
         }
+        self.note_write(scope, "transition");
         let key = format!("{}>{}", from, to);
         self.with_scopes(scope, move |s, _| {
             *s.transition.entry(key.clone()).or_insert(0) += 1;
@@ -540,6 +1455,7 @@ impl SdsStore {
         if items.is_empty() {
             return;
         }
+        self.note_write(scope, "gates");
         let list = items.to_vec();
         self.with_scopes(scope, move |s, ring| {
             for (id, sev, blocked, sole) in list.iter() {
@@ -570,6 +1486,185 @@ impl SdsStore {
         }
     }
 
+    pub fn merged_scope_by_key(&self, l: Ledger, key: &str) -> Option<ScopeStat> {
+        self.merged_scope(l, key)
+    }
+
+    pub fn run_scope_by_key(&self, l: Ledger, key: &str) -> Option<ScopeStat> {
+        self.runs.get(&l).and_then(|r| r.scopes.get(key).cloned())
+    }
+
+    /// Return all scope keys (both v1 and v2) present in base or run buffer for `track`.
+    pub fn scope_keys_for_track(&self, track: Track) -> Vec<String> {
+        let l = track.ledger();
+        let p1 = format!("{}|", track.as_str());
+        let p2 = format!("{}/", track.as_str());
+        let mut keys: Vec<String> = self
+            .bases
+            .get(&l)
+            .map(|b| b.scopes.keys().filter(|k| k.starts_with(&p1) || k.starts_with(&p2)).cloned().collect())
+            .unwrap_or_default();
+        if let Some(r) = self.runs.get(&l) {
+            keys.extend(r.scopes.keys().filter(|k| k.starts_with(&p1) || k.starts_with(&p2)).cloned());
+        }
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Collect `(mean, n, variance)` across sibling scopes directly below `parent_key` at `rung_depth`
+    /// for empirical Bayes shrinkage (`pool.rs`).
+    pub(crate) fn sibling_stats(&self, track: Track, parent_key: &str, rung_depth: usize, axis: &str, agreement: bool) -> Vec<(f64, f64, f64)> {
+        let l = track.ledger();
+        let mut out = Vec::new();
+        for k in self.scope_keys_for_track(track) {
+            if k == parent_key || (!parent_key.is_empty() && !k.starts_with(parent_key)) {
+                continue;
+            }
+            if key_depth(&k) != rung_depth {
+                continue;
+            }
+            if let Some(st) = self.merged_scope(l, &k) {
+                let w = if agreement { st.agreement.get(axis) } else { st.baseline.get(axis) };
+                if let Some(w) = w.filter(|w| w.n >= 2) {
+                    out.push((w.mean, w.n as f64, w.variance()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Extract `(mean, sd, n_eff, rho, used_window, state)` from a [`Welford`] for a requested [`Window`].
+    fn extract_window(track: Track, w: &Welford, req: Window) -> (f64, f64, f64, f64, Window, DriftState) {
+        let pol = track.temporal_policy();
+        let t = w.t.as_ref();
+        let state = t.map_or(DriftState::Stable, |x| x.state);
+        let pick = match req {
+            Window::Auto => {
+                if t.and_then(|x| x.seg.as_ref()).is_some_and(|sp| sp.n >= 2) {
+                    Window::Span
+                } else if t.is_some() {
+                    Window::Long
+                } else {
+                    Window::Lifetime
+                }
+            }
+            other => other,
+        };
+        match pick {
+            Window::Lifetime => (w.mean, w.sd(), w.n as f64, t.map_or(0.0, |x| x.long.rho()), Window::Lifetime, state),
+            Window::Long => {
+                let ts = t.cloned().unwrap_or_else(|| w.temporal_or_seeded(pol.m_short, pol.m_long));
+                (ts.long.mean, ts.long.sd(), ts.long.n_eff(), ts.long.rho(), Window::Long, state)
+            }
+            Window::Short => {
+                let ts = t.cloned().unwrap_or_else(|| w.temporal_or_seeded(pol.m_short, pol.m_long));
+                (ts.short.mean, ts.short.sd(), ts.short.n_eff(), ts.short.rho(), Window::Short, state)
+            }
+            Window::Span => {
+                if let Some(sp) = t.and_then(|x| x.seg.as_ref()).filter(|s| s.n >= 1) {
+                    (sp.mean, sp.sd(), sp.n as f64, 0.0, Window::Span, state)
+                } else {
+                    (w.mean, w.sd(), w.n as f64, t.map_or(0.0, |x| x.long.rho()), Window::Lifetime, state)
+                }
+            }
+            Window::Auto => unreachable!(),
+        }
+    }
+
+    /// Uncertainty-aware mean estimate (Phase 2 – Part 2 · D3).
+    pub fn estimate_mean(&self, scope: &Scope, axis: &str, window: Window, conf: f64) -> Option<SdsEstimate> {
+        self.note_read(scope, axis);
+        let pol = scope.track.temporal_policy();
+        let ((w, need), key) = self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.clone(), 0u64), w.n)))?;
+        let _ = need;
+        let (mean, sd, raw_neff, rho, used, state) = Self::extract_window(scope.track, &w, window);
+        let n_e = effective_n(raw_neff, rho);
+        let (se, lo, hi) = mean_ci(mean, sd, n_e, conf);
+        let hw = 0.5 * (hi - lo);
+        let thin = if n_e < pol.min_obs.floor_n as f64 {
+            Some(format!("n_eff {:.1} < {}", n_e, pol.min_obs.floor_n))
+        } else if pol.min_obs.target_hw.is_some_and(|t| hw > t) {
+            Some(format!("반폭 {hw:.3} > {:.3}", pol.min_obs.target_hw.unwrap()))
+        } else {
+            None
+        };
+        Some(SdsEstimate { value: mean, se, lo, hi, n: w.n, n_eff: n_e, rho, window: used, key, level: Level::Exact, state, thin })
+    }
+
+    /// Uncertainty-aware Bernoulli rate estimate with Wilson CI (Phase 2 – Part 2 · D3).
+    pub fn estimate_rate(&self, scope: &Scope, axis: &str, window: Window, conf: f64) -> Option<SdsEstimate> {
+        self.note_read(scope, axis);
+        let pol = scope.track.temporal_policy();
+        let (w, key) = self.resolve(scope, |st| st.agreement.get(axis).map(|w| (w.clone(), w.n)))?;
+        let (mean, _, raw_neff, rho, used, state) = Self::extract_window(scope.track, &w, window);
+        let n_e = effective_n(raw_neff, rho);
+        let (se, lo, hi) = wilson_ci(mean, n_e, conf);
+        let thin = if n_e < pol.min_obs.floor_n as f64 {
+            Some(format!("n_eff {:.1} < {}", n_e, pol.min_obs.floor_n))
+        } else {
+            None
+        };
+        Some(SdsEstimate { value: mean.clamp(0.0, 1.0), se, lo, hi, n: w.n, n_eff: n_e, rho, window: used, key, level: Level::Exact, state, thin })
+    }
+
+    /// Uncertainty-aware spread (SD) estimate with chi-square CI (Phase 2 – Part 2 · D3).
+    pub fn estimate_spread(&self, scope: &Scope, axis: &str, window: Window, conf: f64) -> Option<SdsEstimate> {
+        self.note_read(scope, axis);
+        let pol = scope.track.temporal_policy();
+        let (w, key) = self.resolve(scope, |st| st.baseline.get(axis).map(|w| (w.clone(), w.n)))?;
+        let (_, sd, raw_neff, rho, used, state) = Self::extract_window(scope.track, &w, window);
+        let n_e = effective_n(raw_neff, rho);
+        let (se, lo, hi) = spread_ci(sd, n_e, conf);
+        let thin = if n_e < pol.min_obs.floor_n as f64 {
+            Some(format!("n_eff {:.1} < {}", n_e, pol.min_obs.floor_n))
+        } else {
+            None
+        };
+        Some(SdsEstimate { value: sd, se, lo, hi, n: w.n, n_eff: n_e, rho, window: used, key, level: Level::Exact, state, thin })
+    }
+
+    /// Uncertainty-aware multiplicative calibration factor estimate with `n_e` shrinkage and log-scale CI.
+    pub fn estimate_factor(&self, scope: &Scope, axis: &str, window: Window, conf: f64) -> Option<SdsEstimate> {
+        self.note_read(scope, axis);
+        let pol = scope.track.temporal_policy();
+        let (w, key) = self.resolve(scope, |st| st.calibration.get(axis).map(|w| (w.clone(), w.n)))?;
+        let (mean, sd, raw_neff, rho, used, state) = Self::extract_window(scope.track, &w, window);
+        let n_e = effective_n(raw_neff, rho);
+        let cv = if mean > 1e-6 { sd / mean } else { 0.0 };
+        let geo = if matches!(used, Window::Lifetime) {
+            let drift = w.drift_z();
+            if drift.abs() > RECENTRE_Z { w.recent_geo_mean() } else { w.geo_mean() }
+        } else if mean > 0.0 {
+            mean / (1.0 + cv * cv).sqrt()
+        } else {
+            mean
+        };
+        let shrunk = (1.0 + (geo - 1.0) * (n_e / (n_e + CALIBRATION_SHRINK_K))).clamp(0.25, 4.0);
+        let (se, lo, hi) = factor_ci(shrunk, cv, n_e, conf);
+        let thin = if n_e < pol.min_obs.floor_n as f64 {
+            Some(format!("n_eff {:.1} < {}", n_e, pol.min_obs.floor_n))
+        } else {
+            None
+        };
+        Some(SdsEstimate { value: shrunk, se, lo, hi, n: w.n, n_eff: n_e, rho, window: used, key, level: Level::Exact, state, thin })
+    }
+
+    /// Current CUSUM drift state for a scope/axis (checks baseline, calibration, agreement).
+    pub fn drift_state(&self, scope: &Scope, axis: &str) -> DriftState {
+        let l = scope.track.ledger();
+        for (key, _) in self.levels(scope) {
+            if let Some(st) = self.merged_scope(l, &key) {
+                if let Some(w) = st.baseline.get(axis).or_else(|| st.calibration.get(axis)).or_else(|| st.agreement.get(axis)) {
+                    if let Some(t) = &w.t {
+                        return t.state;
+                    }
+                }
+            }
+        }
+        DriftState::Stable
+    }
+
     fn resolve<T, F: Fn(&ScopeStat) -> Option<(T, u64)>>(&self, scope: &Scope, pick: F) -> Option<(T, String)> {
         let l = scope.track.ledger();
         for (key, need) in self.levels(scope) {
@@ -588,18 +1683,22 @@ impl SdsStore {
     }
 
     pub fn adaptive_baseline(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, u64)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n))).map(|v| v.0)
     }
 
     pub fn adaptive_baseline_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, f64, u64), String)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.mean, w.sd(), w.n), w.n)))
     }
 
     pub fn adaptive_recent(&self, scope: &Scope, axis: &str) -> Option<(f64, f64, f64)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| st.baseline.get(axis).map(|w| ((w.recent_mean(), w.mean, w.drift_z()), w.n))).map(|v| v.0)
     }
 
     pub fn calibration_factor(&self, scope: &Scope, axis: &str) -> Option<(f64, u64, f64, String)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| {
             st.calibration.get(axis).map(|w| {
                 let drift = w.drift_z();
@@ -628,10 +1727,12 @@ impl SdsStore {
     }
 
     pub fn agreement_rate(&self, scope: &Scope, axis: &str) -> Option<(f64, u64)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n))).map(|v| v.0)
     }
 
     pub fn agreement_rate_scoped(&self, scope: &Scope, axis: &str) -> Option<((f64, u64), String)> {
+        self.note_read(scope, axis);
         self.resolve(scope, |st| st.agreement.get(axis).map(|w| ((w.mean, w.n), w.n)))
     }
 
@@ -820,10 +1921,17 @@ impl SdsStore {
             snapshot.updated_at = now_ms();
             let mut txt = serde_json::to_string_pretty(&snapshot).unwrap_or_default();
             if txt.len() > self.cap_bytes {
-                let mut keys: Vec<(String, u64, i64)> =
-                    snapshot.scopes.iter().map(|(k, v)| (k.clone(), v.observations(), v.updated_at)).collect();
-                keys.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
-                for (k, _, _) in keys {
+                // Depth-first deterministic truncation (Phase 2 – Part 1 · D5, Part 3 · D6):
+                // drop deepest scopes first, then fewest observations, oldest, then key name;
+                // never drop depth-0 global scopes.
+                let mut keys: Vec<(String, usize, u64, i64)> = snapshot
+                    .scopes
+                    .iter()
+                    .filter(|(k, _)| key_depth(k) > 0)
+                    .map(|(k, v)| (k.clone(), key_depth(k), v.observations(), v.updated_at))
+                    .collect();
+                keys.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.3.cmp(&b.3)).then(a.0.cmp(&b.0)));
+                for (k, _, _, _) in keys {
                     if txt.len() <= self.cap_bytes {
                         break;
                     }
@@ -869,18 +1977,47 @@ impl SdsStore {
         self.flush();
     }
 
-    pub fn purge(&mut self) {
+    /// Archive current ledger files into `archive/<ms>-purge/` and reset to cold start
+    /// (Phase 2 – Part 3 · D2: archive instead of irreversible deletion).
+    pub fn purge(&mut self) -> Option<PathBuf> {
+        let mut archived_dir = None;
         self.bases.clear();
         self.runs.clear();
         self.dirty.clear();
-        if let Some(dir) = &self.dir {
-            let _ = std::fs::remove_dir_all(dir);
-            let _ = std::fs::create_dir_all(dir);
+        self.rev = self.rev.saturating_add(1);
+        if let Some(dir) = self.dir.clone() {
+            let arch_root = self.root_dir.clone().unwrap_or_else(|| dir.clone());
+            let arch = arch_root.join("archive").join(format!("{}-purge", now_ms()));
+            let mut moved_any = false;
+            for l in Ledger::ALL {
+                let p = dir.join(l.file_name());
+                if p.exists() {
+                    let _ = std::fs::create_dir_all(&arch);
+                    if std::fs::rename(&p, arch.join(l.file_name())).is_ok() {
+                        moved_any = true;
+                    }
+                }
+            }
+            let runs_dir = dir.join("runs");
+            if runs_dir.exists() {
+                let _ = std::fs::create_dir_all(&arch);
+                if std::fs::rename(&runs_dir, arch.join("runs")).is_ok() {
+                    moved_any = true;
+                }
+            }
+            if moved_any {
+                archived_dir = Some(arch);
+            }
+            let _ = std::fs::create_dir_all(&dir);
         }
         for l in Ledger::ALL {
             self.bases.insert(l, fresh_file());
         }
-        self.push_log("[SDS] 원장·실행 파일을 전량 삭제했습니다. 판정은 고정 기본값으로 복귀합니다".into());
+        self.push_log(match &archived_dir {
+            Some(p) => format!("[SDS] 원장·실행 파일을 {}로 보관하고 냉간 상태로 복귀했습니다", p.display()),
+            None => "[SDS] 원장·실행 파일을 초기화했습니다. 판정은 고정 기본값으로 복귀합니다".into(),
+        });
+        archived_dir
     }
 
     pub fn status(&self, max_axes: usize) -> SdsStatus {
@@ -925,6 +2062,15 @@ impl SdsStore {
                         sd: gs.severity.sd(),
                         recent: gs.sole as f64 / n,
                         drift_z: gs.severity.drift_z(),
+                        window: Some(Window::Lifetime),
+                        n_eff: Some(n),
+                        rho: None,
+                        lo: None,
+                        hi: None,
+                        state: Some(DriftState::Stable),
+                        thin: None,
+                        seeded: None,
+                        axis_kind: Some(AxisKind::Rate),
                     });
                 }
                 for (pair, c) in st.confusion.iter() {
@@ -946,7 +2092,12 @@ impl SdsStore {
                 engine_revs: self.engine_revs(l),
             });
         }
-        axes.sort_by(|a, b| b.n.cmp(&a.n).then(a.scope.cmp(&b.scope)).then(a.axis.cmp(&b.axis)));
+        // Sort Shifted axes first, then by observation count descending.
+        axes.sort_by(|a, b| {
+            let sa = matches!(a.state, Some(DriftState::Shifted { .. }));
+            let sb = matches!(b.state, Some(DriftState::Shifted { .. }));
+            sb.cmp(&sa).then(b.n.cmp(&a.n)).then(a.scope.cmp(&b.scope)).then(a.axis.cmp(&b.axis))
+        });
         axes.truncate(max_axes);
         confusions.sort_by(|a, b| b.ties.cmp(&a.ties).then(a.pair.cmp(&b.pair)));
         confusions.truncate(max_axes);
@@ -978,6 +2129,27 @@ fn fresh_file() -> SdsFile {
     SdsFile { recipe: SDS_RECIPE.into(), updated_at: now_ms(), scopes: HashMap::new(), engine_revs: Vec::new() }
 }
 
+fn canonical_json_no_ts(v: serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (k, val) in m {
+                if k == "updated_at" {
+                    continue;
+                }
+                sorted.insert(k, canonical_json_no_ts(val));
+            }
+            let mut out = serde_json::Map::new();
+            for (k, val) in sorted {
+                out.insert(k, val);
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.into_iter().map(canonical_json_no_ts).collect()),
+        other => other,
+    }
+}
+
 fn reference_of(st: &ScopeStat, axis: &str) -> Option<ReferenceReport> {
     let v = st.baseline.get(axis)?;
     let d = st.baseline.get(&format!("{axis}:dev"))?;
@@ -990,6 +2162,31 @@ fn reference_of(st: &ScopeStat, axis: &str) -> Option<ReferenceReport> {
 }
 
 fn axis_status(scope: &str, axis: &str, kind: &str, w: &Welford) -> AxisStatus {
+    let tr = track_of_key(scope);
+    let ak = if kind == "agreement" {
+        AxisKind::Rate
+    } else if axis.ends_with(":life_used") {
+        AxisKind::Cumulative
+    } else {
+        AxisKind::Level
+    };
+    let (window, n_eff, rho, lo, hi, state, thin, seeded) = if let Some(t) = &w.t {
+        let used = if t.seg.as_ref().is_some_and(|s| s.n >= 2) { Window::Span } else { Window::Long };
+        let (m, s, raw_n, r) = match used {
+            Window::Span => {
+                let sp = t.seg.as_ref().unwrap();
+                (sp.mean, sp.sd(), sp.n as f64, 0.0)
+            }
+            _ => (t.long.mean, t.long.sd(), t.long.n_eff(), t.long.rho()),
+        };
+        let n_e = effective_n(raw_n, r);
+        let (_, ci_lo, ci_hi) = if ak == AxisKind::Rate { wilson_ci(m, n_e, 0.95) } else { mean_ci(m, s, n_e, 0.95) };
+        let floor_n = tr.map_or(4, |x| x.temporal_policy().min_obs.floor_n);
+        let thin = (n_e < floor_n as f64).then(|| format!("n_eff {n_e:.1} < {floor_n}"));
+        (Some(used), Some(n_e), Some(r), Some(ci_lo), Some(ci_hi), Some(t.state), thin, Some(t.seeded))
+    } else {
+        (Some(Window::Lifetime), Some(w.n as f64), None, None, None, Some(DriftState::Stable), None, Some(false))
+    };
     AxisStatus {
         scope: scope.to_string(),
         axis: axis.to_string(),
@@ -999,6 +2196,15 @@ fn axis_status(scope: &str, axis: &str, kind: &str, w: &Welford) -> AxisStatus {
         sd: w.sd(),
         recent: w.recent_mean(),
         drift_z: w.drift_z(),
+        window,
+        n_eff,
+        rho,
+        lo,
+        hi,
+        state,
+        thin,
+        seeded,
+        axis_kind: Some(ak),
     }
 }
 
@@ -1423,5 +2629,127 @@ mod tests {
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&legacy);
+    }
+
+    #[test]
+    fn legacy_v1_ledger_migrates() {
+        let dir = tmpdir("migrate_v1");
+        let mut s = SdsStore::open(&dir);
+        for i in 0..10 {
+            s.record_baseline(&Scope::new(Track::Balance, "nn:s4", "brake_1.0"), "score", 70.0 + i as f64);
+            s.record_baseline(&Scope::new(Track::Depth, "tips", "tree"), "scale", 1.05 + i as f64 * 0.01);
+        }
+        s.close_runs();
+        let old_mean = s.merged_scope(Ledger::Body, "balance|nn:s4|brake_1.0").unwrap().baseline["score"].mean;
+        let old_n = s.merged_scope(Ledger::Body, "balance|nn:s4|brake_1.0").unwrap().baseline["score"].n;
+        let (migrated, legacy_kept) = s.migrate_v1_to_v2();
+        assert!(migrated >= 2 && legacy_kept == 0);
+        let new_st = s.merged_scope(Ledger::Body, "balance/nn:s4;ph=brake_1.0").expect("migrated nn:s4 scope");
+        assert_eq!(new_st.baseline["score"].n, old_n);
+        assert!((new_st.baseline["score"].mean - old_mean).abs() < 1e-9);
+        assert!(s.merged_scope(Ledger::Ml, "depth/tree;mode=tips").is_some());
+        let has_backup = std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".v1-"));
+        assert!(has_backup, "v1 backup must be preserved on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multi_match_event_is_counted_once_upstream() {
+        let mut s = SdsStore::memory();
+        let s1 = Scope::new(Track::Balance, "nn:s1", "slope");
+        let s6 = Scope::new(Track::Balance, "nn:s6", "slope");
+        s.record_batch("ev#1", |b| {
+            b.record_baseline(&s1, "score", 85.0);
+            b.record_baseline(&s6, "score", 85.0);
+        });
+        assert_eq!(s.merged_scope(Ledger::Body, "balance|nn:s1|slope").unwrap().baseline["score"].n, 1);
+        assert_eq!(s.merged_scope(Ledger::Body, "balance|nn:s6|slope").unwrap().baseline["score"].n, 1);
+        assert_eq!(s.merged_scope(Ledger::Body, "balance||").unwrap().baseline["score"].n, 1, "shared upstream balance|| must count once");
+    }
+
+    #[test]
+    fn old_ledger_loads_and_seeds_temporal() {
+        let dir = tmpdir("seed_t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{"recipe":"noto-sds-v1:welford+ring/hier-write/ledger-split/calib-shrink/atomic","updated_at":1,"engine_revs":["r1"],"scopes":{"vision|tree|":{"baseline":{"score":{"n":40,"mean":0.72,"m2":0.39,"ring":[0.7,0.74]}},"updated_at":1}}}"#;
+        std::fs::write(dir.join("perception.json"), raw).unwrap();
+        let s = SdsStore::open(&dir);
+        let est = s.estimate_mean(&Scope::new(Track::Vision, "tree", ""), "score", Window::Long, 0.95).unwrap();
+        assert!((est.value - 0.72).abs() < 1e-6);
+        assert!(est.n == 40 && est.lo < est.value && est.value < est.hi);
+        let w = s.merged_scope(Ledger::Perception, "vision|tree|").unwrap().baseline["score"].clone();
+        assert!(w.temporal_or_seeded(16.0, 128.0).seeded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fingerprint_change_opens_a_generation_and_keeps_the_parent() {
+        let dir = tmpdir("gen");
+        {
+            let mut g1 = SdsStore::open_generation(&dir, "r1", "aaaaaaaaaaaa");
+            for _ in 0..30 {
+                g1.record_baseline(&Scope::new(Track::Vision, "tree", ""), "score", 0.78);
+                g1.record_calibration(&Scope::new(Track::Balance, "accel>foot", ""), "ff", 1.3, 1.0);
+            }
+            g1.close_runs();
+        }
+        // Fingerprint change under same engine_rev -> Inherit generation
+        let g2 = SdsStore::open_generation(&dir, "r1", "bbbbbbbbbbbb");
+        assert_eq!(g2.generation_id(), Some("r1+bbbbbbbbbbbb"));
+        let st = g2.generations_status();
+        assert_eq!(st.parent.as_deref(), Some("r1+aaaaaaaaaaaa"));
+        assert_eq!(st.inherit, "inherit");
+        assert!(dir.join("gen").join("r1+aaaaaaaaaaaa").join("perception.json").exists(), "parent files kept");
+        // Path A (Vision::score) inherits prior shrunk to primary min_obs (8)
+        let (_, _, n_a) = g2.adaptive_baseline(&Scope::new(Track::Vision, "tree", ""), "score").expect("path A inherited prior");
+        assert_eq!(n_a, Track::Vision.min_obs().1);
+        // Path F (Balance::ff) is Inherit::Never -> cold start
+        assert!(g2.calibration_factor(&Scope::new(Track::Balance, "accel>foot", ""), "ff").is_none(), "path F must never inherit across generations");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recipe_mismatch_and_purge_archive_instead_of_deleting() {
+        let dir = tmpdir("archive");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("perception.json"), r#"{"recipe":"old-v0","updated_at":1,"scopes":{}}"#).unwrap();
+        let mut s = SdsStore::open(&dir);
+        let arch_recipe = std::fs::read_dir(dir.join("archive")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("-recipe"));
+        assert!(arch_recipe, "recipe mismatch must archive instead of deleting");
+        for _ in 0..5 {
+            s.record_baseline(&Scope::new(Track::Forecast, "x", ""), "a", 1.0);
+        }
+        s.close_runs();
+        let moved = s.purge();
+        assert!(moved.is_some());
+        assert!(s.archive_bytes() > 0);
+        let arch_purge = std::fs::read_dir(dir.join("archive")).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("-purge"));
+        assert!(arch_purge, "purge must archive instead of deleting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn phase_switching_alone_does_not_alarm() {
+        // Alternating phase means (90 vs 55) with phase-expected profile residual CUSUM should stay Stable,
+        // while a simultaneous +1.5σ shift across all phases triggers Shifted.
+        let mut t = Temporal::default();
+        let m_s = 12.0;
+        let m_l = 96.0;
+        for i in 0..120 {
+            let phase_mu = if i % 2 == 0 { 90.0 } else { 55.0 };
+            let noise = if (i / 2) % 2 == 0 { 2.0 } else { -2.0 };
+            t.push_with_expected(phase_mu + noise, Some(phase_mu), m_s, m_l, 0.5, 5.0);
+        }
+        assert_eq!(t.state, DriftState::Stable, "pure phase switching with expected profile must not alarm");
+        let mut shifted = false;
+        for i in 0..25 {
+            let phase_mu = if i % 2 == 0 { 90.0 } else { 55.0 };
+            t.push_with_expected(phase_mu + 12.0, Some(phase_mu), m_s, m_l, 0.5, 5.0);
+            if matches!(t.state, DriftState::Shifted { .. }) {
+                shifted = true;
+                break;
+            }
+        }
+        assert!(shifted, "common shift across all phases must trigger Shifted");
     }
 }

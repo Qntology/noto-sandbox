@@ -1,0 +1,708 @@
+[
+  {
+    "id": "S1",
+    "name_ko": "경사 위 들기",
+    "kind": "phase",
+    "core": true,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "Mini-BESTest 감각 6 : 예측 6 (Franchignoni 2010) · REBA 분절 최대점 (Hignett & McAtamney 2000)",
+    "needs_legs": false,
+    "requires": [],
+    "substitute_when_partial": true,
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "slope",
+        "stage": "approach",
+        "subsystem": "sensory",
+        "weight": 0.5,
+        "motion": "still",
+        "live": true,
+        "posture": { "base": "quiet", "source": "slope", "slope_deg": 10.0 },
+        "causes": ["slope"]
+      },
+      {
+        "id": "lift",
+        "stage": "lift",
+        "subsystem": "anticipatory",
+        "weight": 0.5,
+        "motion": "any",
+        "live": true,
+        "requires": ["arms"],
+        "posture": { "base": "arm_lift", "load_frac": 0.10, "slope_deg": 10.0, "two_arms": "auto" },
+        "causes": ["arm_lift", "slope"]
+      }
+    ]
+  },
+  {
+    "id": "S2",
+    "name_ko": "앞 짐 들고 턱 오르기",
+    "kind": "phase",
+    "core": true,
+    "seg_w": [0.056, 0.093, 0.210, 0.149, 0.111, 0.228, 0.154],
+    "weights_from": "BESTest APA 18 : 보행 21 항목 점수 (Horak 2009) · REBA 분절 최대점",
+    "needs_legs": true,
+    "requires": ["legs"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "carry_walk",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.538,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "foot_lift", "cargo_frac": 0.10, "single_support": "legged" },
+        "causes": ["carry_front", "foot_lift"]
+      },
+      {
+        "id": "step",
+        "stage": "step",
+        "subsystem": "anticipatory",
+        "weight": 0.462,
+        "motion": "any",
+        "live": true,
+        "posture": { "base": "quiet", "source": "step_up", "cargo_frac": 0.10, "step_m": 0.17, "single_support": "legged" },
+        "causes": ["carry_front", "step_up"]
+      }
+    ]
+  },
+  {
+    "id": "S3",
+    "name_ko": "한 발로 서서 앞으로 뻗기",
+    "kind": "phase",
+    "core": true,
+    "seg_w": [0.0, 0.179, 0.154, 0.179, 0.0, 0.154, 0.334],
+    "weights_from": "BESTest 안정 한계 21 : APA 18 · 하위체계 안 동일 가중 (Rasch)",
+    "needs_legs": true,
+    "requires": ["legs"],
+    "live": false,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "weight_shift",
+        "stage": "approach",
+        "subsystem": "anticipatory",
+        "weight": 0.462,
+        "motion": "any",
+        "live": true,
+        "posture": { "base": "quiet", "source": "foot_lift", "single_support": "true" },
+        "causes": ["foot_lift"]
+      },
+      {
+        "id": "reach",
+        "stage": "grasp",
+        "subsystem": "limits",
+        "weight": 0.538,
+        "motion": "any",
+        "live": false,
+        "offline_reason": "퀘스트에 한 발 뻗기 동작 없음",
+        "requires": ["arms"],
+        "posture": { "base": "quiet", "source": "arm_raise", "arm_elev_deg": [90.0, 0.0], "elbow_deg": [0.0, 10.0], "single_support": "true" },
+        "causes": ["foot_lift", "arm_raise"]
+      }
+    ]
+  },
+  {
+    "id": "S4",
+    "name_ko": "짐 들고 제동 (강도 사다리)",
+    "kind": "phase",
+    "core": true,
+    "seg_w": [0.190, 0.233, 0.065, 0.172, 0.129, 0.086, 0.125],
+    "weights_from": "Mini-BESTest 반응 6 : 보행 10 · 사다리는 NIOSH CLI 의 최악 단계 바닥값 (Waters 1994)",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "carry",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.625,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "carry_front", "cargo_frac": 0.10 },
+        "causes": ["carry_front"]
+      },
+      {
+        "id": "brake_0.5",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 0.375,
+        "ladder": "brake",
+        "imposed": true,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_fixed": -0.5 },
+        "causes": ["carry_front", "brake"]
+      },
+      {
+        "id": "brake_1.0",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 0.375,
+        "ladder": "brake",
+        "imposed": true,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_fixed": -1.0 },
+        "causes": ["carry_front", "brake"]
+      },
+      {
+        "id": "brake_1.5",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 0.375,
+        "ladder": "brake",
+        "imposed": true,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_fixed": -1.5 },
+        "causes": ["carry_front", "brake"]
+      },
+      {
+        "id": "brake_2.5",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 0.375,
+        "ladder": "brake",
+        "imposed": true,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_fixed": -2.5 },
+        "causes": ["carry_front", "brake"]
+      }
+    ]
+  },
+  {
+    "id": "S6",
+    "name_ko": "경사 위에서 팔 들어 치고 출발",
+    "kind": "phase",
+    "core": true,
+    "seg_w": [0.168, 0.168, 0.140, 0.114, 0.057, 0.130, 0.223],
+    "weights_from": "Brief-BESTest APA 6 : 감각 3 (Padgett 2012) · RULA 분절 최대점 (McAtamney & Corlett 1993)",
+    "needs_legs": false,
+    "requires": [],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "slope",
+        "stage": "approach",
+        "subsystem": "sensory",
+        "weight": 0.333,
+        "motion": "still",
+        "live": true,
+        "posture": { "base": "quiet", "source": "slope", "slope_deg": 10.0 },
+        "causes": ["slope"]
+      },
+      {
+        "id": "strike",
+        "stage": "grasp",
+        "subsystem": "anticipatory",
+        "weight": 0.3335,
+        "motion": "any",
+        "live": true,
+        "requires": ["arms"],
+        "posture": { "base": "arm_raise", "slope_deg": 10.0 },
+        "causes": ["arm_raise", "slope"]
+      },
+      {
+        "id": "start",
+        "stage": "move",
+        "subsystem": "anticipatory",
+        "weight": 0.3335,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "slope_start", "slope_deg": 10.0 },
+        "causes": ["start", "slope"],
+        "legged_causes": ["foot_lift", "slope"]
+      }
+    ]
+  },
+  {
+    "id": "S5",
+    "name_ko": "움직이는 바닥과 질량 변화 (예약)",
+    "kind": "reserved",
+    "core": false,
+    "seg_w": [0.143, 0.143, 0.143, 0.143, 0.143, 0.143, 0.142],
+    "weights_from": "사람 주파수 응답 원자료 확보 시 채점 승격 (Phase 6 – Part 1 · D5)",
+    "needs_legs": false,
+    "requires": [],
+    "live": false,
+    "series": ["sway_gain", "sway_phase_deg"],
+    "phases": []
+  },
+  {
+    "id": "S5-A",
+    "name_ko": "움직이는 바닥 주파수 응답 (기록 전용)",
+    "kind": "record_only",
+    "core": false,
+    "seg_w": [0.143, 0.143, 0.143, 0.143, 0.143, 0.143, 0.142],
+    "weights_from": "정현파 바닥 가진 응답 이득·위상 기록 전용 (기준 확보 전 채점 보류)",
+    "needs_legs": false,
+    "requires": [],
+    "live": false,
+    "series": ["sway_gain", "sway_phase_deg", "min_margin"],
+    "phases": [
+      {
+        "id": "floor_0.5hz",
+        "stage": "approach",
+        "subsystem": "sensory",
+        "weight": 0.333,
+        "motion": "still",
+        "live": false,
+        "offline_reason": "바닥 정현파 가진 시험은 오프라인 전용",
+        "posture": { "base": "quiet", "source": "accel", "floor_amp_mps2": 0.4, "floor_hz": 0.5 },
+        "causes": []
+      },
+      {
+        "id": "floor_1.5hz",
+        "stage": "approach",
+        "subsystem": "sensory",
+        "weight": 0.333,
+        "motion": "still",
+        "live": false,
+        "offline_reason": "바닥 정현파 가진 시험은 오프라인 전용",
+        "posture": { "base": "quiet", "source": "accel", "floor_amp_mps2": 0.4, "floor_hz": 1.5 },
+        "causes": []
+      },
+      {
+        "id": "floor_load",
+        "stage": "move",
+        "subsystem": "sensory",
+        "weight": 0.334,
+        "motion": "still",
+        "live": false,
+        "offline_reason": "바닥 정현파 가진 시험은 오프라인 전용",
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "floor_amp_mps2": 0.4, "floor_hz": 0.5 },
+        "causes": ["carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "S7",
+    "name_ko": "근무 교대 합성 지수 (SLI)",
+    "kind": "aggregate",
+    "core": false,
+    "seg_w": [0.143, 0.143, 0.143, 0.143, 0.143, 0.143, 0.142],
+    "weights_from": "NIOSH SLI (Waters 2007) — 분모 240분",
+    "needs_legs": false,
+    "requires": [],
+    "live": true,
+    "series": ["sli", "heat_max", "wear_max"],
+    "of": [["S1", 120.0], ["S2", 60.0], ["S4", 60.0]],
+    "phases": []
+  },
+  {
+    "id": "T1",
+    "name_ko": "짐 들고 장시간 운반",
+    "kind": "sequence",
+    "core": false,
+    "seg_w": [0.190, 0.233, 0.065, 0.172, 0.129, 0.086, 0.125],
+    "weights_from": "S4와 같음 (Mini-BESTest 반응 6 : 보행 10) · S7 근무 60분 분배",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "repeat": 12,
+    "rest_s": 2.0,
+    "series": ["heat_max", "wear_max", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "carry",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.625,
+        "motion": "moving",
+        "live": true,
+        "dwell_s": 28.0,
+        "posture": { "base": "quiet", "source": "carry_front", "cargo_frac": 0.10, "moving": true },
+        "causes": ["carry_front"]
+      },
+      {
+        "id": "brake",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 0.375,
+        "imposed": false,
+        "motion": "moving",
+        "live": true,
+        "dwell_s": 2.0,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_planner": -1.0 },
+        "causes": ["carry_front", "brake"]
+      }
+    ]
+  },
+  {
+    "id": "T2",
+    "name_ko": "연속 채취",
+    "kind": "sequence",
+    "core": false,
+    "seg_w": [0.168, 0.168, 0.140, 0.114, 0.057, 0.130, 0.223],
+    "weights_from": "S6 채취 분절 가중 · FX 바위 채취 10분 분배",
+    "needs_legs": false,
+    "requires": ["arms"],
+    "live": true,
+    "repeat": 20,
+    "rest_s": 1.0,
+    "series": ["heat_max", "wear_max", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "mine",
+        "stage": "grasp",
+        "subsystem": "anticipatory",
+        "weight": 1.0,
+        "motion": "any",
+        "live": true,
+        "dwell_s": 5.0,
+        "posture": { "base": "arm_raise" },
+        "causes": ["arm_raise"]
+      }
+    ]
+  },
+  {
+    "id": "T3",
+    "name_ko": "반복 계단 운반",
+    "kind": "sequence",
+    "core": false,
+    "seg_w": [0.056, 0.093, 0.210, 0.149, 0.111, 0.228, 0.154],
+    "weights_from": "S2와 같음 (BESTest APA 18 : 보행 21)",
+    "needs_legs": true,
+    "requires": ["legs"],
+    "live": true,
+    "repeat": 6,
+    "rest_s": 1.0,
+    "series": ["heat_max", "wear_max", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "carry_walk",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.538,
+        "motion": "moving",
+        "live": true,
+        "dwell_s": 8.0,
+        "posture": { "base": "quiet", "source": "foot_lift", "cargo_frac": 0.10, "single_support": "legged" },
+        "causes": ["carry_front", "foot_lift"]
+      },
+      {
+        "id": "step",
+        "stage": "step",
+        "subsystem": "anticipatory",
+        "weight": 0.462,
+        "motion": "any",
+        "live": true,
+        "dwell_s": 2.0,
+        "posture": { "base": "quiet", "source": "step_up", "cargo_frac": 0.10, "step_m": 0.17, "single_support": "legged" },
+        "causes": ["carry_front", "step_up"]
+      }
+    ]
+  },
+  {
+    "id": "C1",
+    "name_ko": "2인 원목 운반",
+    "kind": "crew",
+    "core": false,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "S1 들기 분절 가중 · 협업 팀 셀 Raw 기록",
+    "needs_legs": false,
+    "requires": ["arms2"],
+    "live": false,
+    "series": ["share_ratio", "weak_util", "min_margin"],
+    "phases": [
+      {
+        "id": "cocarry_flat",
+        "stage": "move",
+        "subsystem": "anticipatory",
+        "weight": 1.0,
+        "motion": "any",
+        "live": false,
+        "offline_reason": "2인 협업 정역학 위상은 오프라인 평가",
+        "posture": { "base": "arm_lift", "load_frac": 0.10, "two_arms": "true" },
+        "causes": ["arm_lift"],
+        "cocarry": { "kind": "log", "length_m": 2.0, "diameter_m": 0.18, "slope_deg": 0.0, "load_factor": 1.4, "even_axial": false }
+      }
+    ]
+  },
+  {
+    "id": "C2",
+    "name_ko": "2인 경사 운반",
+    "kind": "crew",
+    "core": false,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "S1 경사 들기 분절 가중 · 협업 경사 하중 배분 Raw 기록",
+    "needs_legs": false,
+    "requires": ["arms2"],
+    "live": false,
+    "series": ["share_ratio", "axial_n", "weak_util"],
+    "phases": [
+      {
+        "id": "cocarry_slope",
+        "stage": "move",
+        "subsystem": "anticipatory",
+        "weight": 1.0,
+        "motion": "any",
+        "live": false,
+        "offline_reason": "2인 협업 경사 위상은 오프라인 평가",
+        "posture": { "base": "arm_lift", "load_frac": 0.10, "slope_deg": 10.0, "two_arms": "true" },
+        "causes": ["arm_lift", "slope"],
+        "cocarry": { "kind": "log", "length_m": 2.0, "diameter_m": 0.18, "slope_deg": 10.0, "load_factor": 1.4, "even_axial": false }
+      }
+    ]
+  },
+  {
+    "id": "C3",
+    "name_ko": "2인 운반 중 한 대 놓침",
+    "kind": "crew",
+    "core": false,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "S1 분절 가중 · 외부 놓침 교란(imposed)",
+    "needs_legs": false,
+    "requires": ["arms2"],
+    "live": false,
+    "series": ["instant_n", "min_margin"],
+    "phases": [
+      {
+        "id": "let_go",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 1.0,
+        "imposed": true,
+        "motion": "any",
+        "live": false,
+        "offline_reason": "협업 놓침 교란 위상은 오프라인 평가",
+        "posture": { "base": "arm_lift", "load_frac": 0.10, "two_arms": "true" },
+        "causes": ["arm_lift"],
+        "cocarry": { "kind": "log", "length_m": 2.0, "diameter_m": 0.18, "slope_deg": 0.0, "load_factor": 1.4, "let_go": 0, "even_axial": false }
+      }
+    ]
+  },
+  {
+    "id": "Y1",
+    "name_ko": "짐 들고 교행 정지",
+    "kind": "crew",
+    "core": false,
+    "seg_w": [0.190, 0.233, 0.065, 0.172, 0.129, 0.086, 0.125],
+    "weights_from": "S4 제동 분절 가중 · 로봇 선택 정지(imposed=false)",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "yield_brake",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 1.0,
+        "imposed": false,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "cargo_frac": 0.10, "accel_planner": -1.0 },
+        "causes": ["carry_front", "brake"]
+      }
+    ]
+  },
+  {
+    "id": "L1",
+    "name_ko": "상차장 적치",
+    "kind": "phase",
+    "core": false,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "S1 들기 분절 가중 · 남은 짐을 안은 채 내려놓기",
+    "needs_legs": false,
+    "requires": ["arms", "cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "stage_put",
+        "stage": "stow",
+        "subsystem": "anticipatory",
+        "weight": 1.0,
+        "motion": "any",
+        "live": true,
+        "posture": { "base": "arm_lift", "load_frac": 0.10, "cargo_frac": 0.10, "two_arms": "auto" },
+        "causes": ["arm_lift", "carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "L2",
+    "name_ko": "탑승자 하차 보행",
+    "kind": "phase",
+    "core": false,
+    "seg_w": [0.056, 0.093, 0.210, 0.149, 0.111, 0.228, 0.154],
+    "weights_from": "S2 보행 분절 가중 · 지게차 탑승자 하차 보행",
+    "needs_legs": true,
+    "requires": ["legs"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "rider_walk",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 1.0,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "foot_lift", "single_support": "true" },
+        "causes": ["foot_lift"]
+      }
+    ]
+  },
+  {
+    "id": "G1",
+    "name_ko": "경사 짐 운반",
+    "kind": "phase",
+    "core": false,
+    "seg_w": [0.218, 0.253, 0.052, 0.138, 0.103, 0.069, 0.167],
+    "weights_from": "S1 경사 분절 가중 · 경사+적재 오귀속 분리",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "slope_carry",
+        "stage": "move",
+        "subsystem": "sensory",
+        "weight": 1.0,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "slope", "slope_deg": 10.0, "cargo_frac": 0.10, "moving": true },
+        "causes": ["slope", "carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "G2",
+    "name_ko": "내리막 짐 제동",
+    "kind": "phase",
+    "core": false,
+    "seg_w": [0.190, 0.233, 0.065, 0.172, 0.129, 0.086, 0.125],
+    "weights_from": "S4 제동 분절 가중 · 내리막 10° 제동",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "downhill_brake",
+        "stage": "brake",
+        "subsystem": "reactive",
+        "weight": 1.0,
+        "imposed": false,
+        "motion": "moving",
+        "live": true,
+        "posture": { "base": "quiet", "source": "accel", "slope_deg": -10.0, "cargo_frac": 0.10, "accel_fixed": -1.0 },
+        "causes": ["slope", "brake", "carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "E1",
+    "name_ko": "지면 전환 운반",
+    "kind": "sequence",
+    "core": false,
+    "seg_w": [0.190, 0.233, 0.065, 0.172, 0.129, 0.086, 0.125],
+    "weights_from": "S4 운반 분절 가중 · 지면별 마찰·구름저항 전환",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "repeat": 4,
+    "rest_s": 0.0,
+    "series": ["heat_max", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "firm_carry",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.5,
+        "motion": "moving",
+        "live": true,
+        "ground": "firm",
+        "dwell_s": 10.0,
+        "posture": { "base": "quiet", "source": "carry_front", "cargo_frac": 0.10, "moving": true, "ground": "firm" },
+        "causes": ["carry_front"]
+      },
+      {
+        "id": "wet_carry",
+        "stage": "move",
+        "subsystem": "gait",
+        "weight": 0.5,
+        "motion": "moving",
+        "live": true,
+        "ground": "wet_sand",
+        "dwell_s": 10.0,
+        "posture": { "base": "quiet", "source": "carry_front", "cargo_frac": 0.10, "moving": true, "ground": "wet_sand" },
+        "causes": ["carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "E2",
+    "name_ko": "경사로·현관 계단",
+    "kind": "sequence",
+    "core": false,
+    "seg_w": [0.056, 0.093, 0.210, 0.149, 0.111, 0.228, 0.154],
+    "weights_from": "S2 분절 가중 · 1:12 경사로 후 17cm 단차 (바퀴형은 경사로만 partial)",
+    "needs_legs": false,
+    "requires": ["cargo"],
+    "live": true,
+    "repeat": 4,
+    "rest_s": 1.0,
+    "series": ["heat_max", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "ramp",
+        "stage": "approach",
+        "subsystem": "sensory",
+        "weight": 0.538,
+        "motion": "moving",
+        "live": true,
+        "dwell_s": 8.0,
+        "posture": { "base": "quiet", "source": "slope", "slope_deg": 4.76, "cargo_frac": 0.10, "moving": true },
+        "causes": ["slope", "carry_front"]
+      },
+      {
+        "id": "porch_step",
+        "stage": "step",
+        "subsystem": "anticipatory",
+        "weight": 0.462,
+        "motion": "any",
+        "live": true,
+        "requires": ["legs"],
+        "dwell_s": 2.0,
+        "posture": { "base": "quiet", "source": "step_up", "step_m": 0.17, "cargo_frac": 0.10, "single_support": "legged" },
+        "causes": ["step_up", "carry_front"]
+      }
+    ]
+  },
+  {
+    "id": "M1",
+    "name_ko": "짐 든 채 채취",
+    "kind": "phase",
+    "core": false,
+    "seg_w": [0.168, 0.168, 0.140, 0.114, 0.057, 0.130, 0.223],
+    "weights_from": "S6 채취 분절 가중 · 적재 상태 팔 들기",
+    "needs_legs": false,
+    "requires": ["arms", "cargo"],
+    "live": true,
+    "series": ["score", "min_margin", "peak_ratio"],
+    "phases": [
+      {
+        "id": "carry_mine",
+        "stage": "grasp",
+        "subsystem": "anticipatory",
+        "weight": 1.0,
+        "motion": "any",
+        "live": true,
+        "posture": { "base": "arm_raise", "cargo_frac": 0.10 },
+        "causes": ["arm_raise", "carry_front"]
+      }
+    ]
+  }
+]

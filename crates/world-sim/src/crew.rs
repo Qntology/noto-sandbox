@@ -10,9 +10,10 @@
 //! A loading bay (상차장) is a waypoint whose deliveries become drops on the ground in a row of slots in front of it:
 //! where humanoids put down what they harvested and a lift truck's tines take it from.
 
-use noto_core::balance::Body;
+use noto_core::balance::{Body, Posture, Source};
 use noto_core::kin::{self, KinLoads, KinPose};
 use noto_core::rig::{self, Palette, Solid};
+use noto_core::surface::Surface;
 use noto_core::{BaseKind, BaseSpec, BodyPlan, FingerCount, Morphology};
 use serde::{Deserialize, Serialize};
 
@@ -167,8 +168,24 @@ pub struct Worker {
 
 impl Worker {
     fn new(id: u32, form: Form, cameras: u8, x: f32, z: f32, yaw: f32, plan: &BodyPlan, fingers: FingerCount) -> Worker {
-        let body = Body::new(&BodyPlan { morph: Morphology::humanoid(form.base()), ..*plan }, form.base(), fingers);
-        let spec = form.base().spec();
+        Self::with_morphology(id, form, Morphology::humanoid(form.base()), cameras, x, z, yaw, plan, fingers)
+    }
+
+    /// Construct a sub-worker with an arbitrary [`Morphology`] (e.g. `Truck`, `MastGripper`, `Humanoid`) (Phase 6 – Part 2 · D3).
+    pub fn with_morphology(
+        id: u32,
+        form: Form,
+        morph: Morphology,
+        cameras: u8,
+        x: f32,
+        z: f32,
+        yaw: f32,
+        plan: &BodyPlan,
+        fingers: FingerCount,
+    ) -> Worker {
+        let base = morph.lower.base();
+        let body = Body::new(&BodyPlan { morph, ..*plan }, base, fingers);
+        let spec = base.spec();
         let capacity_kg = body.drive_limits(&spec, 0.0).capacity_kg;
         Worker {
             id,
@@ -199,6 +216,64 @@ impl Worker {
             stride: Stride::default(),
             fallen_until: None,
             work_left_s: 0.0,
+        }
+    }
+
+    /// Derive a static [`Posture`] from the sub-worker's current [`Job`], load, hold state, slope, and ground
+    /// (Phase 6 – Part 2 · D3). Used for static-only per-worker N:N evaluation without running joint dynamics.
+    pub fn posture_now(&self, slope_deg: f32, ground: Surface) -> (Posture, String) {
+        let cargo = self.carried_kg();
+        let bucket = if slope_deg.abs() < 3.0 {
+            "flat"
+        } else if slope_deg > 0.0 {
+            if slope_deg < 10.0 { "up_lo" } else { "up_hi" }
+        } else if slope_deg > -10.0 {
+            "down_lo"
+        } else {
+            "down_hi"
+        };
+        if self.held_by.is_some() {
+            let decel = -self.body.planned_accel(&self.spec, slope_deg, cargo, ground, -1.0, 0.5);
+            let p = Posture {
+                source: Source::Accel,
+                accel_mps2: decel,
+                slope_deg,
+                ground,
+                moving: true,
+                ..Posture::quiet(cargo)
+            };
+            return (p, format!("{bucket}|yield"));
+        }
+        match &self.job {
+            Job::Go { .. } => {
+                let mut p = Posture { slope_deg, ground, moving: true, ..Posture::quiet(cargo) };
+                if self.speed_mps > 0.05 && self.body.legged() {
+                    p.source = Source::FootLift;
+                    p.single_support = true;
+                } else if slope_deg.abs() >= 3.0 {
+                    p.source = Source::Slope;
+                } else if cargo > 0.0 {
+                    p.source = Source::CarryFront;
+                }
+                (p, format!("{bucket}|move"))
+            }
+            Job::Mine { .. } => (Posture { slope_deg, ground, ..Posture::arm_raise(cargo) }, format!("{bucket}|mine")),
+            Job::Pick { .. } => {
+                let kg = self.carried.last().map_or(2.0, |(k, _)| k.spec().mass_kg);
+                (Posture { slope_deg, ground, ..Posture::arm_lift(kg, false, cargo) }, format!("{bucket}|pick"))
+            }
+            Job::Stage { .. } | Job::Deliver { .. } => {
+                let kg = self.carried.iter().map(|(k, n)| k.spec().mass_kg * n.min(1.0)).fold(0.0f32, f32::max);
+                let tag = if matches!(self.job, Job::Stage { .. }) { "stage" } else { "deliver" };
+                (Posture { slope_deg, ground, ..Posture::arm_lift(kg, false, (cargo - kg).max(0.0)) }, format!("{bucket}|{tag}"))
+            }
+            Job::Idle | Job::Park { .. } => {
+                let mut p = Posture { slope_deg, ground, moving: false, ..Posture::quiet(cargo) };
+                if slope_deg.abs() >= 3.0 {
+                    p.source = Source::Slope;
+                }
+                (p, format!("{bucket}|idle"))
+            }
         }
     }
 

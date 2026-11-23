@@ -6,6 +6,7 @@ import * as hand from './mock-hand.js';
 import * as mw from './mock-world.js';
 import * as rig from './mock-rig.js';
 import * as units from './mock-units.js';
+import * as mp from './mock-progress.js';
 import { depthView, renderFrame, renderUnit } from './mock-render.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -103,14 +104,32 @@ const handlers = {
   load_dictionary: async () => { await sleep(150); return hand.loadDictionary(); },
   dataset_summary: hand.datasetSummary,
   world_new: worldNew,
-  sim_step: mw.simStep,
+  sim_step: (a) => {
+    const r = mw.simStep(a);
+    const tick = r?.snapshot?.tick ?? 0;
+    return { ...r, progress: mp.mockProgress(tick, a?.focus ?? 1), revs: mp.mockRevs(tick) };
+  },
   world_frame: renderFrame,
   command_submit: mw.commandSubmit,
   quest_list: mw.questList,
   perception_scan: async (a) => { await sleep(120); return mw.perceptionScan(a); },
   body_status: mw.bodyStatus,
   sds_status: sdsStatus,
+  sds_feedback: async () => ({ mode: { default: 'live', overrides: {}, snapshot: null }, paths: [] }),
+  sds_tree: async (a) => mp.mockSdsTree(a, mw.world()?.tick ?? 0),
+  sds_query: async (a) => mp.mockSdsQuery(a, mw.world()?.tick ?? 0),
+  sds_watch: async (a) => mp.mockSdsWatch(a, mw.world()?.tick ?? 0),
+  nn_status: async (a) => mp.mockNnStatus(a, mw.world()?.tick ?? 0),
   ts_forecast: tsForecast,
+  ts_keys: async () => ({ contract: 'noto-ts-v1', run_id: 'mock', start_tick: 0, tick_s: 0.1, record_bytes: 16, workers: {}, keys: [], late: 0, memory_bytes: 0, rev: 0 }),
+  ts_series: async (a) => (a?.key
+    ? { key: a.key, channel: '', subject: '', kind: 'gauge', unit: '', start_tick: 0, tick_s: 0.1, t0: 0, period: a?.period || 0, samples: [], dticks: [], values: [], q: [], mask: [], segments: [], imputed_share: 0, spans: [] }
+    : mp.mockTsSeries(a, mw.world()?.tick ?? 0)),
+  ts_view: async (a) => mp.mockTsView(a, mw.world()?.tick ?? 0),
+  forecast_uses: async () => ({ uses: [], active: [] }),
+  rt_revs: async () => mp.mockRevs(mw.world()?.tick ?? 0),
+  test_status_delta: async () => ({ active: false, test_rev: 0 }),
+  test_context: async (a) => ({ pass: a?.pass ?? 'game', tick: a?.tick ?? 0, keyframe: null, video_index: null, video_tick: null, video_total: 0, log_window: null, phase_spans: [], sds_watch: [], gate_marks: [] }),
   log_tail: mw.logTail,
   models_status: async () => ({
     recognizer: 'mock', embedding: false, ttm: false, parser_embedding: false,
@@ -161,6 +180,10 @@ const handlers = {
   rig_delete: rig.rigDelete,
   rig_prompt: rig.rigPrompt,
   rig_commit: rig.rigCommit,
+  sds_generations: async () => ({ current: 'mock+000000000000', parent: null, inherit: 'fresh', generations: [], archive_bytes: 0 }),
+  sds_archive: async () => ({ action: 'list', entries: [], archive_bytes: 0 }),
+  audit_verify: async () => ({ files: [{ session: 'mock', lines: 0, broken_at: null, reason: null, anchor_ok: true, seal_ok: true }] }),
+  replay: async () => ({ matched: true, first_mismatch_tick: null, ticks: 0, original_digests: [], replay_digests: [] }),
   world_terrain: async () => { throw '모의 백엔드에는 지형 격자가 없습니다'; },
 };
 

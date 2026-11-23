@@ -10,13 +10,31 @@ use crate::preprocess::NaflexInput;
 use crate::quant::{Family, QLinear, QWeights};
 
 /// MapHead's packed `in_proj` (query, key and value rows). F32: pre-sliced & pre-transposed once at load
-/// for immutable checkpoint tensors (eliminating 5× 2.36 MB per-call copies while staying bit-identical);
+/// with fused `k+v` (`[d, 2*d]`) for immutable checkpoint tensors (1 GEMM instead of 2 per frame);
 /// live `VarMap` variables keep their reference so post-build `Var::set()` remains visible; quantized or
-/// CPU-packed uses one [`QLinear`] per slice.
+/// CPU-packed uses [`QLinear`] slices with `QLinear::cat_rows` fusing `k+v` when supported.
 enum InProj {
-    Raw { w_t: [Tensor; 3], b: [Tensor; 3] },
-    Var { w: Tensor, b: Tensor, d: usize },
-    Q([QLinear; 3]),
+    Raw {
+        q_w_t: Tensor,
+        q_b: Tensor,
+        kv_w_t: Tensor,
+        kv_b: Tensor,
+        v_w_t: Tensor,
+        v_b: Tensor,
+        d: usize,
+    },
+    Var {
+        w: Tensor,
+        b: Tensor,
+        d: usize,
+    },
+    Q {
+        q: QLinear,
+        k: Option<QLinear>,
+        v: QLinear,
+        kv: Option<QLinear>,
+        d: usize,
+    },
 }
 
 impl InProj {
@@ -30,17 +48,13 @@ impl InProj {
             if w_all.is_variable() || b_all.is_variable() {
                 return Ok(InProj::Var { w: w_all, b: b_all, d });
             }
-            let w_t = [
-                w_all.narrow(0, 0, d)?.t()?.contiguous()?,
-                w_all.narrow(0, d, d)?.t()?.contiguous()?,
-                w_all.narrow(0, 2 * d, d)?.t()?.contiguous()?,
-            ];
-            let b = [
-                b_all.narrow(0, 0, d)?.contiguous()?,
-                b_all.narrow(0, d, d)?.contiguous()?,
-                b_all.narrow(0, 2 * d, d)?.contiguous()?,
-            ];
-            return Ok(InProj::Raw { w_t, b });
+            let q_w_t = w_all.narrow(0, 0, d)?.t()?.contiguous()?;
+            let q_b = b_all.narrow(0, 0, d)?.contiguous()?;
+            let kv_w_t = w_all.narrow(0, d, 2 * d)?.t()?.contiguous()?;
+            let kv_b = b_all.narrow(0, d, 2 * d)?.contiguous()?;
+            let v_w_t = w_all.narrow(0, 2 * d, d)?.t()?.contiguous()?;
+            let v_b = b_all.narrow(0, 2 * d, d)?.contiguous()?;
+            return Ok(InProj::Raw { q_w_t, q_b, kv_w_t, kv_b, v_w_t, v_b, d });
         }
         let mut parts = w
             .linear_split_rows("in_proj_weight", "in_proj_bias", 3, d, d)
@@ -49,22 +63,64 @@ impl InProj {
         let q = parts.next().expect("3 parts");
         let k = parts.next().expect("3 parts");
         let v = parts.next().expect("3 parts");
-        Ok(InProj::Q([q, k, v]))
+        let kv = QLinear::cat_rows(&[&k, &v]);
+        let k_opt = if kv.is_some() { None } else { Some(k) };
+        Ok(InProj::Q { q, k: k_opt, v, kv, d })
     }
 
-    /// Projection `i` (0 query, 1 key, 2 value) of `x`.
-    fn forward(&self, i: usize, x: &Tensor) -> Result<Tensor> {
+    fn forward_q(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            InProj::Raw { w_t, b } => x.broadcast_matmul(&w_t[i])?.broadcast_add(&b[i]),
-            InProj::Var { w, b, d } => x.broadcast_matmul(&w.narrow(0, i * d, *d)?.t()?.contiguous()?)?.broadcast_add(&b.narrow(0, i * d, *d)?),
-            InProj::Q(l) => l[i].forward(x),
+            InProj::Raw { q_w_t, q_b, .. } => x.broadcast_matmul(q_w_t)?.broadcast_add(q_b),
+            InProj::Var { w, b, d } => x
+                .broadcast_matmul(&w.narrow(0, 0, *d)?.t()?.contiguous()?)?
+                .broadcast_add(&b.narrow(0, 0, *d)?),
+            InProj::Q { q, .. } => q.forward(x),
+        }
+    }
+
+    fn forward_v(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            InProj::Raw { v_w_t, v_b, .. } => x.broadcast_matmul(v_w_t)?.broadcast_add(v_b),
+            InProj::Var { w, b, d } => x
+                .broadcast_matmul(&w.narrow(0, 2 * d, *d)?.t()?.contiguous()?)?
+                .broadcast_add(&b.narrow(0, 2 * d, *d)?),
+            InProj::Q { v, .. } => v.forward(x),
+        }
+    }
+
+    /// Computes `(k, v)` in a single fused GEMM / quantized matmul when available.
+    fn forward_kv(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        match self {
+            InProj::Raw { kv_w_t, kv_b, d, .. } => {
+                let kv = x.broadcast_matmul(kv_w_t)?.broadcast_add(kv_b)?;
+                let last = kv.rank() - 1;
+                Ok((kv.narrow(last, 0, *d)?.contiguous()?, kv.narrow(last, *d, *d)?.contiguous()?))
+            }
+            InProj::Var { w, b, d } => {
+                let k = x
+                    .broadcast_matmul(&w.narrow(0, *d, *d)?.t()?.contiguous()?)?
+                    .broadcast_add(&b.narrow(0, *d, *d)?)?;
+                let v = x
+                    .broadcast_matmul(&w.narrow(0, 2 * d, *d)?.t()?.contiguous()?)?
+                    .broadcast_add(&b.narrow(0, 2 * d, *d)?)?;
+                Ok((k, v))
+            }
+            InProj::Q { k, v, kv, d, .. } => {
+                if let Some(fused) = kv {
+                    let out = fused.forward(x)?;
+                    let last = out.rank() - 1;
+                    Ok((out.narrow(last, 0, *d)?.contiguous()?, out.narrow(last, *d, *d)?.contiguous()?))
+                } else {
+                    Ok((k.as_ref().expect("k present when kv is None").forward(x)?, v.forward(x)?))
+                }
+            }
         }
     }
 }
 
 pub struct MapHead {
     probe: Tensor,
-    /// Precomputed `split(in_proj(0, probe))` shaped `(1, heads, 1, hd)` for immutable checkpoint weights
+    /// Precomputed `split(in_proj.forward_q(probe))` shaped `(1, heads, 1, hd)` for immutable checkpoint weights
     /// (avoids re-running the constant probe projection every frame; `None` for live `VarMap` test variables).
     q_probe: Option<Tensor>,
     in_proj: InProj,
@@ -85,7 +141,7 @@ impl MapHead {
         let in_proj = InProj::new(&attn, d)?;
         let q_probe = if !probe.is_variable() && !matches!(in_proj, InProj::Var { .. }) {
             let q = in_proj
-                .forward(0, &probe)?
+                .forward_q(&probe)?
                 .reshape((1, 1, heads, hd))?
                 .transpose(1, 2)?
                 .contiguous()?;
@@ -116,7 +172,7 @@ impl MapHead {
         // Contiguous: from a broadcast batch Metal's matmul gets every row after the first wrong.
         let probe = self.probe.broadcast_as((b, 1, self.hidden))?.contiguous()?;
         self.in_proj
-            .forward(0, &probe)?
+            .forward_q(&probe)?
             .reshape((b, 1, self.heads, hd))?
             .transpose(1, 2)?
             .contiguous()
@@ -128,20 +184,31 @@ impl MapHead {
         let hd = d / self.heads;
 
         let q = self.q_for_batch(b, hd)?;
-        let k = self.in_proj.forward(1, tokens)?;
-        let v = self.in_proj.forward(2, tokens)?;
+        let (k, v) = self.in_proj.forward_kv(tokens)?;
 
         let split = |t: Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.heads, hd))?.transpose(1, 2)?.contiguous()
         };
         let k = split(k, n)?;
         let v = split(v, n)?;
-        let scores = q
-            .matmul(&k.transpose(2, 3)?)?
-            .affine((hd as f64).powf(-0.5), 0.0)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs
-            .matmul(&v)?
+        let ctx_bhsd = if hd <= 256 && crate::device::accel_op_ok(tokens.device(), crate::device::AccelOp::FlashAttn) {
+            let fa_cfg = candle_nn::flash_attn::FlashAttnConfig::new((hd as f32).powf(-0.5));
+            match candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &fa_cfg) {
+                Ok(out) => out,
+                Err(_) => {
+                    let scores = q
+                        .matmul(&k.transpose(2, 3)?)?
+                        .affine((hd as f64).powf(-0.5), 0.0)?;
+                    candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
+                }
+            }
+        } else {
+            let scores = q
+                .matmul(&k.transpose(2, 3)?)?
+                .affine((hd as f64).powf(-0.5), 0.0)?;
+            candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?
+        };
+        let ctx = ctx_bhsd
             .transpose(1, 2)?
             .contiguous()?
             .reshape((b, 1, d))?;
@@ -153,7 +220,7 @@ impl MapHead {
     }
 
     fn dense(&self, tokens: &Tensor) -> Result<Tensor> {
-        let v = self.in_proj.forward(2, tokens)?;
+        let v = self.in_proj.forward_v(tokens)?;
         let attended = self.out.forward(&v)?;
         let normed = self.ln.forward(&attended)?;
         &attended + self.mlp.forward(&normed)?
@@ -167,8 +234,7 @@ impl MapHead {
         let hd = d / self.heads;
 
         let q = self.q_for_batch(b, hd)?;
-        let k = self.in_proj.forward(1, tokens)?;
-        let v_lin = self.in_proj.forward(2, tokens)?;
+        let (k, v_lin) = self.in_proj.forward_kv(tokens)?;
 
         let split = |t: Tensor, len: usize| -> Result<Tensor> {
             t.reshape((b, len, self.heads, hd))?.transpose(1, 2)?.contiguous()
