@@ -16,7 +16,7 @@ tokenizers = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 noto-cpu-kernels = { path = "../noto-cpu-kernels" }
-candle-rocm = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "6c3e5a13066db93148bbfbdee662caa2a0477f2f", optional = true }
+candle-rocm = { git = "https://github.com/sungu-che/candle-rocm-vulkan", rev = "36c88e3d57de7a1459ac7d228c88f0cf63990356", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"], optional = true }

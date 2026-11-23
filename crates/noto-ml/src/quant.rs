@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
+use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QTensor};
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{Linear, VarBuilder};
@@ -615,6 +615,80 @@ impl QLinear {
             None => None,
         };
         Ok(QLinear::CpuPacked { w: packed, b })
+    }
+
+    /// Concatenates multiple compatible [`QLinear`] projections along the output (row) axis so
+    /// sibling projections (e.g. `k` + `v` in `MapHead`) execute as a single GEMM / quantized matmul
+    /// without re-quantizing. Returns `None` when layers have incompatible variants, dtypes, or
+    /// bias presence (such as `CpuPacked`).
+    pub fn cat_rows(layers: &[&QLinear]) -> Option<QLinear> {
+        if layers.len() < 2 {
+            return None;
+        }
+        match layers[0] {
+            QLinear::Dense(_) => {
+                let mut ws = Vec::with_capacity(layers.len());
+                let mut bs = Vec::with_capacity(layers.len());
+                let has_bias = matches!(layers[0], QLinear::Dense(l) if l.bias().is_some());
+                for layer in layers {
+                    let QLinear::Dense(l) = layer else { return None };
+                    ws.push(l.weight());
+                    match (has_bias, l.bias()) {
+                        (true, Some(b)) => bs.push(b),
+                        (false, None) => {}
+                        _ => return None,
+                    }
+                }
+                let w = Tensor::cat(&ws, 0).ok()?;
+                let b = if has_bias { Some(Tensor::cat(&bs, 0).ok()?) } else { None };
+                Some(QLinear::Dense(Linear::new(w, b)))
+            }
+            QLinear::Quant { w: w0, b: b0, use_native_fwd } => {
+                let has_bias = b0.is_some();
+                let mut bs = Vec::with_capacity(layers.len());
+                for layer in layers {
+                    let QLinear::Quant { b, use_native_fwd: nf, .. } = layer else { return None };
+                    if *nf != *use_native_fwd {
+                        return None;
+                    }
+                    match (has_bias, b) {
+                        (true, Some(bt)) => bs.push(bt),
+                        (false, None) => {}
+                        _ => return None,
+                    }
+                }
+                let cat_w = match w0 {
+                    QMatMul::QTensor(_) => {
+                        let mut qts: Vec<&QTensor> = Vec::with_capacity(layers.len());
+                        for layer in layers {
+                            let QLinear::Quant { w: QMatMul::QTensor(qt), .. } = layer else { return None };
+                            qts.push(qt.as_ref());
+                        }
+                        let cat_qt = QTensor::cat_rows(&qts).ok()?;
+                        QMatMul::from_qtensor(cat_qt).ok()?
+                    }
+                    QMatMul::Tensor(_) => {
+                        let mut ts = Vec::with_capacity(layers.len());
+                        for layer in layers {
+                            let QLinear::Quant { w: QMatMul::Tensor(t), .. } = layer else { return None };
+                            ts.push(t);
+                        }
+                        QMatMul::Tensor(Tensor::cat(&ts, 0).ok()?)
+                    }
+                    QMatMul::TensorF16(_) => {
+                        let mut ts = Vec::with_capacity(layers.len());
+                        for layer in layers {
+                            let QLinear::Quant { w: QMatMul::TensorF16(t), .. } = layer else { return None };
+                            ts.push(t);
+                        }
+                        QMatMul::TensorF16(Tensor::cat(&ts, 0).ok()?)
+                    }
+                };
+                let cat_b = if has_bias { Some(Tensor::cat(&bs, 0).ok()?) } else { None };
+                Some(QLinear::Quant { w: cat_w, b: cat_b, use_native_fwd: *use_native_fwd })
+            }
+            QLinear::CpuPacked { .. } => None,
+        }
     }
 }
 

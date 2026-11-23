@@ -169,3 +169,84 @@ fn sam_encoder_and_decoder_match_the_cpu() {
     assert!(out.len() <= 1);
     assert_eq!(t.cached_frames(), 2);
 }
+
+#[test]
+fn siglip2_sparse_extend_blocks_and_quant_pyramid_match_cpu() {
+    use candle_core::quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul};
+    use candle_core::Module;
+    use noto_ml::preprocess::DenseGrid;
+    use noto_ml::quant::QLinear;
+
+    let dev = gpu();
+    let vm = VarMap::new();
+    let on_cpu = || VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
+    Siglip2::from_var_builder(tiny_siglip(), on_cpu(), &Device::Cpu, None).unwrap();
+    fill_zeroed(&vm);
+    let cpu = Siglip2::from_var_builder(tiny_siglip(), on_cpu(), &Device::Cpu, None).unwrap();
+    let g = Siglip2::from_var_builder(
+        tiny_siglip(),
+        VarBuilder::from_tensors(weights_on(&vm, &dev), DType::F32, &dev),
+        &dev,
+        None,
+    )
+    .unwrap();
+
+    // 1. Sparse initial pass + open_cells (exercises zero-copy 2-block flash_attn_blocks + MapHead flash_attn_bhsd on CUDA).
+    let img = frame(96, 64, 7).to_dynamic();
+    let grid = DenseGrid::Pyramid { short_side: 4 };
+    let (gh, gw) = cpu.dense_grid(96, 64, grid);
+    let n = (gh * gw) as u32;
+    let first: Vec<u32> = (0..n).filter(|c| c % 2 == 0).collect();
+    let rest: Vec<u32> = (0..n).filter(|c| c % 2 == 1).collect();
+
+    let mut sd_cpu = cpu.embed_dense_sparse(&img, grid, &first).unwrap();
+    let mut sd_gpu = g.embed_dense_sparse(&img, grid, &first).unwrap();
+    cpu.open_cells(&mut sd_cpu, &rest).unwrap();
+    g.open_cells(&mut sd_gpu, &rest).unwrap();
+    assert_eq!(sd_gpu.evaluated(), n as usize);
+    let e_sparse_vec = sd_cpu
+        .vectors
+        .iter()
+        .zip(&sd_gpu.vectors)
+        .map(|(a, b)| worst(a.as_ref().unwrap(), b.as_ref().unwrap()))
+        .fold(0.0, f32::max);
+    let e_sparse_pool = worst(&sd_cpu.pooled, &sd_gpu.pooled);
+
+    // 2. QLinear::cat_rows across all 4 pyramid quantization formats (Q8_0, Q6K, Q5K, Q4K) on GPU vs CPU.
+    let (rows, cols) = (64usize, 256usize);
+    let det = |len: usize, seed: usize| -> Vec<f32> {
+        (0..len).map(|i| ((i * 29 + seed) % 97) as f32 / 48.0 - 1.0).collect()
+    };
+    let x_cpu = Tensor::from_vec(det(3 * cols, 5), (1, 3, cols), &Device::Cpu).unwrap();
+    let x_dev = x_cpu.to_device(&dev).unwrap();
+    let use_native_fwd = matches!(dev, Device::Vulkan(_));
+    let mut worst_q = 0.0f32;
+    for dtype in [GgmlDType::Q8_0, GgmlDType::Q6K, GgmlDType::Q5K, GgmlDType::Q4K] {
+        let make_ql = |seed: usize, target: &Device, native: bool| -> QLinear {
+            let w = det(rows * cols, seed);
+            let bytes = noto_ml::kquant::encode(&w, cols, dtype, None).unwrap();
+            let mut words = vec![0u64; bytes.len().div_ceil(8)];
+            let (_, raw, _) = unsafe { words.align_to_mut::<u8>() };
+            raw[..bytes.len()].copy_from_slice(&bytes);
+            let qt = qtensor_from_ggml(dtype, &raw[..bytes.len()], vec![rows, cols], target).unwrap();
+            let b = Tensor::from_vec(det(rows, seed + 1), rows, target).unwrap();
+            QLinear::Quant { w: QMatMul::from_qtensor(qt).unwrap(), b: Some(b), use_native_fwd: native }
+        };
+        let k_cpu = make_ql(11, &Device::Cpu, false);
+        let v_cpu = make_ql(17, &Device::Cpu, false);
+        let k_gpu = make_ql(11, &dev, use_native_fwd);
+        let v_gpu = make_ql(17, &dev, use_native_fwd);
+        let kv_gpu = QLinear::cat_rows(&[&k_gpu, &v_gpu]).expect("QLinear::cat_rows succeeds for matching Quant layers");
+        let y_cat_gpu = kv_gpu.forward(&x_dev).unwrap().to_device(&Device::Cpu).unwrap();
+        let y_ref_cpu = Tensor::cat(&[&k_cpu.forward(&x_cpu).unwrap(), &v_cpu.forward(&x_cpu).unwrap()], 2).unwrap();
+        let err = worst(
+            &y_cat_gpu.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            &y_ref_cpu.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        worst_q = worst_q.max(err);
+    }
+    println!(
+        "[GPU] siglip2 sparse+blocks · vecs {e_sparse_vec:.2e} · pooled {e_sparse_pool:.2e} · QLinear::cat_rows (Q8_0/Q6K/Q5K/Q4K) {worst_q:.2e}"
+    );
+    assert!(e_sparse_vec < 1e-3 && e_sparse_pool < 1e-3 && worst_q < 1e-3);
+}
