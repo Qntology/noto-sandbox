@@ -1,6 +1,6 @@
-use noto_data::test_tables::{write_mirror, TABLE_BALANCE_EFFORT, TABLE_ML_KEYFRAMES, TABLE_QUEST_RUNS, TABLE_QUEST_STATS, TABLE_QUEST_STEPS};
+use noto_data::test_tables::{write_mirror, write_ts_samples, TsSampleEntry, TABLE_BALANCE_EFFORT, TABLE_ML_KEYFRAMES, TABLE_NN_PHASES, TABLE_QUEST_RUNS, TABLE_QUEST_STATS, TABLE_QUEST_STEPS, TABLE_TS_SAMPLES};
 use noto_data::LanceStore;
-use noto_sds::{BalanceRow, KeyframeRow, QuestRun, StepRecord, TestDb};
+use noto_sds::{BalanceRow, KeyframeRow, NnPhaseRow, QuestRun, StepRecord, TestDb};
 
 fn run(pass: &str, ok: bool) -> QuestRun {
     QuestRun {
@@ -23,6 +23,9 @@ fn run(pass: &str, ok: bool) -> QuestRun {
             StepRecord { step: "collect".into(), attempts: 1, ok, fail_code: (!ok).then(|| "lift_overload".into()), time_s: 0.0 },
         ],
         created_ms: 1,
+        generation: "noto-1.0.0-wave1+000000000000".into(),
+        ledger_digest: "abcd1234".into(),
+        sds_mode: "live".into(),
     }
 }
 
@@ -63,8 +66,12 @@ async fn test_records_round_trip_through_lance() {
         fusion_flags: String::new(),
         balance_margin: Some(0.7),
         effort_max: Some(0.3),
+        generation: "noto-1.0.0-wave1+000000000000".into(),
+        ledger_digest: "abcd1234".into(),
+        sds_mode: "live".into(),
     });
     db.record_balance(BalanceRow {
+        event_id: "t1-game#10".into(),
         run_id: "t1-game".into(),
         pass: "game".into(),
         tick: 10,
@@ -83,17 +90,61 @@ async fn test_records_round_trip_through_lance() {
         margin: 0.6,
         margin_noff: 0.5,
         ff_gain: 1.0,
+        generation: "noto-1.0.0-wave1+000000000000".into(),
+        ledger_digest: "abcd1234".into(),
+        sds_mode: "live".into(),
+    });
+    db.record_nn_phase(NnPhaseRow {
+        event_id: "t1-game#10".into(),
+        run_id: "t1-game".into(),
+        pass: "game".into(),
+        tick: 10,
+        time_s: 1.0,
+        instance_id: 1,
+        span_id: 2,
+        scenario: "S4".into(),
+        phase: "brake_1.5".into(),
+        holdout: false,
+        form: "mid:wheel:f5".into(),
+        gnd: "firm".into(),
+        slope: "flat".into(),
+        stg: "move".into(),
+        wk: "main".into(),
+        score: 82.5,
+        item: 2,
+        gate_codes: String::new(),
+        beyond_human: false,
+        static_margin: 0.6,
+        min_margin: 0.45,
+        peak_ratio: 0.52,
+        sustained_effort: 0.31,
+        worst_joint: Some("knee_r".into()),
+        generation: "noto-1.0.0-wave1+000000000000".into(),
+        ledger_digest: "abcd1234".into(),
+        sds_mode: "live".into(),
     });
     let batch = db.take_mirror();
     let c = write_mirror(&store, &batch, &db.stats()).await.unwrap();
-    assert_eq!((c.quest_runs, c.quest_steps, c.ml_keyframes, c.balance_effort), (2, 4, 1, 1));
+    assert_eq!((c.quest_runs, c.quest_steps, c.ml_keyframes, c.balance_effort, c.nn_phases), (2, 4, 1, 1, 1));
     assert_eq!(store.row_count(TABLE_QUEST_RUNS).await.unwrap(), 2);
     assert_eq!(store.row_count(TABLE_QUEST_STEPS).await.unwrap(), 4);
     assert_eq!(store.row_count(TABLE_ML_KEYFRAMES).await.unwrap(), 1);
     assert_eq!(store.row_count(TABLE_BALANCE_EFFORT).await.unwrap(), 1);
+    assert_eq!(store.row_count(TABLE_NN_PHASES).await.unwrap(), 1);
     let stats = store.row_count(TABLE_QUEST_STATS).await.unwrap();
     assert_eq!(stats, db.stats().len());
     write_mirror(&store, &db.take_mirror(), &db.stats()).await.unwrap();
     assert_eq!(store.row_count(TABLE_QUEST_STATS).await.unwrap(), stats);
+    let ts_n = write_ts_samples(
+        &store,
+        &[
+            TsSampleEntry { run_id: "t1-game".into(), worker: 1, channel: "bal.margin".into(), subject: String::new(), dtick: 0, sub_ms: 0, value: 0.12, q: 1 },
+            TsSampleEntry { run_id: "t1-game".into(), worker: 1, channel: "nn.score".into(), subject: "s4:brake_1.5".into(), dtick: 50, sub_ms: 0, value: 84.0, q: 1 },
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(ts_n, 2);
+    assert_eq!(store.row_count(TABLE_TS_SAMPLES).await.unwrap(), 2);
     let _ = std::fs::remove_dir_all(&dir);
 }

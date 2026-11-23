@@ -3,7 +3,7 @@ use std::sync::Arc;
 use noto_core::{BodyPlan, NotoConfig};
 use noto_runtime::Runtime;
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{Emitter, State};
 
 use crate::state::{bank_dir, default_store_dir, model_dir, sam_dir, tips_dir, ttm_dir, AppState};
 
@@ -30,12 +30,42 @@ pub async fn rt_call(state: App<'_>, cmd: String, args: Option<Value>) -> Result
     if RUNS_WORLD.contains(&cmd.as_str()) {
         state.require_models()?;
     }
+    let a = args.unwrap_or(Value::Null);
+    // Serve lock-free cached snapshots when fresh (Phase 5 – Part 2 · D5).
+    if cmd == "rt_revs" {
+        if let Ok(c) = state.read_cache.read() {
+            if let Some(revs) = &c.revs {
+                return Ok(revs.clone());
+            }
+        }
+    } else if cmd == "sds_tree" && a.get("parent").and_then(Value::as_str).unwrap_or("").is_empty() {
+        if let Ok(c) = state.read_cache.read() {
+            if let Some((rev, val)) = &c.sds_tree_root {
+                if a.get("if_rev").and_then(Value::as_u64) == Some(*rev) {
+                    return Ok(json!({"unchanged": true, "rev": rev}));
+                }
+                return Ok(val.clone());
+            }
+        }
+    } else if cmd == "ts_series" && a.get("key").is_none() {
+        if let Ok(c) = state.read_cache.read() {
+            if let Some((rev, val)) = &c.ts_series_list {
+                if a.get("if_rev").and_then(Value::as_u64) == Some(*rev) {
+                    return Ok(json!({"unchanged": true, "rev": rev}));
+                }
+                return Ok(val.clone());
+            }
+        }
+    }
     let shared: Arc<AppState> = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         shared.with_world(|rt| {
-            let out = rt.api_call(&cmd, &args.unwrap_or(Value::Null));
+            let out = rt.api_call(&cmd, &a);
             // The eye's camera count decides which models are needed: keep the app's copy in step with the runtime.
             shared.set_stereo(rt.stereo());
+            if matches!(cmd.as_str(), "test_step" | "test_start" | "test_cancel" | "world_new" | "world_reset") {
+                shared.refresh_read_cache(rt);
+            }
             out
         })
     })
@@ -103,51 +133,103 @@ fn selected_device(state: &AppState) -> Result<candle_core::Device, String> {
 }
 
 #[tauri::command]
-pub async fn sim_step(state: App<'_>, ticks: u32) -> Result<Value, String> {
+pub async fn sim_step(app: tauri::AppHandle, state: App<'_>, ticks: u32, focus: Option<u32>) -> Result<Value, String> {
     state.require_models()?;
-    state.with_world(|rt| rt.api_sim_step(ticks))
+    let focus = focus.unwrap_or(1);
+    let shared: Arc<AppState> = state.inner().clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        shared.with_world(|rt| {
+            let out = rt.api_sim_step_focus(ticks, focus)?;
+            shared.refresh_read_cache(rt);
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    if let Some(revs) = res.get("revs") {
+        let _ = app.emit("rt-revs", revs);
+    }
+    Ok(res)
 }
 
 #[tauri::command]
 pub async fn world_frame(state: App<'_>, width: u32, height: u32, quality: f32, view: Option<String>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_world_frame(width, height, quality, view.as_deref().unwrap_or("agent")))
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        shared.with_world(|rt| rt.api_world_frame(width, height, quality, view.as_deref().unwrap_or("agent")))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn command_submit(state: App<'_>, text: String, record: Option<bool>) -> Result<Value, String> {
     state.require_models()?;
-    state.with_world(|rt| rt.api_command_submit_rec(&text, record.unwrap_or(false)))
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        shared.with_world(|rt| {
+            let out = rt.api_command_submit_rec(&text, record.unwrap_or(false))?;
+            shared.refresh_read_cache(rt);
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn quest_list(state: App<'_>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_quest_list())
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_quest_list()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn perception_scan(state: App<'_>, top_k: usize) -> Result<Value, String> {
     state.require_models()?;
-    state.with_world(|rt| rt.api_perception_scan(top_k))
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        shared.with_world(|rt| {
+            let out = rt.api_perception_scan(top_k)?;
+            shared.refresh_read_cache(rt);
+            Ok(out)
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn body_status(state: App<'_>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_body_status())
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_body_status()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn sds_status(state: App<'_>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_sds_status())
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_sds_status()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn ts_forecast(state: App<'_>, scope: String, axis: String) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_ts_forecast(&scope, &axis))
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_ts_forecast(&scope, &axis)))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 pub async fn log_tail(state: App<'_>, after_seq: u64, limit: usize, category: Option<String>) -> Result<Value, String> {
-    state.with_world(|rt| rt.api_log_tail(after_seq, limit, category.as_deref()))
+    let shared: Arc<AppState> = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || shared.with_world(|rt| rt.api_log_tail(after_seq, limit, category.as_deref())))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 pub(crate) fn all_live(rt: &Runtime) -> bool {

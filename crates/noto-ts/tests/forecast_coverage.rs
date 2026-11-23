@@ -81,3 +81,71 @@ fn holts_spread_grows_like_its_errors() {
     println!("[TS] holt on a walk: its sd over the error it makes, h1..h{h}: {}", ratio.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>().join(" "));
     assert!(ratio.iter().all(|r| (0.85..=1.15).contains(r)), "{ratio:?}");
 }
+
+#[test]
+fn the_calibrated_band_converges_to_eighty_percent() {
+    use noto_ts::{ErrBook, HORIZONS};
+    for kind in ["iid", "ar1", "walk", "trend"] {
+        let mut rng = Rng(0xC41B_0001 ^ kind.len() as u64);
+        let y = series(kind, 520, 4, &mut rng);
+        let mut book = ErrBook::new(0.92, 0.05);
+        let mut hits = 0usize;
+        let eval_start = 120usize;
+        let eval_end = 500usize;
+        for t in 16..eval_end {
+            let f = forecast(&y[..t], 1, &[], &book.realized());
+            let s_model = ((f.p90[0] - f.p10[0]) * 0.5 / 1.2816).max(1e-4);
+            let s_f = book.s_fused(s_model);
+            let half = book.k * 1.2816 * s_f;
+            let obs = y[t];
+            let inside = (obs - f.point[0]).abs() <= half;
+            if t >= eval_start && inside {
+                hits += 1;
+            }
+            book.update(&f.weights, obs, obs - f.point[0], s_model);
+            book.aci_step(!inside);
+        }
+        let cov = hits as f64 / (eval_end - eval_start) as f64;
+        let _ = HORIZONS;
+        assert!(
+            (0.74..=0.86).contains(&cov),
+            "calibrated h=1 coverage on {kind} was {cov:.3} (expected [0.74, 0.86], k={:.2})",
+            book.k
+        );
+    }
+}
+
+#[test]
+fn each_horizon_is_calibrated_separately() {
+    use noto_ts::{ErrBook, PendingRing};
+    let mut rng = Rng(0xC41B_0002);
+    let y = series("ar1", 560, 16, &mut rng);
+    let mut book = ErrBook::new(0.92, 0.05);
+    let mut ring = PendingRing::default();
+    let eval_start = 140usize;
+    let mut hits = [0usize; 3];
+    let mut tot = [0usize; 3];
+    for t in 16..520 {
+        let f = forecast(&y[..t], 16, &[], &book.realized());
+        ring.issue((t - 1) as u64, (t - 1) as u64, &f.point, &f.p10, &f.p90, &f.weights);
+        let scored = ring.score_ready(t as u64, t as u64, y[t], &mut book);
+        if t >= eval_start {
+            for sc in scored {
+                if sc.h_idx < 3 {
+                    tot[sc.h_idx] += 1;
+                    if sc.inside80 {
+                        hits[sc.h_idx] += 1;
+                    }
+                }
+            }
+        }
+    }
+    for (i, h) in [1usize, 2, 4].iter().enumerate() {
+        let cov = hits[i] as f64 / tot[i].max(1) as f64;
+        assert!(
+            (0.73..=0.87).contains(&cov),
+            "calibrated horizon h={h} coverage {cov:.3} out of [0.73, 0.87] (k={:.2})",
+            book.h_aci[i].k
+        );
+    }
+}

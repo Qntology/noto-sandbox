@@ -449,6 +449,10 @@ pub struct Rollout {
     pub notes: Vec<String>,
     pub head_pitch_max_deg: f32,
     pub pelvis_lat_acc_max: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sway_gain: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sway_phase_deg: Option<f32>,
     #[serde(skip)]
     robot: Robot,
     #[serde(skip)]
@@ -457,6 +461,25 @@ pub struct Rollout {
     support_before: [f32; 4],
     #[serde(skip)]
     lift_at: f32,
+}
+
+/// Analytical steady-state frequency response `(gain, phase_deg)` of the PD-stabilized
+/// inverted pendulum of height `l_m` and controller bandwidth `bandwidth_hz` to sinusoidal
+/// horizontal floor displacement at `floor_hz` (Phase 6 – Part 1 · D5).
+pub fn inverted_pendulum_frf(l_m: f64, bandwidth_hz: f64, floor_hz: f64) -> (f64, f64) {
+    let wn = std::f64::consts::TAU * bandwidth_hz.max(1e-3);
+    let kd = 2.0 * wn;
+    let w0_sq = (wn * wn - G as f64 / l_m.max(0.2)).max(1.0);
+    let w = std::f64::consts::TAU * floor_hz.max(1e-4);
+    // H(jw) = (w0^2 + j kd w) / ((w0^2 - w^2) + j kd w)
+    let nr = w0_sq;
+    let ni = kd * w;
+    let dr = w0_sq - w * w;
+    let di = kd * w;
+    let den = (dr * dr + di * di).max(1e-12);
+    let hr = (nr * dr + ni * di) / den;
+    let hi = (ni * dr - nr * di) / den;
+    ((hr * hr + hi * hi).sqrt(), hi.atan2(hr).to_degrees())
 }
 
 fn targets(body: &Body, post: &Posture, lean_rad: f64, pitch: f64, robot: &Robot) -> Vec<f64> {
@@ -491,7 +514,20 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let q_to = targets(body, to, lean1, pitch1, &robot);
     let posture_moves = q_from.iter().zip(&q_to).any(|(a, b)| (a - b).abs() > 1f64.to_radians());
     let accel_t0 = if to.source == Source::Accel && posture_moves { dur } else { 0.0 };
-    let total = dur + accel_t0 + cfg.settle_s as f64;
+    let floor_active = to.floor_hz > 0.0 && to.floor_amp_mps2.abs() > 0.0;
+    let floor_w = std::f64::consts::TAU * to.floor_hz as f64;
+    let floor_a0 = to.floor_amp_mps2 as f64;
+    let floor_period = if floor_active { 1.0 / to.floor_hz as f64 } else { 0.0 };
+    let floor_t0 = dur;
+    let floor_meas_start = floor_t0 + (2.0 * floor_period).max(1.0);
+    let floor_meas_end = floor_meas_start + 3.0 * floor_period;
+    let l_ip = (goal.com[2] as f64).max(0.2);
+    let omega0_sq = (kp - G as f64 / l_ip).max(1.0);
+    let total = if floor_active {
+        floor_meas_end
+    } else {
+        dur + accel_t0 + cfg.settle_s as f64
+    };
     let anticipated = if ff.enabled && goal.shift_uncomp_m.abs() > 1e-5 { (ff.gain * goal.ff_predicted_m / goal.shift_uncomp_m).clamp(0.0, 2.0) } else { 0.0 } as f64;
     let delay = REACTION_DELAY_S as f64;
     let comp = |t: f64| -> (f64, f64, f64) {
@@ -506,24 +542,35 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let support = body.support_rect(to, pitch1 as f32);
     let lift_at = if to.single_support && !from.single_support { dur } else { 0.0 };
     let support_before = body.support_rect(from, pitch0 as f32);
-    let root_at = |t: f64| -> RootState {
+    let floor_acc_at = |t: f64| -> f64 {
+        if floor_active && t >= floor_t0 {
+            floor_a0 * (floor_w * (t - floor_t0)).sin()
+        } else {
+            0.0
+        }
+    };
+    let root_at = |t: f64, sway_q: f64| -> RootState {
         let (c, cd, cdd) = comp(t);
         let _ = cd;
         let (s, _, sdd) = min_jerk(t / dur);
         let _ = cdd;
         let ramp = |x: f64| (x / 0.1).clamp(0.0, 1.0);
-        let acc = if to.source == Source::Accel { to.accel_mps2 as f64 * ramp(t - accel_t0).min(ramp(accel_t0 + dur - t)) } else { 0.0 };
+        let base_acc = if to.source == Source::Accel { to.accel_mps2 as f64 * ramp(t - accel_t0).min(ramp(accel_t0 + dur - t)) } else { 0.0 };
+        let acc = base_acc + floor_acc_at(t);
         RootState {
             shift_y: (shift0 + (shift1 - shift0) * c) as f32,
             rise_m: (step * s) as f32,
             rise_acc: (step * sdd / (dur * dur)) as f32,
             accel: acc as f32,
-            pitch: (pitch0 + (pitch1 - pitch0) * s) as f32,
+            pitch: (pitch0 + (pitch1 - pitch0) * s - sway_q) as f32,
         }
     };
 
     let mut q = q_from.clone();
     let mut qd = vec![0.0; n];
+    let (mut sway_q, mut sway_qd) = (0.0f64, 0.0f64);
+    let (mut dft_s2, mut dft_c2, mut dft_sc, mut dft_sy, mut dft_cy) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut dft_n = 0usize;
     let nj = robot.joints.len();
     let mut samples = Vec::new();
     let mut peak = vec![0.0f32; nj];
@@ -539,7 +586,25 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     let (mut head_max, mut lat_acc_max) = (0.0f32, 0.0f32);
     let mut notes = Vec::new();
     while t <= total + 1e-9 {
-        let root = root_at(t);
+        let floor_acc = floor_acc_at(t);
+        let root = root_at(t, sway_q);
+        if floor_active && t >= floor_meas_start && t < floor_meas_end {
+            let phi = floor_w * (t - floor_t0);
+            let ax = floor_a0 / (floor_w * floor_w);
+            if ax.abs() > 1e-12 {
+                let x_floor = -ax * phi.sin();
+                let x_abs = x_floor + l_ip * sway_q;
+                let y = x_abs / ax;
+                let s_b = -phi.sin();
+                let c_b = -phi.cos();
+                dft_s2 += s_b * s_b;
+                dft_c2 += c_b * c_b;
+                dft_sc += s_b * c_b;
+                dft_sy += s_b * y;
+                dft_cy += c_b * y;
+                dft_n += 1;
+            }
+        }
         let (s, sd, sdd) = min_jerk(t / dur);
         let (c, cd, cdd) = comp(t);
         lat_acc_max = lat_acc_max.max(((shift1 - shift0) * cdd).abs() as f32);
@@ -555,12 +620,18 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         }
         let mmat = robot.mass_matrix(&q, &root);
         let h = robot.rnea(&q, &qd, &vec![0.0; n], &root, true).tau;
+        let h_ctrl = if floor_active && floor_acc != 0.0 {
+            let nom_root = RootState { accel: root.accel - floor_acc as f32, ..root };
+            robot.rnea(&q, &qd, &vec![0.0; n], &nom_root, true).tau
+        } else {
+            h.clone()
+        };
         let mut tau = vec![0.0; n];
         let mut sat = vec![false; n];
         let mut avail = vec![0.0; n];
         for k in 0..n {
             let a = rdd[k] + kp * (r[k] - q[k]) + kd * (rd[k] - qd[k]);
-            let cmd: f64 = (0..n).map(|j| mmat[k][j] * if j == k { a } else { rdd[j] + kp * (r[j] - q[j]) + kd * (rd[j] - qd[j]) }).sum::<f64>() + h[k];
+            let cmd: f64 = (0..n).map(|j| mmat[k][j] * if j == k { a } else { rdd[j] + kp * (r[j] - q[j]) + kd * (rd[j] - qd[j]) }).sum::<f64>() + h_ctrl[k];
             let act = &robot.dof_joints[k].1;
             avail[k] = act.torque_at(qd[k] as f32) as f64;
             tau[k] = cmd.clamp(-avail[k], avail[k]);
@@ -585,6 +656,17 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
             if t <= dur {
                 lag[k] = lag[k].max(((r[k] - q[k]).abs().to_degrees()) as f32);
             }
+        }
+        if floor_active && t >= floor_t0 {
+            let deriv = |th: f64, thd: f64, tau_s: f64| -> (f64, f64) {
+                let af = if tau_s >= 0.0 { floor_a0 * (floor_w * tau_s).sin() } else { 0.0 };
+                (thd, -af / l_ip - kd * thd - omega0_sq * th)
+            };
+            let tau_now = t - floor_t0;
+            let (k1_q, k1_d) = deriv(sway_q, sway_qd, tau_now);
+            let (k2_q, k2_d) = deriv(sway_q + 0.5 * dt * k1_q, sway_qd + 0.5 * dt * k1_d, tau_now + 0.5 * dt);
+            sway_q += dt * k2_q;
+            sway_qd += dt * k2_d;
         }
         let full = robot.rnea(&q, &qd, &qdd, &root, true);
         let single = to.single_support && t >= lift_at;
@@ -683,6 +765,18 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
     }
     let final_margin = last.as_ref().map_or(0.0, |s| s.margin);
     let feasible = reached && min_margin >= 0.0 && summary.iter().filter(|s| s.kind != "structure").all(|s| s.stalled_s == 0.0 && s.peak_ratio <= 1.0);
+    let (sway_gain, sway_phase_deg) = if floor_active && dft_n >= 16 {
+        let det = dft_s2 * dft_c2 - dft_sc * dft_sc;
+        if det.abs() > 1e-12 {
+            let hr = (dft_c2 * dft_sy - dft_sc * dft_cy) / det;
+            let hi = (dft_s2 * dft_cy - dft_sc * dft_sy) / det;
+            (Some((hr * hr + hi * hi).sqrt() as f32), Some(hi.atan2(hr).to_degrees() as f32))
+        } else {
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
     Rollout {
         source: to.source,
         duration_s: dur as f32,
@@ -703,6 +797,8 @@ pub fn simulate(body: &Body, from: &Posture, to: &Posture, ff: &FeedForward, gri
         notes,
         head_pitch_max_deg: head_max,
         pelvis_lat_acc_max: lat_acc_max,
+        sway_gain,
+        sway_phase_deg,
         robot,
         support,
         support_before,
@@ -860,6 +956,10 @@ pub struct DynDigest {
     pub notes: Vec<String>,
     pub head_pitch_max_deg: f32,
     pub pelvis_lat_acc_max: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sway_gain: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sway_phase_deg: Option<f32>,
 }
 
 impl Rollout {
@@ -880,6 +980,8 @@ impl Rollout {
             notes: self.notes.clone(),
             head_pitch_max_deg: self.head_pitch_max_deg,
             pelvis_lat_acc_max: self.pelvis_lat_acc_max,
+            sway_gain: self.sway_gain,
+            sway_phase_deg: self.sway_phase_deg,
         }
     }
 
@@ -1140,6 +1242,29 @@ mod tests {
             let hand = end.boxes.iter().find(|x| x.name == "hand_r").unwrap();
             let sh = end.joints.iter().find(|j| j.name == "shoulder_r").unwrap();
             assert!(hand.center[0] > sh.pos[0] + 0.2, "{:?} vs {:?}", hand.center, sh.pos);
+        }
+    }
+
+    #[test]
+    fn floor_response_matches_the_inverted_pendulum() {
+        let b = body(Tier::Mid, BaseKind::HumanFoot);
+        let ff = FeedForward::default();
+        for hz in [0.5f32, 1.5, 3.0] {
+            let p = Posture { source: Source::Accel, floor_amp_mps2: 0.4, floor_hz: hz, ..Posture::quiet(0.0) };
+            let goal = b.solve(&p, &ff, 1e3);
+            let cfg_dt = DynCfg::default();
+            let cfg_half = DynCfg { dt_s: cfg_dt.dt_s * 0.5, ..cfg_dt };
+            let r_dt = simulate(&b, &p, &p, &ff, 1e3, &cfg_dt);
+            let r_half = simulate(&b, &p, &p, &ff, 1e3, &cfg_half);
+            let (g_dt, p_dt) = (r_dt.sway_gain.expect("sway_gain"), r_dt.sway_phase_deg.expect("sway_phase_deg"));
+            let (g_half, p_half) = (r_half.sway_gain.expect("sway_gain"), r_half.sway_phase_deg.expect("sway_phase_deg"));
+            let (g_ref, p_ref) = inverted_pendulum_frf((goal.com[2] as f64).max(0.2), cfg_dt.bandwidth_hz as f64, hz as f64);
+            let err_g_half = (g_half as f64 - g_ref).abs();
+            let err_p_half = (p_half as f64 - p_ref).abs();
+            let diff_g = (g_dt as f64 - g_half as f64).abs();
+            let diff_p = (p_dt as f64 - p_half as f64).abs();
+            assert!(err_g_half < 1e-3 && err_g_half <= diff_g + 1e-5, "hz={hz}: g_dt={g_dt} g_half={g_half} ref={g_ref:.5} err={err_g_half:.6} diff={diff_g:.6}");
+            assert!(err_p_half < 0.05 && err_p_half <= diff_p + 1e-3, "hz={hz}: p_dt={p_dt} p_half={p_half} ref={p_ref:.4} err={err_p_half:.5} diff={diff_p:.5}");
         }
     }
 }

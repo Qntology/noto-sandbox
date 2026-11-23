@@ -4,9 +4,9 @@ import { bus } from './state.js';
 import { $ } from './util.js';
 
 // ESC 는 맨 위 판부터 하나씩 닫고, 닫을 판이 없으면 유닛 선택을 푼다('escape' 이벤트, unit-select.js).
-const STACK = ['cctv-zoom', 'analysis-modal', 'world-popover', 'preset-dropup', 'quest-dropup'];
-const DROPUPS = ['preset-dropup', 'quest-dropup'];
-const OPENER = { 'world-popover': 'world-pill', 'quest-dropup': 'quest-bar', 'preset-dropup': 'preset-toggle' };
+const STACK = ['cctv-zoom', 'analysis-modal', 'world-popover', 'nn-dropup', 'preset-dropup', 'quest-dropup'];
+const DROPUPS = ['nn-dropup', 'preset-dropup', 'quest-dropup'];
+const OPENER = { 'world-popover': 'world-pill', 'quest-dropup': 'quest-bar', 'preset-dropup': 'preset-toggle', 'nn-dropup': 'nn-open-btn' };
 
 export const isOpen = (id) => !!$(id) && !$(id).hidden;
 

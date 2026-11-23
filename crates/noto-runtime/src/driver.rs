@@ -931,8 +931,8 @@ impl Runtime {
             Some(piece) => {
                 t.side = t.side.map(|(_, h)| (piece, h));
                 let vscope = self.gates.vision_scope(&l.label);
-                self.sds.record_agreement(&vscope, "touch", true);
-                self.sds.record_baseline(&vscope, "score", l.score as f64);
+                self.active_sds_mut().record_agreement(&vscope, "touch", true);
+                self.active_sds_mut().record_baseline(&vscope, "score", l.score as f64);
                 t.touch_ok += 1;
                 t.mem.insert(piece, l.memory());
                 self.gates.consume(id);
@@ -965,7 +965,7 @@ impl Runtime {
                     return Flow::Continue;
                 }
                 let vscope = self.gates.vision_scope(&l.label);
-                self.sds.record_agreement(&vscope, "touch", false);
+                self.active_sds_mut().record_agreement(&vscope, "touch", false);
                 self.gates.reject(id);
                 t.touch_miss += 1;
                 t.wasted += 1;
@@ -1008,8 +1008,8 @@ impl Runtime {
                 if let Some(id) = id {
                     if let Some(l) = self.gates.landmark(id).cloned() {
                         let vscope = self.gates.vision_scope(&l.label);
-                        self.sds.record_agreement(&vscope, "touch", false);
-                        self.sds.record_confusion(&vscope, &l.label, "background", l.margin as f64);
+                        self.active_sds_mut().record_agreement(&vscope, "touch", false);
+                        self.active_sds_mut().record_confusion(&vscope, &l.label, "background", l.margin as f64);
                         self.log(
                             "vision",
                             Level::Warn,
@@ -1048,8 +1048,8 @@ impl Runtime {
         let gates: Vec<serde_json::Value> = dec.gates.iter().map(|g| json!({"id": g.id, "value": g.value, "limit": g.limit, "severity": g.severity, "action": g.action.key(), "message": g.message})).collect();
         self.log("quest", level, format!("적재 판단 · {} ({})", dec.summary_ko, dec.action.label_ko()), Some(json!({"drop": id, "action": dec.action, "rule": dec.rule_action, "gates": gates})));
         let scope = Scope::new(Track::Motion, "cargo", &dec.item);
-        self.sds.record_baseline(&scope, "portion", dec.portion as f64);
-        self.sds.record_agreement(&scope, "whole", dec.action == CargoAction::Take);
+        self.active_sds_mut().record_baseline(&scope, "portion", dec.portion as f64);
+        self.active_sds_mut().record_agreement(&scope, "whole", dec.action == CargoAction::Take);
     }
 
     fn do_collect(&mut self, t: &mut Task) -> Flow {
@@ -1389,8 +1389,21 @@ impl Runtime {
         let (Some(m), Some((kind, amount))) = (t.mem.get(&id).copied(), self.world.drop_item(id).map(|d| (d.kind, d.amount))) else { return };
         let (rate, odo) = (self.drift_rate(), self.world.odom.travelled_m);
         let size = kind.spec().piece_size_m(amount);
+        let tol = 0.5 * size[0].min(size[2]);
         let sigma = m.sigma_m(odo, rate);
-        if intermittent && memory_ok(sigma, 0.5 * size[0].min(size[2]), &self.cfg.vision) {
+        let base_ok = memory_ok(sigma, tol, &self.cfg.vision);
+        // Monotonic earlier re-look under Calibrated trust: trigger when travelled >= d* - v * h_act (Phase 3-P3 D3).
+        let look_early = if self.foreuse.trust("memory_relook_ahead") == crate::foreuse::Trust::Calibrated {
+            let d_star = m.dist_to_tolerance(tol, rate, 1.0);
+            let h_act = 0.35 + noto_core::balance::REACTION_DELAY_S;
+            let lead = self.world.agent.speed_mps.max(0.2) * h_act;
+            let travelled = (odo - m.odo_m).max(0.0);
+            let trigger_d = crate::foreuse::tighten_look_dist(f32::INFINITY, Some((d_star - lead).max(0.0)), crate::foreuse::Trust::Calibrated);
+            travelled >= trigger_d
+        } else {
+            false
+        };
+        if intermittent && base_ok && !look_early {
             return;
         }
         let Some((pan, tilt)) = gaze_to_see(&self.cam, self.world.standing_eye_m(), self.me(), m.x, m.z) else { return };
@@ -1877,6 +1890,16 @@ impl Runtime {
             return Flow::Continue;
         }
         t.act_predicted_s = self.world.plan_route(Goal::Within { x, z, reach_m: reach }).map(|p| p.time_s);
+        // Pre-carry reacquire check (Phase 3-P3 D3): monotonically ORs a forward scan only under Calibrated trust.
+        let pre_scan = crate::foreuse::tighten_scan_needed(
+            false,
+            self.pose_sigma_m() * 2.0 >= 0.25,
+            self.foreuse.trust("pre_carry_reacquire"),
+        );
+        if pre_scan && t.place_fixes == 0 {
+            let _ = self.scan_now("pre_carry");
+            self.vstats.looks += 1;
+        }
         t.act_distance0 = dist;
         t.place_fixes = 0;
         match self.issue(t, Action::MoveTo { x, z, reach_m: reach }, Act::Move(MoveFor::Carry)) {
@@ -2174,7 +2197,7 @@ impl Runtime {
             if why.starts_with("fall") {
                 t.falls += 1;
                 let ground = self.world.ground_here().id();
-                self.sds.record_agreement(&Scope::new(Track::Act, "walk", ground), "no_fall", false);
+                self.active_sds_mut().record_agreement(&Scope::new(Track::Act, "walk", ground), "no_fall", false);
                 if t.falls > MAX_FALLS {
                     return fail("fall", format!("{}번 넘어져 그만둠 — {}", t.falls, why.trim_start_matches("fall: ")));
                 }
@@ -2240,7 +2263,8 @@ impl Runtime {
             };
         }
         if matches!(act, Act::Move(_)) && self.world.body.base == noto_core::BaseKind::HumanFoot {
-            self.sds.record_agreement(&Scope::new(Track::Act, "walk", self.world.ground_here().id()), "no_fall", true);
+            let ground = self.world.ground_here().id();
+            self.active_sds_mut().record_agreement(&Scope::new(Track::Act, "walk", ground), "no_fall", true);
         }
         match act {
             Act::Turn => {
@@ -2329,7 +2353,7 @@ impl Runtime {
         if let Some(pred) = t.act_predicted_s.take() {
             if pred > 0.5 {
                 let base = format!("{:?}", self.world.hand.base.kind).to_lowercase();
-                self.sds.record_calibration(&Scope::new(Track::Motion, &base, "move"), "route_time_s", elapsed, pred as f64);
+                self.active_sds_mut().record_calibration(&Scope::new(Track::Motion, &base, "move"), "route_time_s", elapsed, pred as f64);
             }
         }
     }
@@ -2338,7 +2362,8 @@ impl Runtime {
         if let Some(pred) = t.act_predicted_s.take() {
             if pred > 0.5 {
                 if let Some((_, kind, _)) = &t.broken {
-                    self.sds.record_calibration(&Scope::new(Track::Motion, kind.id(), "mine"), "mine_time_s", elapsed, pred as f64);
+                    let kid = kind.id();
+                    self.active_sds_mut().record_calibration(&Scope::new(Track::Motion, kid, "mine"), "mine_time_s", elapsed, pred as f64);
                 }
             }
         }
@@ -2350,11 +2375,11 @@ impl Runtime {
         let lm = t.target_lm.take().and_then(|id| self.gates.landmark(id).cloned());
         if let Some(l) = &lm {
             let vscope = self.gates.vision_scope(&l.label);
-            self.sds.record_agreement(&vscope, "touch", hit);
+            self.active_sds_mut().record_agreement(&vscope, "touch", hit);
             if hit {
-                self.sds.record_baseline(&vscope, "score", l.score as f64);
+                self.active_sds_mut().record_baseline(&vscope, "score", l.score as f64);
             } else {
-                self.sds.record_confusion(&vscope, &l.label, kind.id(), l.margin as f64);
+                self.active_sds_mut().record_confusion(&vscope, &l.label, kind.id(), l.margin as f64);
             }
             self.gates.consume(l.id);
         }
@@ -2453,10 +2478,10 @@ impl Runtime {
             }
         }
         let scope = Scope::new(Track::Motion, t.kind, "");
-        self.sds.record_baseline(&scope, "duration_s", r.time_s);
-        self.sds.record_baseline(&scope, "energy_j", r.energy_j);
+        self.active_sds_mut().record_baseline(&scope, "duration_s", r.time_s);
+        self.active_sds_mut().record_baseline(&scope, "energy_j", r.energy_j);
         if t.kind == "fetch" {
-            self.sds.record_baseline(&scope, "trips", r.trips as f64);
+            self.active_sds_mut().record_baseline(&scope, "trips", r.trips as f64);
         }
         self.log("quest", Level::Info, format!("퀘스트 {} 완료: {}", t.quest, r.summary), Some(json!({"quest": t.quest, "tick": tick, "result": r})));
         self.record_quest_run(&t.quest, &t.attempts);

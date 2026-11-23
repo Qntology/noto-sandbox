@@ -98,9 +98,55 @@ fn part_path(dir: &Path, f: &FileSpec) -> PathBuf {
     dir.join(format!("{}.part", f.name))
 }
 
+fn hash_verified(path: &Path, expected_sha256: &str, mtime_ns: u128, len: u64) -> bool {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (u128, u64, String)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((mt, sz, digest)) = guard.get(path) {
+            if *mt == mtime_ns && *sz == len {
+                return digest.eq_ignore_ascii_case(expected_sha256);
+            }
+        }
+    }
+    let Ok(mut f) = File::open(path) else { return false };
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => h.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    let digest = format!("{:x}", h.finalize());
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (mtime_ns, len, digest.clone()));
+    }
+    digest.eq_ignore_ascii_case(expected_sha256)
+}
+
 fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
-    if fs::metadata(dir.join(f.name)).is_ok_and(|m| m.len() == f.bytes) {
-        return (f.bytes, true);
+    let p = dir.join(f.name);
+    if let Ok(m) = fs::metadata(&p) {
+        if m.len() == f.bytes {
+            let mtime_ns = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            // Re-verify SHA-256 on small/fast weights (e.g., TTM <= 64 MiB) with mtime+size cache.
+            let ok = if f.bytes <= 64 * 1024 * 1024 {
+                hash_verified(&p, f.sha256, mtime_ns, m.len())
+            } else {
+                true
+            };
+            if ok {
+                return (f.bytes, true);
+            }
+            return (0, false);
+        }
     }
     (fs::metadata(part_path(dir, f)).map_or(0, |m| m.len().min(f.bytes)), false)
 }

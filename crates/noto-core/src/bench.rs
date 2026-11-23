@@ -14,6 +14,26 @@ pub const ENGINE_REV: &str = "noto-1.0.0-wave1";
 
 pub const HOLDOUT_SEED: u64 = 20261024;
 
+/// Central holdout seed registry by benchmark area (Phase 6 – Part 1 · D6).
+pub const HOLDOUT_SEEDS: &[(&str, u64)] = &[
+    ("NN", 20261024),
+    ("AX", 20261024),
+    ("FX", 20261024),
+    ("TX", 20261027),
+];
+
+/// Look up the official holdout seed for a benchmark area (`"NN"`, `"AX"`, `"FX"`, `"TX"`).
+pub fn holdout_seed(area: &str) -> u64 {
+    HOLDOUT_SEEDS
+        .iter()
+        .find(|(a, _)| *a == area)
+        .map(|(_, s)| *s)
+        .unwrap_or(HOLDOUT_SEED)
+}
+
+/// Held-out live world `(seed, terrain)` fixtures reserved for post-change verification.
+pub const LIVE_HOLDOUT: &[(u64, &str)] = &[(9101, "rugged"), (9102, "open")];
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(tag = "rule", rename_all = "snake_case")]
 pub enum Rule {
@@ -229,7 +249,7 @@ pub fn from_nn(form: &str, r: &ScenarioResult) -> BenchScenario {
             });
         }
     }
-    let score = if r.skipped.is_some() {
+    let score = if r.skipped.is_some() || r.kind == nn::ScenarioKind::RecordOnly {
         None
     } else if r.gated {
         Some(0.0)
@@ -276,7 +296,7 @@ pub fn run_ax(forms: &[Form]) -> Vec<BenchScenario> {
         let (body, id) = (f.body(), f.id());
         out.extend(actbench::library().iter().map(|s| from_ax(&id, &actbench::evaluate(&body, s))));
         if counts_holdout(f) {
-            out.extend(actbench::holdout(HOLDOUT_SEED, 6).iter().map(|s| from_ax(&id, &actbench::evaluate(&body, s))));
+            out.extend(actbench::holdout(holdout_seed("AX"), 6).iter().map(|s| from_ax(&id, &actbench::evaluate(&body, s))));
         }
     }
     out
@@ -288,7 +308,7 @@ pub fn run_fx(forms: &[Form]) -> Vec<BenchScenario> {
         let (body, id) = (f.body(), f.id());
         out.extend(effects::library().iter().map(|s| from_fx(&id, &effects::evaluate(&body, s))));
         if counts_holdout(f) {
-            out.extend(effects::holdout(HOLDOUT_SEED, 8).iter().map(|s| from_fx(&id, &effects::evaluate(&body, s))));
+            out.extend(effects::holdout(holdout_seed("FX"), 8).iter().map(|s| from_fx(&id, &effects::evaluate(&body, s))));
         }
     }
     out
@@ -301,7 +321,7 @@ pub fn run_nn(forms: &[Form]) -> Vec<BenchScenario> {
         let (body, id) = (f.body(), f.id());
         out.extend(nn::library(&body).iter().map(|s| from_nn(&id, &nn::evaluate(&body, s, &ff))));
         if counts_holdout(f) {
-            out.extend(nn::holdout(&body, HOLDOUT_SEED, 8).iter().map(|s| from_nn(&id, &nn::evaluate(&body, s, &ff))));
+            out.extend(nn::holdout(&body, holdout_seed("NN"), 8).iter().map(|s| from_nn(&id, &nn::evaluate(&body, s, &ff))));
         }
     }
     out
@@ -496,7 +516,7 @@ pub fn ux_lines(summaries: &[Summary]) -> Vec<String> {
     out
 }
 
-pub const ENGINE_FILES: [&str; 12] = [
+pub const ENGINE_FILES: [&str; 13] = [
     "crates/noto-core/src/**/*.rs",
     "crates/world-sim/src/**/*.rs",
     "crates/noto-vision/src/**/*.rs",
@@ -504,6 +524,7 @@ pub const ENGINE_FILES: [&str; 12] = [
     "crates/noto-runtime/src/mldrive.rs",
     "crates/noto-runtime/src/vision.rs",
     "crates/noto-runtime/src/precision.rs",
+    "crates/noto-runtime/src/foreuse.rs",
     "crates/noto-runtime/src/runtime.rs",
     "crates/noto-runtime/src/record.rs",
     "crates/noto-runtime/src/cargo.rs",
@@ -519,9 +540,16 @@ pub const NOT_ENGINE: [(&str, &str); 3] = [
 
 pub const REFERENCE_SECTIONS: [(&str, &str); 1] = [("crates/noto-core/src/balance.rs", "pub struct RefCtx {")];
 
-pub const DECISION_FILES: [&str; 4] = ["crates/noto-runtime/src/driver.rs", "crates/noto-runtime/src/mldrive.rs", "crates/noto-runtime/src/vision.rs", "crates/noto-runtime/src/precision.rs"];
+pub const DECISION_FILES: [&str; 6] = [
+    "crates/noto-runtime/src/driver.rs",
+    "crates/noto-runtime/src/mldrive.rs",
+    "crates/noto-runtime/src/vision.rs",
+    "crates/noto-runtime/src/precision.rs",
+    "crates/noto-runtime/src/feedback.rs",
+    "crates/noto-runtime/src/foreuse.rs",
+];
 
-pub const REFERENCE_READS: [&str; 13] = [
+pub const REFERENCE_READS: [&str; 19] = [
     "reference_report",
     "exact_reference",
     "area_report",
@@ -532,9 +560,15 @@ pub const REFERENCE_READS: [&str; 13] = [
     "actbench",
     "effects::",
     "nn::",
+    "\"nn:",
     "composite_reference",
     "reference(",
     "bench::",
+    "nn_scenarios",
+    "hold_log",
+    "progress::",
+    "nn_live",
+    "shift_ledger",
 ];
 
 #[derive(Clone, Copy, Debug)]
@@ -773,5 +807,19 @@ mod tests {
         assert!(excluded("crates/noto-core/src/collbench.rs") && excluded("crates/noto-core/src/tactbench.rs"));
         assert!(!excluded("crates/world-sim/src/workbench.rs"), "a bench outside noto-core is engine");
         assert!(!excluded("crates/noto-core/src/benchmark_free.rs"));
+    }
+
+    #[test]
+    fn s5_is_record_only_until_its_reference_exists() {
+        let body = Body::new(&BodyPlan::named("mid").unwrap(), BaseKind::HumanFoot, FingerCount::Five);
+        let spec = nn::s5a_spec(&body).expect("S5-A defined");
+        let res = nn::evaluate(&body, &spec, &FeedForward::default());
+        assert_eq!(res.kind, nn::ScenarioKind::RecordOnly);
+        let bs = from_nn(&form_id(&body), &res);
+        assert_eq!(bs.score, None, "S5-A must be record-only with score=None");
+        assert!(bs.cells.iter().any(|c| c.axis == "sway_gain" && c.value.is_some()));
+        assert!(bs.cells.iter().any(|c| c.axis == "sway_phase_deg" && c.value.is_some()));
+        let sum = summarize("NN", "복합 N:N", &[bs]);
+        assert_eq!(sum.record_only, 1);
     }
 }

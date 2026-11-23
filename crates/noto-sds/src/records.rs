@@ -11,6 +11,7 @@ const KEEP_ROWS: usize = 4000;
 pub const FILE_RUNS: &str = "quest_runs.jsonl";
 pub const FILE_KEYFRAMES: &str = "keyframes.jsonl";
 pub const FILE_BALANCE: &str = "balance_effort.jsonl";
+pub const FILE_NN_PHASES: &str = "nn_phases.jsonl";
 pub const FILE_STATS: &str = "quest_stats.json";
 
 pub const WHOLE_QUEST: &str = "quest";
@@ -42,6 +43,12 @@ pub struct QuestRun {
     pub energy_j: f64,
     pub steps: Vec<StepRecord>,
     pub created_ms: i64,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub ledger_digest: String,
+    #[serde(default)]
+    pub sds_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,10 +80,18 @@ pub struct KeyframeRow {
     pub fusion_flags: String,
     pub balance_margin: Option<f64>,
     pub effort_max: Option<f64>,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub ledger_digest: String,
+    #[serde(default)]
+    pub sds_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BalanceRow {
+    #[serde(default)]
+    pub event_id: String,
     pub run_id: String,
     pub pass: String,
     pub tick: u64,
@@ -95,6 +110,47 @@ pub struct BalanceRow {
     pub margin: f64,
     pub margin_noff: f64,
     pub ff_gain: f64,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub ledger_digest: String,
+    #[serde(default)]
+    pub sds_mode: String,
+}
+
+/// Joined N:N phase observation row (Phase 2 – Part 1 · D2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NnPhaseRow {
+    pub event_id: String,
+    pub run_id: String,
+    pub pass: String,
+    pub tick: u64,
+    pub time_s: f64,
+    pub instance_id: u64,
+    pub span_id: u64,
+    pub scenario: String,
+    pub phase: String,
+    pub holdout: bool,
+    pub form: String,
+    pub gnd: String,
+    pub slope: String,
+    pub stg: String,
+    pub wk: String,
+    pub score: f64,
+    pub item: u8,
+    pub gate_codes: String,
+    pub beyond_human: bool,
+    pub static_margin: f64,
+    pub min_margin: f64,
+    pub peak_ratio: f64,
+    pub sustained_effort: f64,
+    pub worst_joint: Option<String>,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub ledger_digest: String,
+    #[serde(default)]
+    pub sds_mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -122,11 +178,12 @@ pub struct MirrorBatch {
     pub runs: Vec<QuestRun>,
     pub keyframes: Vec<KeyframeRow>,
     pub balance: Vec<BalanceRow>,
+    pub nn_phases: Vec<NnPhaseRow>,
 }
 
 impl MirrorBatch {
     pub fn is_empty(&self) -> bool {
-        self.runs.is_empty() && self.keyframes.is_empty() && self.balance.is_empty()
+        self.runs.is_empty() && self.keyframes.is_empty() && self.balance.is_empty() && self.nn_phases.is_empty()
     }
 }
 
@@ -135,6 +192,7 @@ pub struct TestDb {
     runs: Vec<QuestRun>,
     keyframes: Vec<KeyframeRow>,
     balance: Vec<BalanceRow>,
+    nn_phases: Vec<NnPhaseRow>,
     stats: BTreeMap<String, SuccessStat>,
     pending: BTreeMap<&'static str, Vec<String>>,
     mirror: MirrorBatch,
@@ -155,6 +213,7 @@ impl TestDb {
             runs: Vec::new(),
             keyframes: Vec::new(),
             balance: Vec::new(),
+            nn_phases: Vec::new(),
             stats: BTreeMap::new(),
             pending: BTreeMap::new(),
             mirror: MirrorBatch::default(),
@@ -234,6 +293,12 @@ impl TestDb {
         push_capped(&mut self.balance, row);
     }
 
+    pub fn record_nn_phase(&mut self, row: NnPhaseRow) {
+        self.queue(FILE_NN_PHASES, &row);
+        self.mirror.nn_phases.push(row.clone());
+        push_capped(&mut self.nn_phases, row);
+    }
+
     pub fn flush(&mut self) -> Vec<String> {
         let Some(dir) = self.dir.clone() else { return Vec::new() };
         let mut notes = Vec::new();
@@ -288,6 +353,10 @@ impl TestDb {
     pub fn balance(&self) -> &[BalanceRow] {
         &self.balance
     }
+
+    pub fn nn_phases(&self) -> &[NnPhaseRow] {
+        &self.nn_phases
+    }
 }
 
 impl Drop for TestDb {
@@ -323,6 +392,9 @@ mod tests {
                 StepRecord { step: "deliver".into(), attempts: 1, ok, fail_code: None, time_s: 1.0 },
             ],
             created_ms: now_ms(),
+            generation: String::new(),
+            ledger_digest: String::new(),
+            sds_mode: String::new(),
         }
     }
 
@@ -346,6 +418,7 @@ mod tests {
             let mut db = TestDb::open(&dir);
             db.record_run(run("ml", true, 1));
             db.record_balance(BalanceRow {
+                event_id: "r#3".into(),
                 run_id: "r".into(),
                 pass: "ml".into(),
                 tick: 3,
@@ -364,6 +437,9 @@ mod tests {
                 margin: 0.6,
                 margin_noff: 0.5,
                 ff_gain: 1.0,
+                generation: String::new(),
+                ledger_digest: String::new(),
+                sds_mode: String::new(),
             });
             let notes = db.flush();
             assert!(notes.iter().any(|n| n.starts_with(FILE_RUNS)), "{notes:?}");
