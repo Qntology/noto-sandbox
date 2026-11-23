@@ -14,7 +14,7 @@ use crate::runtime::{label_ko, FrameView, Runtime, Submission};
 pub const MIN_CELLS: usize = 32;
 pub const MAX_CELLS: usize = 160;
 
-pub const COMMANDS: [&str; 53] = [
+pub const COMMANDS: [&str; 68] = [
     "act_status",
     "units_list",
     "unit_frame",
@@ -48,12 +48,27 @@ pub const COMMANDS: [&str; 53] = [
     "perception_scan",
     "body_status",
     "sds_status",
+    "sds_feedback",
+    "sds_generations",
+    "sds_archive",
+    "sds_tree",
+    "sds_query",
+    "sds_watch",
+    "audit_verify",
+    "replay",
     "ts_forecast",
+    "ts_keys",
+    "ts_series",
+    "ts_view",
+    "forecast_uses",
+    "rt_revs",
     "log_tail",
     "models_status",
     "test_start",
     "test_step",
     "test_status",
+    "test_status_delta",
+    "test_context",
     "test_keyframe",
     "test_video",
     "test_stats",
@@ -223,6 +238,9 @@ pub fn snapshot_json(s: &WorldSnapshot) -> Value {
 
 pub fn log_json(l: &LogLine) -> Value {
     let mut v = json!({"seq": l.seq, "ts": iso_ms(l.ts), "cat": l.cat, "level": l.level, "msg": l.msg});
+    if let Some(tk) = l.tick {
+        v["tick"] = json!(tk);
+    }
     if let Some(d) = &l.data {
         v["data"] = d.clone();
     }
@@ -481,6 +499,10 @@ impl Runtime {
     }
 
     pub fn api_sim_step(&mut self, ticks: u32) -> Result<Value, String> {
+        self.api_sim_step_focus(ticks, 1)
+    }
+
+    pub fn api_sim_step_focus(&mut self, ticks: u32, focus: u32) -> Result<Value, String> {
         self.refuse_during_test()?;
         let ticks = ticks.clamp(1, 200);
         let lines = if self.live_running() {
@@ -493,13 +515,27 @@ impl Runtime {
         self.live_pump();
         let notable: Vec<&LogLine> = lines.iter().filter(|l| l.level != noto_sds::Level::Debug).collect();
         let events: Vec<Value> = notable[notable.len().saturating_sub(50)..].iter().map(|l| log_json(l)).collect();
+        let progress = crate::progress::build_progress(self, focus);
         Ok(json!({
             "snapshot": snapshot_json(&self.snapshot()),
             "quests": self.api_quest_list()?,
             "body": self.api_body_status()?,
             "events": events,
             "test": self.live_brief(),
+            "progress": progress,
+            "revs": self.api_rt_revs(),
         }))
+    }
+
+    pub fn api_rt_revs(&self) -> Value {
+        json!({
+            "tick": self.world.tick,
+            "sds": self.sds.rev(),
+            "ts": self.gates.ts_rev(),
+            "test": self.test_rev(),
+            "nn": self.nn_live.rev(),
+            "log_seq": self.audit.last_seq(),
+        })
     }
 
     pub fn api_inventory_drop(&mut self, item: Option<&str>, amount: Option<u32>) -> Result<Value, String> {
@@ -630,6 +666,7 @@ impl Runtime {
                     "label_id": d.label, "label_ko": d.label_ko, "score": r3(d.score), "margin": r3(d.margin),
                     "accepted": d.accepted, "blocked_by": d.blocked_by, "reason": d.reason,
                     "bbox": d.bbox.map(r3), "landmark": d.landmark,
+                    "floor_source": d.floor_source, "temporal": d.temporal,
                 })
             })
             .collect();
@@ -706,7 +743,16 @@ impl Runtime {
     /// it; setting down runs the other way. Read from the world's act phase (or held look) and the last checks.
     pub fn procedure_json(&self) -> Option<Value> {
         use noto_core::act::ActKind;
-        const HAND: [(&str, &str); 6] = [("approach", "다가가기"), ("look", "고개 숙여 응시"), ("check", "비전 확인"), ("bend", "자세 낮춤"), ("grip", "쥐기"), ("lift", "시선 따라 들어올림")];
+        const HAND: [(&str, &str); 8] = [
+            ("approach", "다가가기"),
+            ("look", "고개 숙여 응시"),
+            ("check", "비전 확인"),
+            ("bend", "자세 낮춤"),
+            ("grip", "쥐기"),
+            ("lift", "시선 따라 들어올림"),
+            ("stow", "수납"),
+            ("look_up", "시야 재확보"),
+        ];
         const FORK: [(&str, &str); 9] = [
             ("approach", "다가가기"),
             ("align", "정렬"),
@@ -733,6 +779,8 @@ impl Runtime {
             Some((ActKind::Look, _)) | Some((ActKind::Grasp, "check")) => "check",
             Some((ActKind::Grasp, "reach")) => "bend",
             Some((ActKind::Grasp, "close" | "squeeze" | "load")) => "grip",
+            Some((ActKind::Grasp, "stow")) => "stow",
+            Some((ActKind::Grasp, "look_up" | "recover" | "release")) => "look_up",
             Some((ActKind::Grasp, _)) => "lift",
             _ => {
                 let next = self.task.as_ref().filter(|t| matches!(t.phase, crate::driver::Phase::Collect)).and_then(|t| t.drops.get(t.drop_idx).copied());
@@ -931,7 +979,532 @@ impl Runtime {
             "eval": self.eval().summary(),
             "counts": self.eval(),
         });
+        v["feedback"] = self.feedback.status_json();
+        v["rev"] = json!(self.sds.rev());
+        v["generation"] = json!(self.sds.generation_id().unwrap_or(noto_core::bench::ENGINE_REV));
+        v["engine_fp"] = json!(crate::ENGINE_FP);
+        v["archive_bytes"] = json!(self.sds.archive_bytes());
         Ok(v)
+    }
+
+    pub fn api_sds_generations(&self) -> Result<Value, String> {
+        serde_json::to_value(self.sds.generations_status()).map_err(|e| e.to_string())
+    }
+
+    pub fn api_sds_archive(&mut self, args: &Value) -> Result<Value, String> {
+        let action = text(args, "action").unwrap_or("list");
+        match action {
+            "purge" => {
+                let obs = self.sds.total_observations();
+                let seal = self.sds.combined_digest();
+                let moved = self.sds.purge();
+                self.log(
+                    "sds_purge",
+                    noto_sds::Level::Warn,
+                    format!("SDS 보관 이동(purge): {}건", obs),
+                    Some(json!({"moved": moved.as_ref().map(|p| p.display().to_string()), "observations": obs, "seal": seal})),
+                );
+                Ok(json!({
+                    "action": "purge",
+                    "moved": moved.map(|p| p.display().to_string()),
+                    "observations": obs,
+                    "seal": seal,
+                    "archive_bytes": self.sds.archive_bytes(),
+                }))
+            }
+            "prune" => {
+                let keep = num(args, "keep").unwrap_or(5.0).max(0.0) as usize;
+                let removed = self.sds.prune_archive(keep);
+                self.log(
+                    "sds_prune",
+                    noto_sds::Level::Info,
+                    format!("SDS 보관 정리: {}건 삭제 (유지 {keep})", removed.len()),
+                    Some(json!({"removed": removed, "keep": keep})),
+                );
+                Ok(json!({
+                    "action": "prune",
+                    "removed": removed,
+                    "archive_bytes": self.sds.archive_bytes(),
+                }))
+            }
+            _ => {
+                let entries: Vec<Value> = self
+                    .sds
+                    .list_archive()
+                    .into_iter()
+                    .map(|(name, bytes)| json!({"name": name, "bytes": bytes}))
+                    .collect();
+                Ok(json!({
+                    "action": "list",
+                    "entries": entries,
+                    "archive_bytes": self.sds.archive_bytes(),
+                }))
+            }
+        }
+    }
+
+    pub fn api_audit_verify(&mut self) -> Result<Value, String> {
+        if let Some(dir) = self.data_dir().map(std::path::Path::to_path_buf) {
+            self.audit.sync_anchor();
+            let digests = self.sds.ledger_digests();
+            let files = noto_sds::verify_dir(&dir.join("logs"), Some(&digests));
+            Ok(json!({"files": files}))
+        } else {
+            let (lines, _) = self.audit.tail(0, 10_000, None);
+            Ok(json!({
+                "files": [{
+                    "session": self.session_id,
+                    "lines": lines.len(),
+                    "broken_at": Value::Null,
+                    "reason": Value::Null,
+                    "anchor_ok": true,
+                    "seal_ok": Value::Null,
+                }]
+            }))
+        }
+    }
+
+    pub fn api_replay(&mut self, args: &Value) -> Result<Value, String> {
+        let manifest = if let Some(m) = args.get("manifest").filter(|v| !v.is_null()) {
+            serde_json::from_value::<crate::testrun::ReplayManifest>(m.clone()).map_err(|e| format!("재현 명세를 읽을 수 없습니다: {e}"))?
+        } else {
+            self.test
+                .as_ref()
+                .and_then(|t| t.manifest.clone())
+                .ok_or_else(|| "재현할 테스트 명세가 없습니다. 먼저 통합 테스트를 실행하세요".to_string())?
+        };
+        let max_ticks = num(args, "max_ticks").unwrap_or(self.test_cfg.max_pass_ticks as f64).max(1.0) as u64;
+        self.replay_manifest(&manifest, max_ticks).map_err(|e| format!("{e:#}"))
+    }
+
+    pub fn api_sds_feedback(&mut self, args: &Value) -> Result<Value, String> {
+        let mut next = self.feedback.mode().clone();
+        let mut changed = false;
+        if let Some(d) = text(args, "default") {
+            let m = crate::feedback::Mode::from_str(d).ok_or_else(|| format!("알 수 없는 모드 '{d}' (live, frozen, off)"))?;
+            next.default = m;
+            changed = true;
+        }
+        if let Some(obj) = args.get("overrides").and_then(Value::as_object) {
+            if args.get("replace_overrides").and_then(Value::as_bool).unwrap_or(false) {
+                next.overrides.clear();
+            }
+            for (k, val) in obj {
+                let path = crate::feedback::FeedbackPath::from_id(k).ok_or_else(|| format!("알 수 없는 경로 '{k}' (A~H)"))?;
+                if val.is_null() {
+                    next.overrides.remove(&path);
+                } else {
+                    let s = val.as_str().ok_or_else(|| format!("경로 '{k}'의 모드는 문자열이어야 합니다"))?;
+                    let m = crate::feedback::Mode::from_str(s).ok_or_else(|| format!("알 수 없는 모드 '{s}' (live, frozen, off)"))?;
+                    next.overrides.insert(path, m);
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.set_sds_mode(next);
+        }
+        Ok(self.feedback.status_json())
+    }
+
+    pub fn api_ts_keys(&self) -> Result<Value, String> {
+        Ok(self.ts.keys_json())
+    }
+
+    pub fn api_ts_series(&self, args: &Value) -> Result<Value, String> {
+        if let Some(key) = text(args, "key") {
+            let t0 = num(args, "t0").map(|v| v.max(0.0) as u32);
+            let period = num(args, "period").unwrap_or(0.0).max(0.0) as u32;
+            let n = num(args, "n").map(|v| v.max(1.0) as usize);
+            let spans: Vec<noto_ts::series::SpanRef> = args
+                .get("spans")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            Some(noto_ts::series::SpanRef {
+                                span_id: v.get("span_id")?.as_u64()? as u32,
+                                start: v.get("start")?.as_u64()? as u32,
+                                end: v.get("end").and_then(Value::as_u64).map(|x| x as u32),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return self.ts.series_json(key, t0, period, n, &spans);
+        }
+        // Registry listing mode (Phase 5 – Part 2 · D2): `lm:*`, `label:*`, `dec:*`, `sds:*`, `ts:*`.
+        let rev = self.gates.ts_rev() ^ self.sds.rev().rotate_left(17) ^ self.test_rev().rotate_left(33);
+        if args.get("if_rev").and_then(Value::as_u64) == Some(rev) {
+            return Ok(json!({"unchanged": true, "rev": rev}));
+        }
+        let mut items: Vec<Value> = Vec::new();
+        for lm in self.gates.landmarks() {
+            if lm.trace.is_empty() && lm.history.is_empty() {
+                continue;
+            }
+            items.push(json!({
+                "id": format!("lm:{}:score", lm.id),
+                "group": "landmark",
+                "label": format!("L{} {}", lm.id, lm.label),
+                "n": lm.trace.len().max(lm.history.len()),
+                "last_tick": lm.last_tick,
+                "gate_use": true,
+            }));
+        }
+        for (lbl, n) in self.gates.series_labels() {
+            items.push(json!({
+                "id": format!("label:{lbl}:score"),
+                "group": "label",
+                "label": format!("{lbl} · score"),
+                "n": n,
+                "last_tick": self.world.tick,
+                "gate_use": false,
+            }));
+            let mn = self.gates.margin_series(&lbl).len();
+            if mn > 0 {
+                items.push(json!({
+                    "id": format!("label:{lbl}:margin"),
+                    "group": "label",
+                    "label": format!("{lbl} · margin"),
+                    "n": mn,
+                    "last_tick": self.world.tick,
+                    "gate_use": false,
+                }));
+            }
+        }
+        for pass in ["ml", "game"] {
+            if let Some(r) = self.rec_of(pass) {
+                let dec_n = r.keyframes.iter().filter(|k| k.decision.as_ref().and_then(|d| d.estimate).is_some()).count();
+                if dec_n > 0 {
+                    let lt = r.keyframes.last().map_or(0, |k| k.tick);
+                    items.push(json!({"id": format!("dec:{pass}:x"), "group": "decide", "label": format!("결정 {pass} · x"), "n": dec_n, "last_tick": lt, "gate_use": true}));
+                    items.push(json!({"id": format!("dec:{pass}:z"), "group": "decide", "label": format!("결정 {pass} · z"), "n": dec_n, "last_tick": lt, "gate_use": true}));
+                }
+            }
+        }
+        for ((sc, ax), pts) in &self.sds_watch.axes {
+            if pts.is_empty() {
+                continue;
+            }
+            items.push(json!({
+                "id": format!("sds:{sc}:{ax}"),
+                "group": "sds",
+                "label": format!("{sc} · {ax}"),
+                "n": pts.len(),
+                "last_tick": pts.back().map_or(0, |p| p.tick),
+                "gate_use": false,
+            }));
+        }
+        if let Some(keys) = self.ts.keys_json().get("keys").and_then(Value::as_array) {
+            for k in keys {
+                if let Some(kid) = k.get("key").and_then(Value::as_str) {
+                    let n = k.get("n").and_then(Value::as_u64).unwrap_or(0);
+                    if n > 0 {
+                        items.push(json!({
+                            "id": format!("ts:{kid}"),
+                            "group": "ts",
+                            "label": kid,
+                            "n": n,
+                            "last_tick": k.get("last_tick").and_then(Value::as_u64).unwrap_or(self.world.tick),
+                            "gate_use": false,
+                        }));
+                    }
+                }
+            }
+        }
+        let ttm = match self.gates.ttm() {
+            Some(t) => {
+                let fp = t.fingerprint();
+                json!({
+                    "attached": true,
+                    "fp8": fp.fp8,
+                    "verified": fp.verified,
+                    "device": noto_ml::device_label(t.device()),
+                    "stats": t.call_stats(),
+                })
+            }
+            None => json!({"attached": false, "fp8": null, "verified": false, "device": null, "stats": null}),
+        };
+        Ok(json!({
+            "rev": rev,
+            "ttm": ttm,
+            "series": items,
+        }))
+    }
+
+    /// Unified time-series & gate-trace inspector (`ts_view`, Phase 5 – Part 2 · D2 & D4).
+    /// Separate from the test-only `Runtime::ts_view(label, horizon)` method.
+    pub fn api_ts_view(&self, args: &Value) -> Result<Value, String> {
+        let series_id = text(args, "series").ok_or("series 가 필요합니다 (예: lm:1:score, label:tree:score)")?;
+        let horizon = num(args, "horizon").unwrap_or(8.0).clamp(1.0, FORECAST_HORIZON as f64) as usize;
+        let until_tick = num(args, "until_tick").map(|v| v.max(0.0) as u64);
+        let rev = self.gates.ts_rev() ^ self.sds.rev().rotate_left(17) ^ self.test_rev().rotate_left(33);
+        if until_tick.is_none() && args.get("if_rev").and_then(Value::as_u64) == Some(rev) {
+            return Ok(json!({"unchanged": true, "rev": rev}));
+        }
+
+        let median_step = |ticks: &[u64]| -> u64 {
+            if ticks.len() < 2 {
+                return 10;
+            }
+            let mut diffs: Vec<u64> = ticks.windows(2).map(|w| w[1].saturating_sub(w[0]).max(1)).collect();
+            diffs.sort_unstable();
+            diffs[diffs.len() / 2]
+        };
+        let ttm_arc = self.gates.ttm();
+        let run_fc = |vals: &[f64], past: &[noto_ts::HistoryMse], prior_s0: Option<f64>| -> Option<noto_ts::Forecast> {
+            if vals.is_empty() {
+                return None;
+            }
+            match &ttm_arc {
+                Some(t) => {
+                    let tp = noto_ts::TtmPredictor(t.as_ref());
+                    Some(noto_ts::forecast_with_prior(vals, horizon, &[&tp], past, prior_s0))
+                }
+                None => Some(noto_ts::forecast_with_prior(vals, horizon, &[], past, prior_s0)),
+            }
+        };
+
+        let mut gate_use = false;
+        let mut points: Vec<Value> = Vec::new();
+        let mut band_1step: Vec<Value> = Vec::new();
+        let mut vals_for_fc: Vec<f64> = Vec::new();
+        let mut ticks_seen: Vec<u64> = Vec::new();
+        let mut past_err: Vec<noto_ts::HistoryMse> = Vec::new();
+        let mut prior_s0: Option<f64> = None;
+        let mut book_ref: Option<&noto_ts::ErrBook> = None;
+
+        if let Some(rest) = series_id.strip_prefix("lm:") {
+            let mut sp = rest.split(':');
+            let id: u32 = sp.next().and_then(|s| s.parse().ok()).ok_or("잘못된 랜드마크 id")?;
+            let lm = self.gates.landmark(id).ok_or_else(|| format!("랜드마크 L{id}를 찾을 수 없습니다"))?;
+            gate_use = true;
+            let fp8 = ttm_arc.as_deref().map(|t| t.fp8());
+            let mode = self.gates.recognizer_mode_tag();
+            book_ref = self.gates.book_for(&lm.label, "score");
+            past_err = crate::precision::past_errors_for_series(self.sds(), &lm.label, "score", mode, fp8, book_ref, &self.feedback, until_tick.unwrap_or(self.world.tick));
+            prior_s0 = self.gates.prior_s0(&lm.label, "score", self.sds(), &self.feedback, until_tick.unwrap_or(self.world.tick));
+            for gm in &lm.trace {
+                if let Some(ut) = until_tick {
+                    if gm.tick > ut {
+                        continue;
+                    }
+                }
+                ticks_seen.push(gm.tick);
+                points.push(json!({
+                    "tick": gm.tick,
+                    "value": r4(gm.observed),
+                    "outcome": gm.outcome,
+                    "rescue": gm.rescue,
+                    "z": gm.z.map(r4),
+                    "method": gm.method,
+                }));
+                if let Some(exp) = gm.expected {
+                    band_1step.push(json!({
+                        "tick": gm.tick,
+                        "expected": r4(exp),
+                        "lo": gm.lo.map(r4),
+                        "hi": gm.hi.map(r4),
+                        "z": gm.z.map(r4),
+                        "sds_sd": gm.sds_sd.map(r4),
+                        "observed": r4(gm.observed),
+                    }));
+                }
+                if gm.outcome != "held" {
+                    vals_for_fc.push(gm.observed);
+                }
+            }
+        } else if let Some(rest) = series_id.strip_prefix("label:") {
+            let (lbl, axis) = rest.rsplit_once(':').ok_or("label:<라벨>:<score|margin> 형식이어야 합니다")?;
+            let raw: &[f64] = if axis == "margin" { self.gates.margin_series(lbl) } else { self.gates.series(lbl) };
+            let sname = if axis == "margin" { "margin" } else { "score" };
+            let fp8 = ttm_arc.as_deref().map(|t| t.fp8());
+            let mode = self.gates.recognizer_mode_tag();
+            book_ref = self.gates.book_for(lbl, sname);
+            past_err = crate::precision::past_errors_for_series(self.sds(), lbl, sname, mode, fp8, book_ref, &self.feedback, until_tick.unwrap_or(self.world.tick));
+            prior_s0 = self.gates.prior_s0(lbl, sname, self.sds(), &self.feedback, until_tick.unwrap_or(self.world.tick));
+            let base_tick = self.world.tick.saturating_sub((raw.len().saturating_sub(1) * 10) as u64);
+            for (i, &v) in raw.iter().enumerate() {
+                let tk = base_tick + (i as u64) * 10;
+                if until_tick.is_some_and(|ut| tk > ut) {
+                    continue;
+                }
+                ticks_seen.push(tk);
+                vals_for_fc.push(v);
+                points.push(json!({"tick": tk, "value": r4(v), "outcome": "accepted"}));
+            }
+        } else if let Some(rest) = series_id.strip_prefix("dec:") {
+            let (pass, coord) = rest.rsplit_once(':').ok_or("dec:<pass>:<x|z> 형식이어야 합니다")?;
+            let rec = self.rec_of(pass).ok_or_else(|| format!("통과 '{pass}' 기록이 없습니다"))?;
+            gate_use = true;
+            for kf in &rec.keyframes {
+                if until_tick.is_some_and(|ut| kf.tick > ut) {
+                    continue;
+                }
+                let Some(dv) = &kf.decision else { continue };
+                let Some((ex, ez, _, _)) = dv.estimate else { continue };
+                let val = if coord == "z" { ez as f64 } else { ex as f64 };
+                let outcome = if dv.kind == "hold" { "held" } else { "accepted" };
+                ticks_seen.push(kf.tick);
+                points.push(json!({"tick": kf.tick, "value": r4(val), "outcome": outcome, "method": dv.forecast_method}));
+                if let Some(b) = dv.band {
+                    let (lo, hi) = if coord == "z" { (b[1] as f64, b[3] as f64) } else { (b[0] as f64, b[2] as f64) };
+                    let exp = 0.5 * (lo + hi);
+                    band_1step.push(json!({"tick": kf.tick, "expected": r4(exp), "lo": r4(lo), "hi": r4(hi), "observed": r4(val)}));
+                }
+                if outcome != "held" {
+                    vals_for_fc.push(val);
+                }
+            }
+        } else if let Some(rest) = series_id.strip_prefix("sds:") {
+            let (sc, ax) = rest.rsplit_once(':').ok_or("sds:<scope>:<axis> 형식이어야 합니다")?;
+            if let Some(pts) = self.sds_watch.axes.get(&(sc.to_string(), ax.to_string())) {
+                for p in pts {
+                    if until_tick.is_some_and(|ut| p.tick > ut) {
+                        continue;
+                    }
+                    ticks_seen.push(p.tick);
+                    vals_for_fc.push(p.mean);
+                    points.push(json!({"tick": p.tick, "value": r4(p.mean), "recent": r4(p.recent), "drift_z": r4(p.drift_z), "outcome": "accepted"}));
+                }
+            }
+        } else if let Some(key) = series_id.strip_prefix("ts:") {
+            let raw = self.ts.series_json(key, None, 0, Some(256), &[])?;
+            if let Some(arr) = raw.get("points").and_then(Value::as_array) {
+                for item in arr {
+                    let tk = item.get(0).and_then(Value::as_u64).unwrap_or(0);
+                    let val = item.get(1).and_then(Value::as_f64).unwrap_or(0.0);
+                    if until_tick.is_some_and(|ut| tk > ut) {
+                        continue;
+                    }
+                    ticks_seen.push(tk);
+                    vals_for_fc.push(val);
+                    points.push(json!({"tick": tk, "value": r4(val), "outcome": "accepted"}));
+                }
+            }
+        } else {
+            return Err(format!("알 수 없는 계열 형식 '{series_id}'"));
+        }
+
+        let step_ticks = median_step(&ticks_seen);
+        let fc = run_fc(&vals_for_fc, &past_err, prior_s0);
+        let z_g = self.gates.cfg().temporal_z;
+        let k_cal = book_ref.map_or(1.0, |b| b.k);
+
+        let (fc_json, weights_json, rmse_fused, holdout, notes, bands_json) = match fc {
+            Some(f) => {
+                let mut cal_lo = Vec::with_capacity(f.point.len());
+                let mut cal_hi = Vec::with_capacity(f.point.len());
+                let mut gate_lo = Vec::with_capacity(f.point.len());
+                let mut gate_hi = Vec::with_capacity(f.point.len());
+                for i in 0..f.point.len() {
+                    let s_m = ((f.p90[i] - f.p10[i]) * 0.5 / 1.2816).max(1e-4);
+                    let sf = book_ref.map_or(s_m, |b| b.s_fused(s_m) * ((i + 1) as f64).sqrt().min(4.0));
+                    let sg = book_ref.map_or_else(
+                        || prior_s0.map_or(s_m, |p0| (0.5 * (p0 * p0 + s_m * s_m)).sqrt()),
+                        |b| b.s_gate(prior_s0, 4.0, sf),
+                    );
+                    cal_lo.push(r4(f.point[i] - k_cal * 1.2816 * sf));
+                    cal_hi.push(r4(f.point[i] + k_cal * 1.2816 * sf));
+                    gate_lo.push(r4(f.point[i] - k_cal * z_g * sg));
+                    gate_hi.push(r4(f.point[i] + k_cal * z_g * sg));
+                }
+                let wj: Vec<Value> = f
+                    .weights
+                    .iter()
+                    .map(|w| {
+                        let real = book_ref.and_then(|b| b.realized_rmse(&w.method));
+                        json!({
+                            "method": w.method, "rev": w.rev, "weight": r4(w.weight), "rmse": r4(w.rmse),
+                            "realized_rmse": real.map(|(r, _)| r4(r)),
+                            "realized_n": real.map(|(_, n)| r4(n)),
+                            "history_rmse": w.history_rmse.map(r4), "history_n": w.history_n,
+                        })
+                    })
+                    .collect();
+                (
+                    json!({
+                        "point": f.point.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                        "p10": f.p10.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                        "p90": f.p90.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                        "step_ticks": step_ticks,
+                        "method": f.method,
+                    }),
+                    wj,
+                    Some(r4(f.rmse_fused)),
+                    f.holdout,
+                    f.notes,
+                    json!({
+                        "model": {
+                            "p10": f.p10.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                            "p90": f.p90.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                        },
+                        "cal80": { "lo": cal_lo, "hi": cal_hi, "k": r4(k_cal) },
+                        "gate": { "lo": gate_lo, "hi": gate_hi, "z_g": r4(z_g) },
+                    }),
+                )
+            }
+            None => (Value::Null, Vec::new(), None, 0, Vec::new(), Value::Null),
+        };
+
+        // Compute realized summary from band_1step (or ErrBook fallback).
+        let mut err_sum = 0.0f64;
+        let mut in_band_hits = 0usize;
+        let mut real_n = 0usize;
+        let mut err_series: Vec<Value> = Vec::new();
+        for b in &band_1step {
+            if let (Some(obs), Some(exp)) = (b["observed"].as_f64(), b["expected"].as_f64()) {
+                let err = (obs - exp).abs();
+                err_sum += err;
+                real_n += 1;
+                let inside = b["lo"].as_f64().zip(b["hi"].as_f64()).is_some_and(|(lo, hi)| obs >= lo && obs <= hi);
+                if inside {
+                    in_band_hits += 1;
+                }
+                err_series.push(json!({"tick": b["tick"], "err": r4(obs - exp), "abs_err": r4(err), "in_band": inside}));
+            }
+        }
+        let realized = if real_n > 0 {
+            json!({
+                "n": real_n,
+                "mae": r4(err_sum / real_n as f64),
+                "in_band": r4(in_band_hits as f64 / real_n as f64),
+                "nominal": 0.8,
+                "series": err_series,
+            })
+        } else if let Some(b) = book_ref.filter(|b| b.total_evals > 0) {
+            json!({
+                "n": b.total_evals,
+                "mae": r4(b.fused.max(0.0).sqrt()),
+                "in_band": r4(b.cal_hits as f64 / b.total_evals as f64),
+                "nominal": 0.8,
+                "series": [],
+            })
+        } else {
+            json!({"n": 0, "mae": null, "in_band": null, "nominal": 0.8, "series": []})
+        };
+
+        Ok(json!({
+            "rev": rev,
+            "series": series_id,
+            "gate_use": gate_use,
+            "until_tick": until_tick,
+            "points": points,
+            "band_1step": band_1step,
+            "forecast": fc_json,
+            "bands": bands_json,
+            "weights": weights_json,
+            "rmse_fused": rmse_fused,
+            "holdout": holdout,
+            "realized": realized,
+            "gate_cfg": {
+                "min_history": self.gates.cfg().temporal_min_history,
+                "temporal_z": r4(z_g),
+                "enabled": self.gates.cfg().enabled,
+            },
+            "notes": notes,
+        }))
     }
 
     pub fn api_ts_forecast(&self, scope: &str, axis: &str) -> Result<Value, String> {
@@ -939,14 +1512,93 @@ impl Runtime {
         if label.is_empty() {
             return Err(format!("범위 '{scope}'에는 라벨이 없어 예측할 수 없습니다"));
         }
-        let (history, fc) = match axis {
-            "score" | "score_all" => (self.gates().series(label).to_vec(), self.gates().forecast_for(label, FORECAST_HORIZON, self.sds())),
-            "margin" => (self.gates().margin_series(label).to_vec(), self.gates().forecast_margin(label, FORECAST_HORIZON)),
+        let series_name = match axis {
+            "score" | "score_all" => "score",
+            "margin" => "margin",
             other => return Err(format!("축 '{other}'은 이력을 따로 두지 않습니다. 이력이 있는 축: score, margin")),
+        };
+        let (history, fc) = match series_name {
+            "score" => (self.gates().series(label).to_vec(), self.gates().forecast_for_with(label, FORECAST_HORIZON, self.sds(), &self.feedback, self.world.tick)),
+            _ => (self.gates().margin_series(label).to_vec(), self.gates().forecast_margin_with(label, FORECAST_HORIZON, self.sds(), &self.feedback, self.world.tick)),
         };
         let Some(fc) = fc else {
             let known: Vec<String> = self.gates().series_labels().into_iter().take(6).map(|(l, n)| format!("{l}({n})")).collect();
             return Err(format!("'{label}'의 {axis} 이력이 아직 없습니다. 인식이 쌓이면 예측할 수 있습니다{}", if known.is_empty() { String::new() } else { format!(" (이력 있는 라벨: {})", known.join(", ")) }));
+        };
+        let book = self.gates().book_for(label, series_name);
+        let k_cal = book.map_or(1.0, |b| b.k);
+        let z_g = self.gates().cfg().temporal_z;
+        let s0 = self.gates().prior_s0(label, series_name, self.sds(), &self.feedback, self.world.tick);
+        let mut cal_lo = Vec::with_capacity(fc.point.len());
+        let mut cal_hi = Vec::with_capacity(fc.point.len());
+        let mut gate_lo = Vec::with_capacity(fc.point.len());
+        let mut gate_hi = Vec::with_capacity(fc.point.len());
+        for i in 0..fc.point.len() {
+            let s_m = ((fc.p90[i] - fc.p10[i]) * 0.5 / 1.2816).max(1e-4);
+            let h_idx = noto_ts::HORIZONS.iter().position(|&h| h == i + 1);
+            let (kh, sf) = match (book, h_idx) {
+                (Some(b), Some(hi)) => (b.h_aci[hi].k, b.s_for_horizon(hi, s_m)),
+                (Some(b), None) => (b.k, b.s_fused(s_m) * ((i + 1) as f64).sqrt().min(4.0)),
+                (None, _) => (1.0, s_m),
+            };
+            let sg = match book {
+                Some(b) => b.s_gate(s0, 4.0, sf),
+                None => s0.map_or(s_m, |p0| (0.5 * (p0 * p0 + s_m * s_m)).sqrt()),
+            };
+            cal_lo.push(r4(fc.point[i] - kh * 1.2816 * sf));
+            cal_hi.push(r4(fc.point[i] + kh * 1.2816 * sf));
+            gate_lo.push(r4(fc.point[i] - kh * z_g * sg));
+            gate_hi.push(r4(fc.point[i] + kh * z_g * sg));
+        }
+        let coverage = match book {
+            Some(b) => {
+                let n = b.total_evals;
+                let rate = |hits: u64| if n > 0 { Some(r4(hits as f64 / n as f64)) } else { None };
+                let (pm, ps) = b.pit_stats();
+                json!({
+                    "model80": rate(b.model_hits),
+                    "cal80": rate(b.cal_hits),
+                    "gate": rate(b.gate_hits),
+                    "n": n,
+                    "pit_mean": pm.map(r4),
+                    "pit_sd": ps.map(r4),
+                })
+            }
+            None => json!({"model80": null, "cal80": null, "gate": null, "n": 0, "pit_mean": null, "pit_sd": null}),
+        };
+        let horizons: Vec<Value> = noto_ts::HORIZONS
+            .iter()
+            .enumerate()
+            .map(|(i, &h)| {
+                let (n, cov, kh) = match book {
+                    Some(b) => (
+                        b.h_total[i],
+                        if b.h_total[i] > 0 { Some(r4(b.h_hits[i] as f64 / b.h_total[i] as f64)) } else { None },
+                        r4(b.h_aci[i].k),
+                    ),
+                    None => (0, None, 1.0),
+                };
+                json!({"h": h, "cal80": cov, "n": n, "k": kh})
+            })
+            .collect();
+        let ttm_info = match self.gates().ttm() {
+            Some(t) => {
+                let hist_n = self.gates().ttm_history_n(label, self.sds(), &self.feedback, self.world.tick);
+                let elig = t.eligibility(history.len(), FORECAST_HORIZON, hist_n);
+                let fp = t.fingerprint();
+                json!({
+                    "attached": true,
+                    "joins": fc.weights.iter().any(|w| w.method == "ttm"),
+                    "reason": elig.reason,
+                    "real_points": elig.real_points,
+                    "backtest_points": elig.backtest_points,
+                    "padded": elig.padded,
+                    "fp8": fp.fp8,
+                    "verified": fp.verified,
+                    "stats": t.call_stats(),
+                })
+            }
+            None => json!({"attached": false, "joins": false, "reason": "TTM 가중치가 연결되지 않았습니다", "fp8": null, "verified": false, "stats": null}),
         };
         Ok(json!({
             "scope": scope, "axis": axis, "label": label,
@@ -955,10 +1607,31 @@ impl Runtime {
             "p10": fc.p10.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
             "p90": fc.p90.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
             "method": fc.method,
-            "weights": fc.weights.iter().map(|w| json!({"method": w.method, "weight": r4(w.weight), "rmse": r4(w.rmse)})).collect::<Vec<_>>(),
+            "weights": fc.weights.iter().map(|w| {
+                let realized = book.and_then(|b| b.realized_rmse(&w.method));
+                json!({
+                    "method": w.method, "rev": w.rev, "weight": r4(w.weight), "rmse": r4(w.rmse),
+                    "realized_rmse": realized.map(|(r, _)| r4(r)),
+                    "realized_n": realized.map(|(_, n)| r4(n)),
+                    "history_rmse": w.history_rmse.map(r4), "history_n": w.history_n,
+                })
+            }).collect::<Vec<_>>(),
+            "bands": {
+                "model": {
+                    "p10": fc.p10.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                    "p90": fc.p90.iter().map(|x| r4(*x)).collect::<Vec<_>>(),
+                },
+                "cal80": { "lo": cal_lo, "hi": cal_hi, "k": r4(k_cal) },
+                "gate": { "lo": gate_lo, "hi": gate_hi, "z_g": r4(z_g) },
+            },
+            "coverage": coverage,
+            "horizons": horizons,
+            "models": self.gates().registry().specs(),
+            "quantiles": fc.quantiles,
             "rmse_fused": r4(fc.rmse_fused),
             "holdout": fc.holdout,
             "notes": fc.notes,
+            "ttm": ttm_info,
         }))
     }
 
@@ -998,6 +1671,8 @@ impl Runtime {
             "recognizer": mode,
             "embedding": mode != "oracle",
             "ttm": self.has_ttm(),
+            "ttm_fingerprint": self.gates.ttm().map(|t| t.fingerprint().clone()),
+            "ttm_stats": self.gates.ttm().map(|t| t.call_stats()),
             "parser_embedding": self.has_embedder(),
             "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device(), "ttm": self.gates.ttm().map(|t| noto_ml::device_label(t.device()))},
             "ml": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode()},
@@ -1062,7 +1737,11 @@ impl Runtime {
                 }
                 self.api_world_new(seed, size, config, text(args, "base"))
             }
-            "sim_step" => self.api_sim_step(num(args, "ticks").unwrap_or(1.0).max(1.0) as u32),
+            "sim_step" => {
+                let ticks = num(args, "ticks").unwrap_or(1.0).max(1.0) as u32;
+                let focus = num(args, "focus").unwrap_or(1.0).max(1.0) as u32;
+                self.api_sim_step_focus(ticks, focus)
+            }
             "world_frame" => {
                 let (w, h) = (num(args, "width").unwrap_or(480.0) as u32, num(args, "height").unwrap_or(320.0) as u32);
                 self.api_world_frame(w, h, num(args, "quality").unwrap_or(75.0) as f32, text(args, "view").unwrap_or("agent"))
@@ -1104,7 +1783,31 @@ impl Runtime {
                 self.set_track(mode);
                 Ok(self.crew_json())
             }
-            "nn_status" => Ok(json!({"scenarios": self.nn_live.summary(), "phases": self.nn_live.phases().collect::<Vec<_>>()})),
+            "sds_feedback" => self.api_sds_feedback(args),
+            "sds_generations" => self.api_sds_generations(),
+            "sds_archive" => self.api_sds_archive(args),
+            "sds_tree" => Ok(crate::sdsview::sds_tree(
+                &self.sds,
+                text(args, "parent"),
+                args.get("if_rev").and_then(Value::as_u64),
+            )),
+            "sds_query" => Ok(crate::sdsview::sds_query(&self.sds, args)),
+            "sds_watch" => Ok(crate::sdsview::sds_watch_api(&mut self.sds_watch, &self.sds, args)),
+            "audit_verify" => self.api_audit_verify(),
+            "replay" => self.api_replay(args),
+            "ts_keys" => self.api_ts_keys(),
+            "ts_series" => self.api_ts_series(args),
+            "ts_view" => self.api_ts_view(args),
+            "forecast_uses" => Ok(self.foreuse.status_json()),
+            "rt_revs" => Ok(self.api_rt_revs()),
+            "nn_status" => {
+                let since = num(args, "since").unwrap_or(0.0).max(0.0) as u64;
+                let window = text(args, "window");
+                let worker = num(args, "worker").unwrap_or(1.0).max(1.0) as u32;
+                let scenario = text(args, "scenario");
+                let phase = text(args, "phase");
+                Ok(crate::progress::build_nn_status_full(self, worker, scenario, phase, since, window))
+            }
             "physics_status" => Ok(self.api_physics_status()),
             "act_status" => Ok(self.api_act_status()),
             "world_light" => self.api_world_light(args),

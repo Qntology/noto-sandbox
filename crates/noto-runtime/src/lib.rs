@@ -8,6 +8,8 @@ pub mod config;
 pub mod crew;
 mod driver;
 pub mod embedding;
+pub mod feedback;
+pub mod foreuse;
 pub mod mcp;
 pub mod ml;
 mod mldrive;
@@ -15,11 +17,14 @@ mod mlsds;
 pub mod nnlive;
 pub mod perception;
 pub mod precision;
+pub mod progress;
 pub mod record;
 pub mod rigs;
 pub mod runtime;
+pub mod sdsview;
 pub mod stereo;
 pub mod testrun;
+pub mod tshub;
 pub mod views;
 pub mod vision;
 pub mod vocab;
@@ -34,6 +39,14 @@ pub use testrun::{TestCfg, TestPhase, TestSession};
 pub use vision::{DriftRate, Memory, VisionCfg, VisionMark};
 pub use runtime::{label_ko, Detection, EvalCounters, EvalSummary, FrameOut, FrameView, Runtime, ScanReport, Submission, TsView};
 pub use vocab::vocab_texts;
+
+/// Automatic 12-hex SHA-256 fingerprint of engine source files (Phase 2 – Part 3 · D2).
+pub const ENGINE_FP: &str = env!("NOTO_ENGINE_FP");
+
+/// Combined generation identifier `<ENGINE_REV>+<ENGINE_FP>`.
+pub fn generation_id() -> String {
+    format!("{}+{}", noto_core::bench::ENGINE_REV, ENGINE_FP)
+}
 
 pub fn world_terrain_kind(id: &str) -> Result<world_sim::TerrainKind, String> {
     world_sim::TerrainKind::from_id(id).ok_or_else(|| format!("알 수 없는 지형 '{id}' (open 또는 rugged)"))

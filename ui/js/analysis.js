@@ -3,10 +3,11 @@ import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $, clear, el, fmt } from './util.js';
 import { describeDestination, summarize } from './command-bar.js';
+import { isOpen } from './overlays.js';
+import { register } from './poller.js';
 
 const MODE_NOTE = { oracle: '모의 인식기(렌더러 정답 + 오류 주입)', embedding: 'SigLIP2 임베딩', siglip2: 'SigLIP2', mock: '모의 인식기(브라우저)' };
 const SCAN_TOP_K = 8;
-const SDS_POLL_MS = 5000;
 
 // ── 비전 점수 ───────────────────────────────────────────────────
 function scoreList(labels) {
@@ -91,15 +92,55 @@ function renderTrace() {
 }
 
 // ── SDS ─────────────────────────────────────────────────────────
+async function setFeedbackMode(defaultMode) {
+  try {
+    await call('sds_feedback', { default: defaultMode });
+    await refreshSds();
+  } catch { /* api-error 가 표시 */ }
+}
+
+function feedbackSection(fb) {
+  if (!fb || !Array.isArray(fb.paths)) return null;
+  const wrap = el('div', { style: 'margin-bottom:12px' });
+  const mode = fb.mode?.default ?? 'live';
+  const snap = fb.mode?.snapshot ? ` · 스냅샷 ${String(fb.mode.snapshot).slice(0, 8)}` : '';
+  const sel = el('select', { aria: { label: 'SDS 되먹임 모드' }, on: { change: (e) => setFeedbackMode(e.target.value) } },
+    ...[['live', '실시간 (live)'], ['frozen', '동결 (frozen)'], ['off', '끔 (off)']].map(([v, t]) => el('option', { value: v, text: t, selected: v === mode })));
+  wrap.append(
+    el('div', { class: 'ct-sec', style: 'display:flex;align-items:center;gap:8px' },
+      el('span', { text: `되먹임 경로 A–H${snap}` }), sel),
+    el('table', { class: 'pv-table' },
+      el('thead', {}, el('tr', {}, ['경로', '모드', '축', '값', '키(계층)', 'n', '출처'].map((h, i) => el('th', { text: h, class: (i === 3 || i === 5) ? 'num' : null })))),
+      el('tbody', {}, fb.paths.map((p) => el('tr', {},
+        el('td', { class: 'mono', text: p.id }),
+        el('td', { class: 'mono', text: p.mode }),
+        el('td', { class: 'mono', text: `${p.track}:${p.axis}` }),
+        el('td', { class: 'num', text: p.value == null ? `기본(${p.cold_default})` : fmt.n(p.value, 3) }),
+        el('td', { class: 'mono', text: p.key ? `${p.key} (${p.level ?? ''})` : '—' }),
+        el('td', { class: 'num', text: String(p.n ?? 0) }),
+        el('td', { class: 'mono', text: p.provenance ?? 'experience' }))))));
+  return wrap;
+}
+
 function sdsView(sds) {
   if (!sds) return el('p', { class: 'empty-note', text: 'SDS 상태를 불러오지 못했습니다.' });
   const wrap = el('div', {});
-  wrap.append(el('div', { class: 'pv-kv', style: 'margin-bottom:10px' }, ...kvRow('원장 폴더', sds.dir), ...kvRow('레시피', sds.recipe)));
+  wrap.append(el('div', { class: 'pv-kv', style: 'margin-bottom:10px' },
+    ...kvRow('원장 폴더', sds.dir),
+    ...kvRow('레시피', sds.recipe),
+    ...(sds.rev != null ? kvRow('판 번호', String(sds.rev)) : [])));
+  // F4: 원장 표에 engine_revs(개정) 열 표시
   wrap.append(el('table', { class: 'pv-table', style: 'margin-bottom:12px' },
-    el('thead', {}, el('tr', {}, ['원장', '범위 수', '관측', '이번 실행'].map((h, i) => el('th', { text: h, class: i ? 'num' : null })))),
-    el('tbody', {}, (sds.ledgers ?? []).map((l) => el('tr', {},
-      el('td', { class: 'mono', text: l.ledger }), el('td', { class: 'num', text: String(l.scopes) }),
-      el('td', { class: 'num', text: String(l.observations) }), el('td', { class: 'num', text: String(l.run_observations) }))))));
+    el('thead', {}, el('tr', {}, ['원장', '범위 수', '관측', '이번 실행', '엔진 개정'].map((h, i) => el('th', { text: h, class: (i > 0 && i < 4) ? 'num' : null })))),
+    el('tbody', {}, (sds.ledgers ?? []).map((l) => {
+      const revs = l.engine_revs ?? [];
+      return el('tr', {},
+        el('td', { class: 'mono', text: l.ledger }), el('td', { class: 'num', text: String(l.scopes) }),
+        el('td', { class: 'num', text: String(l.observations) }), el('td', { class: 'num', text: String(l.run_observations) }),
+        el('td', { class: `mono ${revs.length > 1 ? 'warn' : ''}`, text: revs.length ? revs.join(', ') : '—' }));
+    }))));
+  const fbSec = feedbackSection(sds.feedback);
+  if (fbSec) wrap.append(fbSec);
   if (sds.precision) {
     const p = sds.precision;
     const e = p.eval ?? {};
@@ -126,20 +167,35 @@ function sdsView(sds) {
           el('td', { class: 'num', text: String(c.ties) }), el('td', { class: 'num', text: String(c.a_wins) }),
           el('td', { class: 'num', text: String(c.b_wins) }), el('td', { class: 'num', text: fmt.n(c.mean_margin, 3) }))))));
   }
-  if (sds.axes?.length) {
+  // F3: 게이트 차단율 행(recent 가 단독 차단율)을 전용 표로 분리
+  const allAxes = sds.axes ?? [];
+  const gateAxes = allAxes.filter((a) => a.kind === 'gate_block');
+  const statAxes = allAxes.filter((a) => a.kind !== 'gate_block');
+  if (gateAxes.length) {
+    wrap.append(el('div', { class: 'ct-sec', text: '게이트 차단율' }),
+      el('table', { class: 'pv-table', style: 'margin-bottom:12px' },
+        el('thead', {}, el('tr', {}, ['범위', '게이트', '평가 n', '차단율', '단독 차단율', '심각도 σ', '드리프트 z'].map((h, i) => el('th', { text: h, class: i > 1 ? 'num' : null })))),
+        el('tbody', {}, gateAxes.map((a) => el('tr', {},
+          el('td', { class: 'mono', text: a.scope }), el('td', { class: 'mono', text: a.axis }),
+          el('td', { class: 'num', text: String(a.n) }), el('td', { class: 'num', text: fmt.pct(a.mean, 1) }),
+          el('td', { class: 'num', text: fmt.pct(a.recent, 1) }), el('td', { class: 'num', text: fmt.n(a.sd, 2) }),
+          el('td', { class: `num ${Math.abs(a.drift_z) > 3 ? 'warn' : ''}`, text: fmt.n(a.drift_z, 2) }))))));
+  }
+  if (statAxes.length) {
     wrap.append(el('table', { class: 'pv-table' },
       el('thead', {}, el('tr', {}, ['범위', '축', '종류', 'n', '평균', 'σ', '최근', '드리프트 z'].map((h, i) => el('th', { text: h, class: i > 2 ? 'num' : null })))),
-      el('tbody', {}, sds.axes.map((a) => el('tr', {},
+      el('tbody', {}, statAxes.map((a) => el('tr', {},
         el('td', { class: 'mono', text: a.scope }), el('td', { class: 'mono', text: a.axis }), el('td', { text: a.kind }),
         el('td', { class: 'num', text: String(a.n) }), el('td', { class: 'num', text: fmt.n(a.mean, 3) }),
         el('td', { class: 'num', text: fmt.n(a.sd, 3) }), el('td', { class: 'num', text: fmt.n(a.recent, 3) }),
-        el('td', { class: `num ${Math.abs(a.drift_z) > 2 ? 'warn' : ''}`, text: fmt.n(a.drift_z, 2) }))))));
-  } else {
+        el('td', { class: `num ${Math.abs(a.drift_z) > 3 ? 'warn' : ''}`, text: fmt.n(a.drift_z, 2) }))))));
+  } else if (!gateAxes.length) {
     wrap.append(el('p', { class: 'empty-note', text: '아직 축 통계가 없습니다. 관측이 쌓이면 표시됩니다.' }));
   }
   if (sds.log?.length) {
+    // F1: 서버가 최신순으로 반환하므로 slice(0, 8) 이 최신 8줄
     wrap.append(el('div', { class: 'ct-sec', text: 'SDS 최근 기록' }),
-      el('div', { class: 'hint', style: 'font-family:var(--font-mono);white-space:pre-wrap' }, sds.log.slice(-8).join('\n')));
+      el('div', { class: 'hint', style: 'font-family:var(--font-mono);white-space:pre-wrap' }, sds.log.slice(0, 8).join('\n')));
   }
   return wrap;
 }
@@ -169,15 +225,19 @@ export function initAnalysis() {
   renderTrace();
   renderSds();
 
-  // 재생 중 자동 인식(4초마다)
-  setInterval(() => {
-    if ($('scan-auto').checked && state.playing && !document.hidden) runScan();
-  }, 4000);
-  // 시계열·SDS 탭이 보이는 동안 SDS 상태를 주기적으로 갱신
+  // 재생 중 자동 인식(4초마다) · SDS 요약(판 번호 sds 바뀔 때만) — poller 중앙 스케줄러에 등록 (F2)
   let tab = null;
-  setInterval(() => {
-    if (tab === 'ts' && !document.hidden) refreshSds();
-  }, SDS_POLL_MS);
+  register('scan-auto', {
+    every: 4000,
+    visible: () => !!$('scan-auto')?.checked && state.playing,
+    run: () => runScan(),
+  });
+  register('sds-status', {
+    rev: 'sds',
+    minGap: 2000,
+    visible: () => isOpen('analysis-modal') && tab === 'ts',
+    run: () => refreshSds(),
+  });
   bus.on('tab', ({ group, name }) => {
     if (group !== 'analysis') return;
     tab = name;

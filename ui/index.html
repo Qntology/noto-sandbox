@@ -12,6 +12,7 @@
   <link rel="stylesheet" href="css/overlay.css" />
   <link rel="stylesheet" href="css/cctv.css" />
   <link rel="stylesheet" href="css/timeline.css" />
+  <link rel="stylesheet" href="css/dock.css" />
   <script type="module" src="js/main.js"></script>
 </head>
 <body>
@@ -353,7 +354,23 @@
         </div>
       </section>
 
+      <!-- N:N 상태 · 7×7 지도 · 보류/기권 Drop-up -->
+      <section class="vp-glass ov-panel dropup nn-dropup" id="nn-dropup" aria-label="N:N 시나리오 · 균형 지도 · 보류" hidden>
+        <div class="ov-head">
+          <b>🧭 N:N 실시간 위상 · 감점 분해 · 보류/기권</b>
+          <span class="step-sum" id="nn-meta"></span>
+          <button type="button" class="ov-close" data-close="nn-dropup" aria-label="닫기">✕</button>
+        </div>
+        <div class="nn-tabs" id="nn-tabs" role="tablist">
+          <button type="button" class="nn-tab active" data-tab="scenarios">시나리오 · 위상</button>
+          <button type="button" class="nn-tab" data-tab="matrix">7×7 균형 지도</button>
+          <button type="button" class="nn-tab" data-tab="holds">보류 · 기권</button>
+        </div>
+        <div id="nn-dropup-body"></div>
+      </section>
+
       <form class="vp-glass command-bar" id="command-bar" autocomplete="off">
+        <div class="progress-band" id="progress-band" aria-label="실시간 진행 띠"></div>
         <div class="quest-row">
           <button type="button" class="quest-bar" id="quest-bar" aria-expanded="false" aria-controls="quest-dropup" aria-label="퀘스트 진행 — 누르면 협업·퀘스트·인벤토리 상세">
             <span class="qb-ico" aria-hidden="true">📋</span>
@@ -388,8 +405,11 @@
     </section>
   </main>
 
-  <!-- 기록·분석 모달: 로그 줄을 누르면 그 범주의 탭으로 열린다 -->
-  <div class="modal-back" id="analysis-modal" role="dialog" aria-modal="true" aria-label="기록 · 분석" hidden>
+  <!-- 공유 시간 커서 띠 (과거 키프레임 탐색 시 표시) -->
+  <div class="cursor-banner" id="cursor-banner" role="status" aria-live="polite" hidden></div>
+
+  <!-- 기록·분석 작업면: 오른쪽/아래 도킹 또는 전체 크기 -->
+  <div class="modal-back" id="analysis-modal" role="dialog" aria-modal="false" aria-label="기록 · 분석" hidden>
     <div class="modal-card analysis-card">
       <div class="modal-head">
         <div class="bottom-tabs" role="tablist" aria-label="기록 · 분석 탭" id="analysis-tabs">
@@ -397,6 +417,13 @@
           <button type="button" class="bottom-tab" role="tab" id="atab-ts" data-tab="ts" aria-selected="false" aria-controls="apane-ts" tabindex="-1">📈 시계열 · SDS</button>
           <button type="button" class="bottom-tab" role="tab" id="atab-vision" data-tab="vision" aria-selected="false" aria-controls="apane-vision" tabindex="-1">👁 비전 · 깊이</button>
           <button type="button" class="bottom-tab" role="tab" id="atab-trace" data-tab="trace" aria-selected="false" aria-controls="apane-trace" tabindex="-1">📜 명령 해석 · 합성 DB</button>
+        </div>
+        <div class="dock-controls">
+          <span class="dock-meta" id="dock-meta"></span>
+          <span class="dock-transport" id="dock-transport">폴링</span>
+          <button type="button" class="pb-btn" id="dock-side" title="도킹 위치 전환">⬇ 아래로</button>
+          <button type="button" class="pb-btn" id="dock-size" title="반 크기 / 전체 전환">전체</button>
+          <button type="button" class="pb-btn" id="dock-collapse" title="접기/펼치기">▶</button>
         </div>
         <button type="button" class="ov-close" data-close="analysis-modal" aria-label="닫기">✕</button>
       </div>
@@ -408,21 +435,31 @@
       <div class="apane ap-split" id="apane-ts" role="tabpanel" aria-labelledby="atab-ts" hidden>
         <div class="bottom-pane" id="bpane-ts">
           <div class="pane-toolbar">
+            <label class="vt-label" for="ts-series-sel">계열</label><select id="ts-series-sel" class="pane-select"></select>
             <label class="vt-label" for="ts-scope">범위</label><select id="ts-scope" class="pane-select"></select>
             <label class="vt-label" for="ts-axis">축</label><select id="ts-axis" class="pane-select"></select>
             <button type="button" class="vt-btn" id="ts-refresh">새로고침</button>
             <span class="pane-info" id="ts-info"></span>
           </div>
-          <div class="ts-stage">
-            <canvas id="ts-canvas" aria-label="시계열 예측 차트: 이력, P50, P10~P90 띠"></canvas>
+          <div class="ts-layout">
+            <div class="ts-stage">
+              <canvas id="ts-canvas" aria-label="시계열 예측 차트: 틱 기준 이력, 판정 띠, P50, 보정·게이트 띠"></canvas>
+            </div>
+            <aside class="ts-side" id="ts-side" aria-label="가중치 · 실현 오차 · 최근 판정"></aside>
           </div>
         </div>
         <div class="bottom-pane">
           <div class="pane-toolbar">
-            <span class="vt-label">SDS 원장 (sds_status)</span>
+            <span class="vt-label">SDS 탐색기 (sds_tree · sds_query · sds_watch)</span>
             <button type="button" class="vt-btn pane-end" id="an-sds-refresh">새로고침</button>
           </div>
-          <div class="pane-scroll" id="an-sds"></div>
+          <div class="pane-scroll" style="display:flex;flex-direction:column;gap:8px">
+            <div id="sds-explorer" style="flex:1;min-height:240px"></div>
+            <details>
+              <summary class="hint" style="cursor:pointer">원장 요약 · 되먹임 A–H 설정 (sds_status)</summary>
+              <div id="an-sds"></div>
+            </details>
+          </div>
         </div>
       </div>
 

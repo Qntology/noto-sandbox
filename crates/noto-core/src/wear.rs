@@ -71,6 +71,16 @@ pub fn damage(a: &Actuator, torque_nm: f32, dt_s: f32) -> f32 {
     }
 }
 
+/// Shared first-order thermal step `h += min(dt/tau, 1) * (effort^2 - h)` used by both
+/// `world-sim` and offline sequence evaluators (`nn::evaluate_sequence`) so thermal
+/// trajectories match bit-for-bit (Phase 6 – Part 2 · D3).
+pub fn heat_step(h: f32, effort: f32, dt_s: f32, tau_s: f32) -> f32 {
+    if dt_s <= 0.0 || tau_s <= 0.0 {
+        return h;
+    }
+    h + (dt_s / tau_s).min(1.0) * (effort * effort - h)
+}
+
 pub fn cubic_mean_torque(cycle: &[(f32, f32, f32)]) -> f32 {
     let (num, den) = cycle.iter().fold((0.0f64, 0.0f64), |a, &(t, n, s)| (a.0 + (n * s) as f64 * (t.abs() as f64).powi(3), a.1 + (n * s) as f64));
     if den <= 0.0 {

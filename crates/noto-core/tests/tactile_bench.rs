@@ -1,5 +1,6 @@
 use noto_core::actbench::Layer;
 use noto_core::balance::Body;
+use noto_core::bench::holdout_seed;
 use noto_core::effects::Rule;
 use noto_core::parts::BodyPlan;
 use noto_core::tactbench::{evaluate, holdout, library, TxResult};
@@ -7,7 +8,6 @@ use noto_core::{BaseKind, FingerCount};
 
 const PLANS: [&str; 3] = ["mid", "pro", "wheel_lift"];
 const BASES: [BaseKind; 3] = [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track];
-const HOLDOUT_SEED: u64 = 20261027;
 
 fn num(v: f32) -> String {
     if v != 0.0 && v.abs() < 0.01 {
@@ -84,13 +84,14 @@ fn the_same_engine_and_draws_give_the_same_answer() {
 
 #[test]
 fn held_out_draws_are_counted_not_tuned() {
+    let seed = holdout_seed("TX");
     for plan in ["mid", "pro"] {
         for base in [BaseKind::HumanFoot, BaseKind::Track] {
             let body = Body::new(&BodyPlan::named(plan).unwrap(), base, FingerCount::Five);
-            let results: Vec<TxResult> = holdout(HOLDOUT_SEED, 6).iter().map(|s| evaluate(&body, s)).collect();
+            let results: Vec<TxResult> = holdout(seed, 6).iter().map(|s| evaluate(&body, s)).collect();
             let run: Vec<&TxResult> = results.iter().filter(|r| r.skipped.is_none()).collect();
             let passed = run.iter().filter(|r| r.passed).count();
-            println!("[TX-HELD] {plan:<6} {base:?} 시드 {HOLDOUT_SEED}: 통과 {passed} / {} (건너뜀 {})", run.len(), results.len() - run.len());
+            println!("[TX-HELD] {plan:<6} {base:?} 시드 {seed}: 통과 {passed} / {} (건너뜀 {})", run.len(), results.len() - run.len());
             for r in &results {
                 println!(
                     "[TX-HELD]   {} {} {}{}",

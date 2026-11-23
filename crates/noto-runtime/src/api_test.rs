@@ -132,6 +132,8 @@ impl Runtime {
                 self.api_test_status()
             })(),
             "test_status" => self.api_test_status(),
+            "test_status_delta" => self.api_test_status_delta(args),
+            "test_context" => self.api_test_context(args),
             "test_keyframe" => self.api_test_keyframe_with(
                 if text("pass").is_empty() { "game" } else { text("pass") },
                 num("index").unwrap_or(0.0).max(0.0) as usize,

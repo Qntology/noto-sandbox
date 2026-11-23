@@ -4,6 +4,7 @@ import { call } from './api.js';
 import { bus, state } from './state.js';
 import { $ } from './util.js';
 import { setStatus, toast } from './toast.js';
+import { onRevs } from './poller.js';
 
 const STEP_MS = 125;
 let timer = null;
@@ -60,9 +61,12 @@ export async function newWorld(seed, size, terrain = state.terrain ?? 'rugged') 
 }
 
 export async function step(ticks) {
-  const r = await call('sim_step', { ticks });
+  const r = await call('sim_step', { ticks, focus: state.progressWorker ?? 1 });
   // The ML decision pass of a recording swaps in a copy of the start state: the trail starts over.
   const swapped = state.snapshot && r.test?.phase !== state.livePhase && (r.test?.phase === 'decide' || state.livePhase === 'decide');
+  if (swapped) {
+    setStatus(r.test?.phase === 'decide' ? 'ML 결정 통과: 시작 상태 복제 월드로 전환됨' : 'ML 결정 통과 종료: 라이브 월드로 복귀');
+  }
   state.livePhase = r.test?.phase ?? null;
   applySnapshot(r.snapshot, swapped);
   state.quests = r.quests;
@@ -71,6 +75,8 @@ export async function step(ticks) {
   bus.emit('body', r.body);
   bus.emit('sim-events', r.events ?? []);
   bus.emit('sim-test', r.test ?? null);
+  if (r.progress) bus.emit('progress', r.progress);
+  if (r.revs) onRevs(r.revs);
   return r;
 }
 

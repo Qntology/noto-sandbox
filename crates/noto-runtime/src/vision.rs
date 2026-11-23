@@ -1,4 +1,4 @@
-use noto_sds::{Scope, SdsStore, Track};
+use noto_sds::{DriftState, Scope, SdsStore, Track, Window};
 use serde::{Deserialize, Serialize};
 use world_sim::odometry::{LEG_SCALE_SD, RANDOM_WALK_M, WHEEL_SCALE_SD};
 use world_sim::Camera;
@@ -213,6 +213,22 @@ impl Memory {
         (self.sigma0_m * self.sigma0_m + (rate.per_m * d).powi(2) + rate.walk_m * rate.walk_m * d).sqrt()
     }
 
+    /// Closed-form travel distance `d* >= 0` from `self.odo_m` at which `2 * kappa * sigma(d*) = tol`
+    /// (Phase 3 – Part 3 · D3). `kappa >= 1.0` scales uncertainty when SDS innovation z > 1.
+    pub fn dist_to_tolerance(&self, tol: f32, r: DriftRate, kappa: f32) -> f32 {
+        let k = kappa.max(1.0);
+        let s2 = (tol / (2.0 * k)).powi(2) - self.sigma0_m.powi(2);
+        if s2 <= 0.0 {
+            return 0.0;
+        }
+        let a = r.per_m * r.per_m;
+        let b = r.walk_m * r.walk_m;
+        if a <= 1e-12 {
+            return if b <= 1e-12 { f32::INFINITY } else { s2 / b };
+        }
+        ((-b + (b * b + 4.0 * a * s2).sqrt()) / (2.0 * a)).max(0.0)
+    }
+
     /// `fuse`, the memory's σ first raised to what the innovation says when the two σ cannot explain it (covariance
     /// matching): the memory is the one whose error is under-modelled — wheels slip on soft ground and turns move it by
     /// more than the drift spec has, until the SDS has learned the rate — and a look that finds the item well away from
@@ -251,10 +267,27 @@ impl DriftRate {
     }
 
     pub fn learned(sds: &SdsStore, base: &str, legged: bool) -> DriftRate {
+        Self::learned_with(sds, base, legged, &crate::feedback::FeedbackHub::live(), 0)
+    }
+
+    pub fn learned_with(sds: &SdsStore, base: &str, legged: bool, fb: &crate::feedback::FeedbackHub, tick: u64) -> DriftRate {
         let spec = DriftRate::spec(legged);
-        match sds.adaptive_baseline(&Scope::new(Track::Memory, base, "drift"), "drift_var_per_m2") {
-            Some((mean, _, _)) if mean.is_finite() && mean > 0.0 => DriftRate { per_m: (mean as f32).sqrt(), source: "sds", ..spec },
-            _ => spec,
+        let scope = Scope::new(Track::Memory, base, "drift");
+        match fb.estimate_mean(crate::feedback::FeedbackPath::G, sds, &scope, "drift_var_per_m2", Window::Auto, tick) {
+            Some(est) => {
+                // On thin precision or active shift, use upper CI bound (never under-estimate drift).
+                let var = if est.thin.is_some() || matches!(est.state, DriftState::Shifted { .. }) {
+                    est.hi.max(est.value)
+                } else {
+                    est.value
+                };
+                if var.is_finite() && var > 0.0 {
+                    DriftRate { per_m: (var as f32).sqrt(), source: "sds", ..spec }
+                } else {
+                    spec
+                }
+            }
+            None => spec,
         }
     }
 }
@@ -405,5 +438,18 @@ mod tests {
         let cfg = VisionCfg::default();
         assert_eq!(cfg.look_every_ticks, 15);
         assert!(memory_ok(0.02, 0.06, &cfg) && !memory_ok(0.04, 0.06, &cfg));
+    }
+
+    #[test]
+    fn dist_to_tolerance_matches_sigma() {
+        let rate = DriftRate::spec(true);
+        let m = Memory::seen(3.0, 1.0, 0.03, 10.0, 0);
+        for (tol, kappa) in [(0.15f32, 1.0f32), (0.20, 1.25), (0.30, 1.5)] {
+            let d = m.dist_to_tolerance(tol, rate, kappa);
+            assert!(d > 0.0 && d.is_finite());
+            let lhs = 2.0 * kappa.max(1.0) * m.sigma_m(m.odo_m + d, rate);
+            assert!((lhs - tol).abs() < 1e-4, "tol={tol} kappa={kappa} d={d} lhs={lhs}");
+        }
+        assert_eq!(m.dist_to_tolerance(0.04, rate, 1.0), 0.0);
     }
 }

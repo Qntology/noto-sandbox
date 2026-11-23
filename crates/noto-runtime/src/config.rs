@@ -30,8 +30,14 @@ pub struct GateCfg {
     pub track_radius_m: f32,
     pub temporal_min_history: usize,
     pub temporal_widen_sd: f64,
+    #[serde(default = "default_temporal_z")]
+    pub temporal_z: f64,
     pub adaptive: bool,
     pub adaptive_k: f64,
+}
+
+fn default_temporal_z() -> f64 {
+    2.33
 }
 
 impl Default for GateCfg {
@@ -44,6 +50,7 @@ impl Default for GateCfg {
             track_radius_m: 1.0,
             temporal_min_history: 6,
             temporal_widen_sd: 1.0,
+            temporal_z: default_temporal_z(),
             adaptive: true,
             adaptive_k: 2.0,
         }

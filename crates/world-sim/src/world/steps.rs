@@ -145,9 +145,28 @@ impl World {
     }
 
     /// The speed a robot with a load on keeps to for a step it has seen near ahead (m/s).
+    /// Under `forecast_control`, also starts slowing early whenever `d / v <= rem_crouch_s + REACTION_DELAY_S`
+    /// so knee crouch finishes before reaching the edge (Phase 3 – Part 3 · D4).
     pub(super) fn step_speed_limit(&self) -> Option<f32> {
         let s = self.stride.seen?;
-        (self.carried_kg() > AMOUNT_EPS && (s.at.0 - self.agent.x).hypot(s.at.1 - self.agent.z) <= self.crouch_ahead_m()).then_some(STEP_SPEED_MPS)
+        if self.carried_kg() <= AMOUNT_EPS {
+            return None;
+        }
+        let d = (s.at.0 - self.agent.x).hypot(s.at.1 - self.agent.z);
+        if d <= self.crouch_ahead_m() {
+            return Some(STEP_SPEED_MPS);
+        }
+        if self.forecast_control && self.body.legged() {
+            let want = carry::crouch_for(s.height_m, &self.body.dims);
+            let rem = (want - self.stride.crouch_m).max(0.0);
+            let rate = carry::CROUCH_MAX_M / CROUCH_S;
+            let need_s = rem / rate.max(0.05) + noto_core::balance::REACTION_DELAY_S;
+            let v = self.agent.speed_mps.max(STEP_SPEED_MPS);
+            if d / v <= need_s {
+                return Some(STEP_SPEED_MPS);
+            }
+        }
+        None
     }
 
     /// The base takes the step of `e`: the shock of it, with however far the knees were bent, goes to the load.

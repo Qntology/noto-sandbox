@@ -21,6 +21,50 @@ const NOTE_SHIFT_M: f32 = 0.03;
 /// What a load keeps of its shift when the piece above it comes off.
 const SHIFT_KEPT: f32 = 0.4;
 
+/// Online haul friction estimate learned strictly from slip observations (Phase 3 – Part 3 · D4).
+#[derive(Clone, Copy, Debug)]
+pub struct MuEstimate {
+    pub mean: f32,
+    pub sd: f32,
+    pub n: u32,
+}
+
+impl Default for MuEstimate {
+    fn default() -> Self {
+        MuEstimate { mean: 1.0, sd: HAUL_MU_COV, n: 0 }
+    }
+}
+
+impl MuEstimate {
+    /// Conservative lower friction multiplier (10th percentile ~ mean - 1.2816*sd, clamped to `[0.55, 1.0]`).
+    pub fn lower_scale(&self) -> f32 {
+        (self.mean - 1.2816 * self.sd).clamp(0.55, 1.0)
+    }
+
+    /// Update on observed slip with measured acceleration magnitude `a_obs` vs nominal safe acceleration `a_nom`.
+    pub fn observe_slip(&mut self, a_obs: f32, a_nom: f32) {
+        if a_nom <= 1e-3 || !a_obs.is_finite() {
+            return;
+        }
+        let ratio = (a_obs / a_nom).clamp(0.4, 1.2);
+        self.n = self.n.saturating_add(1);
+        let alpha = (1.0 / (self.n as f32 + 1.0)).max(0.25);
+        self.mean = (1.0 - alpha) * self.mean + alpha * ratio;
+        self.sd = (self.sd * 0.85).max(0.04);
+    }
+
+    /// Update lower bound softly when driving cleanly without slip at utilization `u_nom`.
+    pub fn observe_clean(&mut self, a_obs: f32, a_nom: f32) {
+        if a_nom <= 1e-3 || a_obs <= 0.1 * a_nom {
+            return;
+        }
+        let ratio = (a_obs / a_nom).clamp(0.5, 1.15);
+        if ratio > self.mean - self.sd {
+            self.sd = (self.sd * 0.995).max(0.05);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CargoRide {
     pub state: LoadState,
@@ -30,10 +74,12 @@ pub struct CargoRide {
     last_at: Option<(f32, f32)>,
     last_vel: Option<[f32; 2]>,
     accel: [f32; 2],
+    accel_body: [f32; 2],
     /// The kick of a step, taken at the next tick (m/s²).
     pub pending_az: f32,
     pub use_ratio: f32,
     noted: bool,
+    pub mu_est: MuEstimate,
 }
 
 impl CargoRide {
@@ -42,7 +88,18 @@ impl CargoRide {
         self.last_at = None;
         self.last_vel = None;
         self.accel = [0.0, 0.0];
+        self.accel_body = [0.0, 0.0];
         self.pending_az = 0.0;
+    }
+
+    /// Filtered load acceleration in the body frame `[forward, left]` (m/s²).
+    pub fn accel_body(&self) -> [f32; 2] {
+        self.accel_body
+    }
+
+    /// Current horizontal load displacement magnitude (m).
+    pub fn shift_m(&self) -> f32 {
+        self.state.shift[0].hypot(self.state.shift[1])
     }
 }
 
@@ -64,9 +121,34 @@ impl World {
         Some(spec.with_draw(HAUL_MU_COV, self.ride.draw))
     }
 
+    /// Nominal load specification using table mean friction (without peeking at the haul's hidden random draw).
+    pub fn load_spec_nominal(&self) -> Option<LoadSpec> {
+        let pieces: Vec<(ItemKind, f32)> = self.agent.carried.iter().filter(|(_, n)| *n > AMOUNT_EPS).copied().collect();
+        let (top, amount) = *pieces.last()?;
+        let mass: f32 = pieces.iter().map(|(k, n)| k.spec().mass_kg * n).sum();
+        let layers: f32 = pieces.iter().map(|(_, n)| n.ceil()).sum();
+        let size = top.spec().piece_size_m(amount.min(1.0));
+        let spec = if noto_core::act::fork::applies(&self.body) {
+            LoadSpec::tines(&self.body.dims, material_of(top), mass, size[0].max(size[2]), layers as usize)
+        } else {
+            let weight = mass * G;
+            let hold = 2.0 * self.grip_capacity_for(top, amount.min(1.0));
+            LoadSpec::hands(material_of(top), mass, size, hold.max(noto_core::balance::GRIP_SAFETY * weight))
+        };
+        Some(spec)
+    }
+
     /// How hard this robot may accelerate with its load on, corner or straight (m/s²); `None` with nothing on.
+    /// When `forecast_control` is active, monotonically tightens by the conservative lower quantile of `mu_est`.
     pub(super) fn load_accel(&self) -> Option<f32> {
-        self.load_spec().map(|s| s.safe_accel().max(0.3))
+        let base = self.load_spec()?.safe_accel().max(0.3);
+        if self.forecast_control {
+            let nom = self.load_spec_nominal()?.safe_accel().max(0.3);
+            let est_cap = (nom * self.ride.mu_est.lower_scale()).max(0.3);
+            Some(base.min(est_cap))
+        } else {
+            Some(base)
+        }
     }
 
     /// How high the load rides off the ground under the base (m), and how far ahead of the base's centre.
@@ -116,20 +198,26 @@ impl World {
         let (ax, az) = (self.ride.accel[0], self.ride.accel[1]);
         let slope = self.posture_now().0.slope_deg.to_radians();
         let a = [ax * c + az * s + G * slope.sin(), -ax * s + az * c];
+        self.ride.accel_body = a;
         let a_z = std::mem::take(&mut self.ride.pending_az);
         let Some(spec) = self.load_spec() else { return false };
         let r = carry::ride(&spec, self.ride.state, a, a_z, dt);
         self.ride.state = r.state;
         self.ride.use_ratio = r.use_ratio;
         let shift = r.state.shift[0].hypot(r.state.shift[1]);
+        let a_mag = a[0].hypot(a[1]);
+        let a_nom = self.load_spec_nominal().map_or(spec.safe_accel(), |ns| ns.safe_accel()).max(0.3);
         if shift >= NOTE_SHIFT_M && !self.ride.noted {
             self.ride.noted = true;
+            self.ride.mu_est.observe_slip(a_mag, a_nom);
             let item = self.agent.carried.last().map(|c| c.0);
             if let Some(item) = item {
                 let how = if spec.holder == Holder::Tines { "포크 위에서" } else { "손에서" };
                 let label = format!("{} {how} {:.0} cm 밀림 (마찰 이용률 {:.0}%)", item.spec().label_ko, shift * 100.0, r.use_ratio * 100.0);
                 events.push(self.stamp(WorldEvent::CargoSlip { worker, item, shift_m: shift, use_ratio: r.use_ratio, label }));
             }
+        } else if shift < 1e-3 {
+            self.ride.mu_est.observe_clean(a_mag, a_nom);
         }
         match r.lost {
             Some(why) => {

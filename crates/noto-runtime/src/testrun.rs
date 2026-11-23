@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD;
@@ -14,8 +15,12 @@ use serde_json::{json, Value};
 use world_sim::World;
 
 use crate::precision::PrecisionGates;
-use crate::record::{capture_keyframe, capture_video, Keyframe, RecordCfg, Recording};
+use crate::record::{capture_keyframe, capture_video, Keyframe, KeyframeCtx, RecordCfg, Recording};
 use crate::runtime::{Runtime, ScanReport, Submission};
+
+fn default_perceive_budget_ms() -> u64 {
+    160
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TestCfg {
@@ -23,11 +28,19 @@ pub struct TestCfg {
     pub max_pass_ticks: u64,
     pub max_ml_decisions: u32,
     pub perceive_per_step: usize,
+    #[serde(default = "default_perceive_budget_ms")]
+    pub perceive_budget_ms: u64,
 }
 
 impl Default for TestCfg {
     fn default() -> Self {
-        TestCfg { record: RecordCfg::default(), max_pass_ticks: 30_000, max_ml_decisions: 160, perceive_per_step: 6 }
+        TestCfg {
+            record: RecordCfg::default(),
+            max_pass_ticks: 30_000,
+            max_ml_decisions: 160,
+            perceive_per_step: 6,
+            perceive_budget_ms: default_perceive_budget_ms(),
+        }
     }
 }
 
@@ -40,6 +53,27 @@ pub enum TestPhase {
     Done,
 }
 
+/// Reproducibility specification captured at test start (Phase 2 – Part 3 · D6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayManifest {
+    pub seed: u64,
+    pub preset: String,
+    pub body: BodyPlan,
+    pub base: BaseKind,
+    pub command: String,
+    pub generation: String,
+    pub sds_mode: crate::feedback::SdsMode,
+    pub snapshot_digest: String,
+    pub ledger_digest: BTreeMap<String, String>,
+    pub feedback_at_start: BTreeMap<String, Option<f64>>,
+    pub recognizer_mode: String,
+    pub depth_mode: String,
+    pub ttm_on: bool,
+    pub ttm_fp8: Option<String>,
+    #[serde(default)]
+    pub traj_digests: Vec<(u64, String)>,
+}
+
 pub struct TestSession {
     pub id: String,
     pub command: String,
@@ -47,6 +81,7 @@ pub struct TestSession {
     pub body: BodyPlan,
     pub base: BaseKind,
     pub phase: TestPhase,
+    pub test_rev: u64,
     pub game: Option<Recording>,
     pub decide: Option<Recording>,
     pub perceive_next: usize,
@@ -60,6 +95,7 @@ pub struct TestSession {
     pub ml_needed: bool,
     start_world: Option<World>,
     stash: Option<LiveStash>,
+    pub manifest: Option<ReplayManifest>,
 }
 
 struct LiveStash {
@@ -99,6 +135,31 @@ impl Runtime {
             self.pass = "game".into();
             return Err(anyhow!("{}", s.error.unwrap_or_else(|| "명령을 이해하지 못했습니다".into())));
         }
+        let snapshot_digest = if let Some(dir) = self.data_dir() {
+            let snap_dir = dir.join("sds").join("snap");
+            self.sds.save_snapshot(&snap_dir).unwrap_or_else(|_| self.sds.combined_digest())
+        } else {
+            self.sds.combined_digest()
+        };
+        let manifest = ReplayManifest {
+            seed,
+            preset: body.id(),
+            body,
+            base: hand.base,
+            command: command.into(),
+            generation: self.sds.generation_id().map(String::from).unwrap_or_else(crate::generation_id),
+            sds_mode: self.feedback.mode().clone(),
+            snapshot_digest,
+            ledger_digest: self.sds.ledger_digests(),
+            feedback_at_start: self.feedback.snapshot_values(),
+            recognizer_mode: self.recognizer_mode().to_string(),
+            depth_mode: self.ml.depth_mode(),
+            ttm_on: self.has_ttm(),
+            ttm_fp8: self.gates.ttm().map(|t| t.fp8().to_string()),
+            traj_digests: Vec::new(),
+        };
+        self.clear_traj_digests();
+        self.log("replay", Level::Info, format!("재현 명세 기록: {id} · 지문 {}", &manifest.snapshot_digest[..8.min(manifest.snapshot_digest.len())]), Some(json!({"replay": manifest})));
         self.test = Some(TestSession {
             id: id.clone(),
             command: command.into(),
@@ -106,6 +167,7 @@ impl Runtime {
             body,
             base: hand.base,
             phase: TestPhase::Game,
+            test_rev: self.recording.as_ref().map_or(1, |r| r.test_rev.max(1)),
             game: None,
             decide: None,
             perceive_next: 0,
@@ -119,6 +181,7 @@ impl Runtime {
             ml_needed: true,
             start_world: None,
             stash: None,
+            manifest: Some(manifest),
         });
         self.log("quest", Level::Info, format!("통합 테스트 {id} 시작: \"{command}\" · 시드 {seed} · 프리셋 {} · 베이스 {:?}", body.id(), hand.base), None);
         Ok(())
@@ -145,6 +208,7 @@ impl Runtime {
             body: self.cfg.body,
             base: self.cfg.noto.base,
             phase: TestPhase::Game,
+            test_rev: self.recording.as_ref().map_or(1, |r| r.test_rev.max(1)),
             game: None,
             decide: None,
             perceive_next: 0,
@@ -158,6 +222,7 @@ impl Runtime {
             ml_needed,
             start_world: Some(start),
             stash: None,
+            manifest: None,
         });
         self.log(
             "quest",
@@ -170,6 +235,10 @@ impl Runtime {
 
     pub(crate) fn live_restore(&mut self) {
         if let Some(st) = self.test.as_mut().and_then(|t| t.stash.take()) {
+            self.nn_live.close_all(
+                crate::nnlive::CloseWhy::RunEnd,
+                crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+            );
             self.ml_task = None;
             self.task = None;
             self.world = st.world;
@@ -180,18 +249,94 @@ impl Runtime {
         }
     }
 
+    pub fn test_rev(&self) -> u64 {
+        let sess = self.test.as_ref().map_or(0, |t| t.test_rev);
+        let rec = self.recording.as_ref().map_or(0, |r| r.test_rev);
+        sess.max(rec)
+    }
+
+    pub(crate) fn bump_test_rev(&mut self) -> u64 {
+        let next = self.test_rev().saturating_add(1);
+        if let Some(t) = self.test.as_mut() {
+            t.test_rev = next;
+        }
+        if let Some(r) = self.recording.as_mut() {
+            r.test_rev = next;
+        }
+        next
+    }
+
+    pub(crate) fn stamp_keyframe_ctx(&self, kf: &mut Keyframe) {
+        let proc_stage = self
+            .procedure_json()
+            .and_then(|v| v.get("stage").and_then(Value::as_str).map(String::from));
+        let phase_ref = self
+            .nn_live
+            .active_now()
+            .first()
+            .map(|a| format!("{}/{}", a.scenario, a.phase));
+        kf.ctx = KeyframeCtx {
+            log_seq: self.audit.last_seq(),
+            quest_step: kf.step.clone().or_else(|| self.current_step_label()),
+            procedure_stage: proc_stage,
+            phase_ref,
+        };
+        if kf.nn_open.is_empty() {
+            kf.nn_open = self.nn_live.open_span_ids();
+        }
+    }
+
+    pub(crate) fn push_recorded_keyframe(&mut self, mut kf: Keyframe) -> Option<usize> {
+        let max_kf = self.test_cfg.record.max_keyframes;
+        let can_push = self.recording.as_ref().is_some_and(|r| r.keyframes.len() < max_kf);
+        if !can_push {
+            if let Some(r) = self.recording.as_mut() {
+                r.dropped_keyframes += 1;
+            }
+            return None;
+        }
+        self.stamp_keyframe_ctx(&mut kf);
+        let rev = self.bump_test_rev();
+        kf.created_rev = rev;
+        kf.rev = rev;
+        if let Some(r) = self.recording.as_mut() {
+            kf.index = r.keyframes.len() as u32;
+            r.keyframes.push(kf);
+            return Some(r.keyframes.len() - 1);
+        }
+        None
+    }
+
+    pub(crate) fn bump_recorded_keyframe_rev(&mut self, index: usize) {
+        let rev = self.bump_test_rev();
+        if let Some(kf) = self.recording.as_mut().and_then(|r| r.keyframes.get_mut(index)) {
+            kf.rev = rev;
+        }
+    }
+
     fn begin_pass(&mut self, pass: &str, test_id: &str) {
         self.pass = pass.into();
         self.run_id = format!("{test_id}-{pass}");
+        self.ts.set_run(&self.run_id, self.world.tick);
+        self.nn_live.sync_run(
+            &self.run_id,
+            &self.pass,
+            1,
+            &self.world.cfg.body,
+            self.world.cfg.noto.base,
+            self.world.cfg.noto.fingers,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         self.ml.reset();
         self.ml_task = None;
-        let mut rec = Recording::new(pass, &self.run_id, self.world.tick);
+        let rec = Recording::new(pass, &self.run_id, self.world.tick);
+        self.recording = Some(rec);
         if pass == "game" {
-            if let Ok(kf) = capture_keyframe(&self.world, &self.cam, self.test_cfg.record.quality, 0, self.stereo_baseline()) {
-                rec.keyframes.push(kf);
+            if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, self.test_cfg.record.quality, 0, self.stereo_baseline()) {
+                kf.nn_open = self.nn_live.open_span_ids();
+                let _ = self.push_recorded_keyframe(kf);
             }
         }
-        self.recording = Some(rec);
     }
 
     pub(crate) fn record_tick(&mut self) {
@@ -225,9 +370,8 @@ impl Runtime {
             }
             if let Ok(mut kf) = capture_keyframe(&self.world, &self.cam, cfg.quality, index, self.stereo_baseline()) {
                 kf.step = self.current_step_label();
-                if let Some(r) = self.recording.as_mut() {
-                    r.keyframes.push(kf);
-                }
+                kf.nn_open = self.nn_live.open_span_ids();
+                let _ = self.push_recorded_keyframe(kf);
             }
         }
     }
@@ -265,16 +409,25 @@ impl Runtime {
     }
 
     fn end_pass(&mut self, phase: TestPhase) -> Result<()> {
+        self.nn_live.close_all(
+            crate::nnlive::CloseWhy::RunEnd,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
         let mut rec = self.recording.take();
         if let Some(r) = rec.as_mut() {
             r.ended_tick = Some(self.world.tick);
         }
         let quest = self.quests.all().last().cloned();
+        let traj = self.traj_digests.clone();
         let Some(t) = self.test.as_mut() else { return Ok(()) };
+        t.test_rev = t.test_rev.saturating_add(1);
         match phase {
             TestPhase::Game => {
                 t.game = rec;
                 t.game_quest = quest;
+                if let Some(m) = t.manifest.as_mut() {
+                    m.traj_digests = traj;
+                }
                 t.phase = TestPhase::Perceive;
                 t.perceive_next = 0;
                 self.ml.reset();
@@ -324,14 +477,16 @@ impl Runtime {
         let Some(mut t) = self.test.take() else { return Ok(()) };
         let wanted = self.quest_labels(t.game_quest.as_ref());
         let n = t.game.as_ref().map_or(0, |g| g.keyframes.len());
-        let end = (t.perceive_next + self.test_cfg.perceive_per_step).min(n);
+        let cap = (t.perceive_next + self.test_cfg.perceive_per_step.max(1)).min(n);
+        let budget_ms = self.test_cfg.perceive_budget_ms;
+        let t_start = Instant::now();
         let prev_pass = std::mem::replace(&mut self.pass, "game".into());
         let run = t.game.as_ref().map(|g| g.run_id.clone()).unwrap_or_default();
         let prev_run = std::mem::replace(&mut self.run_id, run);
         let mut decoded: HashMap<usize, Rgb> = HashMap::new();
         if let Some(g) = t.game.as_ref() {
             let mut intrs: Vec<(usize, noto_vision::Intrinsics)> = Vec::new();
-            for i in t.perceive_next..end {
+            for i in t.perceive_next..cap {
                 if let Some(k) = g.keyframes.get(i) {
                     if let Ok(rgb) = k.rgb() {
                         decoded.insert(i, rgb);
@@ -347,7 +502,12 @@ impl Runtime {
                 t.notes.push(format!("일괄 추론 실패, 키프레임마다 다시 계산: {e}"));
             }
         }
-        for i in t.perceive_next..end {
+        let mut processed = 0usize;
+        let mut end = t.perceive_next;
+        for i in t.perceive_next..cap {
+            if processed >= 1 && budget_ms > 0 && t_start.elapsed().as_millis() as u64 >= budget_ms {
+                break;
+            }
             let Some(mut kf) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)).map(|k| std::mem::replace(k, placeholder(k))) else { continue };
             let res = match decoded.remove(&i) {
                 Some(rgb) => self.ml_analyse_with_rgb(&mut kf, &rgb, &wanted, None),
@@ -365,8 +525,9 @@ impl Runtime {
                     if let Ok(fix) = triangulate(rays, 6.0) {
                         let label = out.frame.target.as_ref().map(|x| x.label.clone()).unwrap_or_default();
                         if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(&fix, &s)) {
-                            let scope = Scope::new(Track::Depth, &self.ml.depth_mode(), &label);
-                            self.sds.record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
+                            let dmode = self.ml.depth_mode();
+                            let scope = Scope::new(Track::Depth, &dmode, &label);
+                            self.active_sds_mut().record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
                         }
                         if let Some(tv) = kf.ml.as_mut().and_then(|m| m.target.as_mut()) {
                             tv.tri_range_m = Some(fix.range_m);
@@ -383,9 +544,16 @@ impl Runtime {
                 t.notes.push(format!("키프레임 {i}: {e}"));
             }
             kf.truth.shed_pixels();
-            if let Some(slot) = t.game.as_mut().and_then(|g| g.keyframes.get_mut(i)) {
-                *slot = kf;
+            t.test_rev = t.test_rev.saturating_add(1);
+            kf.rev = t.test_rev;
+            if let Some(g) = t.game.as_mut() {
+                g.test_rev = t.test_rev;
+                if let Some(slot) = g.keyframes.get_mut(i) {
+                    *slot = kf;
+                }
             }
+            processed += 1;
+            end = i + 1;
         }
         t.perceive_next = end;
         self.pass = prev_pass;
@@ -436,9 +604,19 @@ impl Runtime {
 
     fn kf_brief(kf: &Keyframe) -> Value {
         let ml = kf.ml.as_ref();
+        let sds_cells: serde_json::Map<String, Value> = kf
+            .sds_detail
+            .iter()
+            .map(|(k, (v, n, sc))| {
+                let kind = if k == "balance" { "shortfall" } else { "z" };
+                (k.clone(), json!({"value": r3(*v), "n": n, "scope": sc, "kind": kind}))
+            })
+            .collect();
         json!({
-            "i": kf.index, "tick": kf.tick, "t": r3(kf.time_s as f32),
+            "i": kf.index, "rev": kf.rev, "tick": kf.tick, "t": r3(kf.time_s as f32),
             "step": kf.step, "action": kf.action,
+            "ctx": kf.ctx,
+            "nn_open": kf.nn_open,
             "pose": [r3(kf.pose.x), r3(kf.pose.z), r3(kf.pose.yaw.to_degrees())],
             "balance": kf.balance.as_ref().map(|b| json!({"source": b.source, "source_ko": b.source_ko, "margin": r3(b.margin), "worst": b.worst_joint, "worst_ratio": r3(b.worst_ratio), "head_tilt_deg": r3(b.head_tilt_deg)})),
             "ml": ml.map(|m| json!({
@@ -449,8 +627,16 @@ impl Runtime {
                 "target": m.target.as_ref().map(|t| json!({"track": t.track_id, "label": t.label, "bearing": r3(t.rel_bearing_deg), "depth_range": t.depth_range_m.map(r3), "tri_range": t.tri_range_m.map(r3), "true_range": t.range_true_m.map(r3), "scale": t.depth_scale.map(r3)})),
                 "stage_ms": m.stage_ms,
             })),
-            "decision": kf.decision.as_ref().map(|d| json!({"label": d.decision, "kind": d.kind, "residual": d.residual_deg.map(r3), "executed": d.executed, "ok": d.ok})),
+            "decision": kf.decision.as_ref().map(|d| json!({
+                "label": d.decision, "kind": d.kind, "note": d.note,
+                "residual": d.residual_deg.map(r3), "forecast_method": d.forecast_method,
+                "band": d.band.map(|b| b.map(r3)), "pos_model": d.pos_model,
+                "estimate": d.estimate.map(|e| [r3(e.0), r3(e.1), r3(e.2), r3(e.3)]),
+                "fix": d.fix.map(|f| [r3(f.0), r3(f.1), r3(f.2), r3(f.3), r3(f.4)]),
+                "executed": d.executed, "ok": d.ok,
+            })),
             "sds": kf.sds.iter().map(|(k, v)| (k.clone(), json!(r3(*v)))).collect::<serde_json::Map<String, Value>>(),
+            "sds_cells": sds_cells,
             "event": kf.event.as_ref().map(|e| json!({"act": e.act, "kind": e.kind, "label": e.label, "ok": e.ok, "parts": e.parts})),
             "focus": kf.focus.as_ref().map(|f| json!({"action": f.action, "action_ko": f.action_ko, "phase": f.phase, "parts": f.parts, "margin": r3(f.body.margin), "trunk_deg": r3(f.body.trunk_deg), "slip_ratio": f.hand.grip.map(|g| r3(g.slip_ratio)), "closure": r3(f.hand.closure)})),
         })
@@ -487,21 +673,277 @@ impl Runtime {
         let decide = if t.phase == TestPhase::Decide { live } else { t.decide.as_ref() };
         let game_quest = if t.phase == TestPhase::Game { self.quests.all().last().cloned() } else { t.game_quest.clone() };
         let ml_quest = if t.phase == TestPhase::Decide { self.quests.all().last().cloned() } else { t.ml_quest.clone() };
+        let manifest_out = t.manifest.as_ref().map(|m| {
+            let mut copy = m.clone();
+            if t.phase == TestPhase::Game && copy.traj_digests.is_empty() {
+                copy.traj_digests = self.traj_digests.clone();
+            }
+            copy
+        });
         Ok(json!({
             "active": true,
+            "test_rev": self.test_rev(),
             "live": t.live, "ml_needed": t.ml_needed,
             "id": t.id, "command": t.command, "seed": t.seed, "preset": t.body.id(), "body": t.body, "base": t.base,
             "phase": t.phase, "tick": self.world.tick,
             "perceive": {"done": t.perceive_next, "total": t.game.as_ref().map_or(0, |g| g.keyframes.len())},
-            "modes": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode(), "ttm": self.has_ttm()},
+            "modes": {
+                "depth": self.ml.depth_mode(),
+                "locate": self.ml.locate_mode(),
+                "track": self.ml.track_mode(),
+                "ttm": self.has_ttm(),
+                "ttm_fp8": self.gates.ttm().map(|x| x.fp8().to_string()),
+                "ttm_verified": self.gates.ttm().map_or(false, |x| x.fingerprint().verified),
+            },
             "game": rows(game), "decide": rows(decide),
             "game_quest": Self::quest_json(&game_quest), "ml_quest": Self::quest_json(&ml_quest),
             "notes": t.notes, "error": t.error,
+            "manifest": manifest_out,
             "keyframe_every_ticks": self.test_cfg.record.keyframe_every_ticks,
         }))
     }
 
-    fn rec_of(&self, pass: &str) -> Option<&Recording> {
+    /// Incremental timeline delta (`test_status_delta`, Phase 5 – Part 2 · D3).
+    pub fn api_test_status_delta(&self, args: &Value) -> Result<Value, String> {
+        let cur_rev = self.test_rev();
+        if args.get("if_rev").and_then(Value::as_u64) == Some(cur_rev) {
+            return Ok(json!({"unchanged": true, "rev": cur_rev}));
+        }
+        let Some(t) = &self.test else { return Ok(json!({"active": false, "test_rev": cur_rev})) };
+        let req_id = args.get("id").and_then(Value::as_str);
+        let since_rev = if req_id.is_some_and(|id| id != t.id) {
+            0
+        } else {
+            args.get("since_rev").and_then(Value::as_u64).unwrap_or(0)
+        };
+        let v_from_g = args.get("vision_from_game").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let v_from_d = args.get("vision_from_decide").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let b_from_g = args.get("belief_from_game").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let b_from_d = args.get("belief_from_decide").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let delta_rec = |r: Option<&Recording>, v_from: usize, b_from: usize| -> Value {
+            let Some(r) = r else {
+                return json!({
+                    "total_keyframes": 0, "video": 0, "start_tick": null, "end_tick": null,
+                    "appended": [], "updated": [], "vision_tail": [], "vision_total": 0, "belief_tail": [], "belief_total": 0
+                });
+            };
+            let mut appended = Vec::new();
+            let mut updated = Vec::new();
+            for kf in &r.keyframes {
+                if kf.created_rev > since_rev {
+                    appended.push(Self::kf_brief(kf));
+                } else if kf.rev > since_rev {
+                    updated.push(Self::kf_brief(kf));
+                }
+            }
+            let vision_tail: Vec<Value> = r
+                .vision
+                .iter()
+                .skip(v_from)
+                .map(|m| json!({"tick": m.tick, "kind": m.kind, "what": m.what, "s0": m.sigma_before_m.map(r3), "s1": m.sigma_after_m.map(r3), "innov": m.innovation_m.map(r3)}))
+                .collect();
+            let belief_tail: Vec<Value> = r.belief_err.iter().skip(b_from).map(|(tk, e)| json!([tk, r3(*e)])).collect();
+            json!({
+                "run_id": r.run_id, "start_tick": r.started_tick, "end_tick": r.ended_tick,
+                "video": r.video.len(), "dropped": r.dropped_keyframes,
+                "total_keyframes": r.keyframes.len(),
+                "memory": memory_json(r),
+                "appended": appended,
+                "updated": updated,
+                "vision_tail": vision_tail,
+                "vision_total": r.vision.len(),
+                "belief_tail": belief_tail,
+                "belief_total": r.belief_err.len(),
+            })
+        };
+        let live = self.recording.as_ref();
+        let game = if t.phase == TestPhase::Game { live } else { t.game.as_ref() };
+        let decide = if t.phase == TestPhase::Decide { live } else { t.decide.as_ref() };
+        let game_quest = if t.phase == TestPhase::Game { self.quests.all().last().cloned() } else { t.game_quest.clone() };
+        let ml_quest = if t.phase == TestPhase::Decide { self.quests.all().last().cloned() } else { t.ml_quest.clone() };
+        Ok(json!({
+            "active": true,
+            "id": t.id,
+            "live": t.live,
+            "ml_needed": t.ml_needed,
+            "command": t.command,
+            "test_rev": cur_rev,
+            "since_rev": since_rev,
+            "phase": t.phase,
+            "tick": self.world.tick,
+            "perceive": {"done": t.perceive_next, "total": t.game.as_ref().map_or(0, |g| g.keyframes.len())},
+            "game": delta_rec(game, v_from_g, b_from_g),
+            "decide": delta_rec(decide, v_from_d, b_from_d),
+            "game_quest": Self::quest_json(&game_quest),
+            "ml_quest": Self::quest_json(&ml_quest),
+            "notes": t.notes,
+            "error": t.error,
+        }))
+    }
+
+    /// Synchronized multi-panel context at a cursor `tick` (`test_context`, Phase 5 – Part 2 · D4).
+    pub fn api_test_context(&self, args: &Value) -> Result<Value, String> {
+        let pass = args.get("pass").and_then(Value::as_str).unwrap_or("game");
+        let tick = args.get("tick").and_then(Value::as_u64).unwrap_or(self.world.tick);
+        let rec = self.rec_of(pass);
+        let (kf_json, video_idx, video_tick, video_total, center_seq) = match rec {
+            Some(r) => {
+                let kf = r.keyframes.iter().min_by_key(|k| k.tick.abs_diff(tick));
+                let vf = r.video.iter().enumerate().min_by_key(|(_, v)| v.tick.abs_diff(tick));
+                let seq = kf.map(|k| k.ctx.log_seq).filter(|&s| s > 0);
+                let kf_v = kf.map(|k| {
+                    let mut b = Self::kf_brief(k);
+                    b["delta_ticks"] = json!(k.tick.abs_diff(tick));
+                    b
+                });
+                (kf_v, vf.map(|(i, _)| i), vf.map(|(_, v)| v.tick), r.video.len(), seq)
+            }
+            None => (None, None, None, 0, None),
+        };
+        let (lines, _) = self.audit.tail(0, 4000, None);
+        let nearest_seq = center_seq.or_else(|| {
+            lines
+                .iter()
+                .filter_map(|l| l.tick.map(|tk| (tk.abs_diff(tick), l.seq)))
+                .min_by_key(|(d, _)| *d)
+                .map(|(_, s)| s)
+        });
+        let log_window = nearest_seq.map(|s| json!({
+            "center_seq": s,
+            "from_seq": s.saturating_sub(8),
+            "to_seq": s.saturating_add(8),
+        }));
+        let phase_spans: Vec<Value> = self
+            .nn_live
+            .spans_for_worker(1)
+            .into_iter()
+            .filter(|sp| sp.start.tick <= tick && sp.end.map_or(true, |e| e.tick >= tick))
+            .map(|sp| json!({
+                "id": sp.id, "scenario": sp.scenario, "phase": sp.phase,
+                "start_tick": sp.start.tick, "end_tick": sp.end.map(|e| e.tick),
+                "close": sp.close,
+            }))
+            .collect();
+        let mut gate_marks: Vec<Value> = Vec::new();
+        for lm in self.gates.landmarks() {
+            for gm in &lm.trace {
+                if gm.tick.abs_diff(tick) <= 5 {
+                    gate_marks.push(json!({
+                        "landmark": lm.id,
+                        "label": lm.label,
+                        "tick": gm.tick,
+                        "observed": gm.observed,
+                        "expected": gm.expected,
+                        "lo": gm.lo,
+                        "hi": gm.hi,
+                        "z": gm.z,
+                        "outcome": gm.outcome,
+                        "rescue": gm.rescue,
+                        "method": gm.method,
+                        "sds_sd": gm.sds_sd,
+                    }));
+                }
+            }
+        }
+        gate_marks.sort_by_key(|m| m["tick"].as_u64().unwrap_or(0));
+        Ok(json!({
+            "pass": pass,
+            "tick": tick,
+            "keyframe": kf_json,
+            "video_index": video_idx,
+            "video_tick": video_tick,
+            "video_total": video_total,
+            "log_window": log_window,
+            "phase_spans": phase_spans,
+            "sds_watch": self.sds_watch.at_tick(tick),
+            "gate_marks": gate_marks,
+        }))
+    }
+
+    /// Replay a [`ReplayManifest`] in Frozen mode against its saved content-addressed snapshot (if available)
+    /// and compare 50-tick trajectory digests (Phase 2 – Part 3 · D6).
+    pub fn replay_manifest(&mut self, manifest: &ReplayManifest, max_ticks: u64) -> Result<Value> {
+        let prev_mode = self.feedback.mode().clone();
+        let prev_run = self.run_id.clone();
+        let prev_pass = self.pass.clone();
+        let mut frozen_mode = manifest.sds_mode.clone();
+        frozen_mode.default = crate::feedback::Mode::Frozen;
+        let loaded_snap = self.data_dir().and_then(|d| {
+            noto_sds::SdsStore::load_snapshot(&d.join("sds").join("snap"), &manifest.snapshot_digest).ok()
+        });
+        match loaded_snap {
+            Some(snap) => self.feedback.set_mode_with_snapshot(frozen_mode, snap),
+            None => self.feedback.set_mode(frozen_mode, &self.sds),
+        }
+        let mut hand = self.cfg.noto;
+        hand.base = manifest.base;
+        self.cfg.body = manifest.body;
+        self.reset_with(Some(manifest.seed), None, Some(hand))?;
+        self.test_seq += 1;
+        self.run_id = format!("{}-replay-{}", self.session_id, self.test_seq);
+        self.pass = "game".into();
+        self.nn_live.sync_run(
+            &self.run_id,
+            &self.pass,
+            1,
+            &self.world.cfg.body,
+            self.world.cfg.noto.base,
+            self.world.cfg.noto.fingers,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
+        self.ml.reset();
+        self.clear_traj_digests();
+        let sub = self.submit(&manifest.command);
+        if !sub.ok {
+            self.run_id = prev_run;
+            self.pass = prev_pass;
+            self.set_sds_mode(prev_mode);
+            return Err(anyhow!("{}", sub.error.unwrap_or_else(|| "재현 명령 제출 실패".into())));
+        }
+        let ticks = self.run_until_idle(max_ticks.max(1));
+        self.nn_live.close_all(
+            crate::nnlive::CloseWhy::RunEnd,
+            crate::nnlive::Clock { seq: self.clock_seq, tick: self.world.tick, time_s: self.world.time_s },
+        );
+        let replay_digests = self.traj_digests.clone();
+        let fb_at_end = self.feedback.snapshot_values();
+        self.run_id = prev_run;
+        self.pass = prev_pass;
+        self.set_sds_mode(prev_mode);
+
+        let mut first_mismatch: Option<u64> = None;
+        let orig = &manifest.traj_digests;
+        for (i, (t_a, d_a)) in orig.iter().enumerate() {
+            match replay_digests.get(i) {
+                Some((t_b, d_b)) if t_a == t_b && d_a == d_b => {}
+                _ => {
+                    first_mismatch = Some(*t_a);
+                    break;
+                }
+            }
+        }
+        if first_mismatch.is_none() && replay_digests.len() != orig.len() {
+            first_mismatch = replay_digests.get(orig.len()).map(|(t, _)| *t).or_else(|| orig.last().map(|(t, _)| *t));
+        }
+        let matched = first_mismatch.is_none();
+        self.log(
+            "replay",
+            if matched { Level::Info } else { Level::Warn },
+            format!("재현 비교: {} ({ticks}틱, 50틱 지문 {}건)", if matched { "일치" } else { "불일치" }, replay_digests.len()),
+            Some(json!({"matched": matched, "first_mismatch_tick": first_mismatch, "ticks": ticks})),
+        );
+        Ok(json!({
+            "matched": matched,
+            "first_mismatch_tick": first_mismatch,
+            "ticks": ticks,
+            "original_digests": orig,
+            "replay_digests": replay_digests,
+            "feedback_at_end": fb_at_end,
+            "manifest": manifest,
+        }))
+    }
+
+    pub(crate) fn rec_of(&self, pass: &str) -> Option<&Recording> {
         let t = self.test.as_ref()?;
         match (pass, t.phase) {
             ("game", TestPhase::Game) | ("ml", TestPhase::Decide) => self.recording.as_ref(),
@@ -541,13 +983,22 @@ impl Runtime {
     pub fn api_test_stats(&self) -> Result<Value, String> {
         let stats = self.db.stats();
         let mut nn: Vec<Value> = Vec::new();
+        let def_axes = noto_core::nn::known_axes_from_defs(&self.world.body);
         for s in Source::ALL.into_iter().filter(|s| *s != Source::Quiet) {
             for g in Segment::ALL {
                 let scope = Scope::new(Track::Balance, &format!("{}>{}", s.id(), g.id()), "");
-                for axis in ["tilt_deg", "lean_deg", "restore_frac", "shift_frac", "peak_ratio", "grip_effort", "com_shift_frac", "ankle_rise", "margin", "cop_shift_frac"] {
-                    let rf = reference(s, g, axis, &noto_core::balance::RefCtx { load_ratio: 0.0, load_dist_m: 0.0, slope_deg: 10.0 });
-                    let rep = self.sds.exact_reference(&scope, axis);
-                    let base = self.sds.exact_baseline(&scope, axis);
+                let mut axes: std::collections::BTreeSet<String> = def_axes.iter().cloned().collect();
+                if let Some(st) = self.sds.merged_scope_by_key(Track::Balance.ledger(), &scope.key_primary()) {
+                    for k in st.baseline.keys() {
+                        if !k.contains(':') {
+                            axes.insert(k.clone());
+                        }
+                    }
+                }
+                for axis in axes {
+                    let rf = reference(s, g, &axis, &noto_core::balance::RefCtx { load_ratio: 0.0, load_dist_m: 0.0, slope_deg: 10.0, single_support: false });
+                    let rep = self.sds.exact_reference(&scope, &axis);
+                    let base = self.sds.exact_baseline(&scope, &axis);
                     if rep.is_none() && base.is_none() {
                         continue;
                     }
@@ -568,7 +1019,7 @@ impl Runtime {
             gains.insert(s.id().into(), *g as f64);
         }
         let runs: Vec<Value> = self.db.runs().iter().rev().take(20).map(|r| json!({"run_id": r.run_id, "pass": r.pass, "kind": r.kind, "target": r.target, "preset": r.preset, "ok": r.ok, "failure": r.failure, "time_s": r.time_s, "steps": r.steps})).collect();
-        Ok(json!({"stats": stats, "nn": nn, "ff_gains": gains, "runs": runs, "db_dir": self.db.dir().map(|d| d.display().to_string())}))
+        Ok(json!({"stats": stats, "nn": nn, "axes": def_axes, "ff_gains": gains, "runs": runs, "db_dir": self.db.dir().map(|d| d.display().to_string())}))
     }
 }
 
@@ -583,6 +1034,8 @@ fn memory_json(r: &Recording) -> Value {
 fn placeholder(k: &Keyframe) -> Keyframe {
     Keyframe {
         index: k.index,
+        created_rev: k.created_rev,
+        rev: k.rev,
         tick: k.tick,
         time_s: k.time_s,
         pose: k.pose,
@@ -597,8 +1050,11 @@ fn placeholder(k: &Keyframe) -> Keyframe {
         ml_webp: None,
         decision: None,
         sds: BTreeMap::new(),
+        sds_detail: BTreeMap::new(),
+        ctx: k.ctx.clone(),
         event: k.event.clone(),
         focus: None,
         focus_webp: Vec::new(),
+        nn_open: k.nn_open.clone(),
     }
 }

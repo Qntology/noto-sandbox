@@ -1,11 +1,11 @@
 use noto_core::balance::Body;
+use noto_core::bench::holdout_seed;
 use noto_core::effects::{evaluate, holdout, library, Effect, FxResult, Rule};
 use noto_core::parts::BodyPlan;
 use noto_core::{BaseKind, FingerCount};
 
 const PLANS: [&str; 4] = ["budget", "mid", "pro", "pro_arms"];
 const BASES: [BaseKind; 3] = [BaseKind::HumanFoot, BaseKind::Wheel, BaseKind::Track];
-const HOLDOUT_SEED: u64 = 20261024;
 
 fn num(v: f32) -> String {
     if v != 0.0 && v.abs() < 0.01 {
@@ -75,13 +75,14 @@ fn environment_effects_against_the_measurements() {
 
 #[test]
 fn held_out_draws_are_counted_not_tuned() {
+    let seed = holdout_seed("FX");
     for plan in ["mid", "pro"] {
         for base in BASES {
             let body = Body::new(&BodyPlan::named(plan).unwrap(), base, FingerCount::Five);
-            let results: Vec<FxResult> = holdout(HOLDOUT_SEED, 8).iter().map(|s| evaluate(&body, s)).collect();
+            let results: Vec<FxResult> = holdout(seed, 8).iter().map(|s| evaluate(&body, s)).collect();
             let run: Vec<&FxResult> = results.iter().filter(|r| r.skipped.is_none()).collect();
             let passed = run.iter().filter(|r| r.passed).count();
-            println!("[FX-HELD] {plan:<8} {base:?} 시드 {HOLDOUT_SEED}: 통과 {passed} / {} (건너뜀 {})", run.len(), results.len() - run.len());
+            println!("[FX-HELD] {plan:<8} {base:?} 시드 {seed}: 통과 {passed} / {} (건너뜀 {})", run.len(), results.len() - run.len());
             for r in &results {
                 println!(
                     "[FX-HELD]   {} {} {}{}",
