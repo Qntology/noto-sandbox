@@ -170,7 +170,12 @@ fn run_accel_probe(device: &Device, op: AccelOp) -> Result<bool> {
                 } else {
                     qm_dev.forward_exact(&x_dev)?
                 };
-                if !same_tol(got, ref_out, 5e-3)? {
+                let tol = match device {
+                    Device::Cuda(_) => 1e-4,
+                    Device::Vulkan(_) => 5e-3,
+                    _ => 1e-3,
+                };
+                if !same_tol(got, ref_out, tol)? {
                     return Ok(false);
                 }
             }
@@ -193,7 +198,50 @@ fn run_accel_probe(device: &Device, op: AccelOp) -> Result<bool> {
             let v_bhsd = v.transpose(1, 2)?.contiguous()?;
             let scores = q_bhsd.matmul(&k_bhsd.transpose(2, 3)?)?.affine(scale as f64, 0.0)?;
             let ref_out = softmax_last_dim(&scores)?.matmul(&v_bhsd)?.transpose(1, 2)?.contiguous()?;
-            same(got, ref_out)
+            if !same(got, ref_out)? {
+                return Ok(false);
+            }
+            if matches!(device, Device::Cuda(_) | Device::Rocm(_)) {
+                // Verify MapHead cross-attention (nq=1, nkv=64, d=64) via flash_attn_bhsd.
+                let q1 = Tensor::from_vec(det(b * h * 1 * d, 31), (b, h, 1, d), &Device::Cpu)?;
+                let k64 = Tensor::from_vec(det(b * h * 64 * d, 37), (b, h, 64, d), &Device::Cpu)?;
+                let v64 = Tensor::from_vec(det(b * h * 64 * d, 41), (b, h, 64, d), &Device::Cpu)?;
+                let got_cross = candle_nn::flash_attn::flash_attn_bhsd(
+                    &q1.to_device(device)?,
+                    &k64.to_device(device)?,
+                    &v64.to_device(device)?,
+                    &cfg_strict,
+                )?;
+                let ref_cross = softmax_last_dim(&q1.matmul(&k64.transpose(2, 3)?)?.affine(scale as f64, 0.0)?)?
+                    .matmul(&v64)?;
+                if !same(got_cross, ref_cross)? {
+                    return Ok(false);
+                }
+
+                // Verify zero-copy 2-block paged attention (used by VisionTower::extend_sparse / open_cells).
+                let qb = Tensor::from_vec(det(b * h * 8 * d, 43), (b, h, 8, d), &Device::Cpu)?;
+                let kb0 = Tensor::from_vec(det(b * h * 12 * d, 47), (b, h, 12, d), &Device::Cpu)?;
+                let vb0 = Tensor::from_vec(det(b * h * 12 * d, 53), (b, h, 12, d), &Device::Cpu)?;
+                let kb1 = Tensor::from_vec(det(b * h * 8 * d, 59), (b, h, 8, d), &Device::Cpu)?;
+                let vb1 = Tensor::from_vec(det(b * h * 8 * d, 61), (b, h, 8, d), &Device::Cpu)?;
+                let kb0_d = kb0.to_device(device)?;
+                let vb0_d = vb0.to_device(device)?;
+                let kb1_d = kb1.to_device(device)?;
+                let vb1_d = vb1.to_device(device)?;
+                let blocks = [
+                    candle_nn::flash_attn::KvBlockRef { k: &kb0_d, v: &vb0_d, rows: 12 },
+                    candle_nn::flash_attn::KvBlockRef { k: &kb1_d, v: &vb1_d, rows: 8 },
+                ];
+                let got_blk = candle_nn::flash_attn::flash_attn_blocks(&qb.to_device(device)?, &blocks, &cfg_strict)?;
+                let k_cat = Tensor::cat(&[&kb0, &kb1], 2)?;
+                let v_cat = Tensor::cat(&[&vb0, &vb1], 2)?;
+                let ref_blk = softmax_last_dim(&qb.matmul(&k_cat.transpose(2, 3)?)?.affine(scale as f64, 0.0)?)?
+                    .matmul(&v_cat)?;
+                if !same(got_blk, ref_blk)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
         AccelOp::Conv2d => {
             let x = Tensor::from_vec(det(1 * 8 * 8 * 8, 23), (1, 8, 8, 8), &Device::Cpu)?;
@@ -510,7 +558,10 @@ pub fn preferred() -> Selection {
 pub fn device_label(device: &Device) -> String {
     let ord = device_ordinal(device);
     match device {
-        Device::Cuda(_) => format!("CUDA:{ord}"),
+        Device::Cuda(_) => match device.cuda_compute_capability() {
+            Some((maj, min)) => format!("CUDA:{ord} (sm_{maj}{min})"),
+            None => format!("CUDA:{ord}"),
+        },
         Device::Rocm(r) => match r.name() {
             Ok(n) if !n.is_empty() => format!("ROCm:{ord} ({n})"),
             _ => format!("ROCm:{ord}"),

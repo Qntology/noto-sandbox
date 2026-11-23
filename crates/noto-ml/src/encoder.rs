@@ -236,11 +236,27 @@ impl Attention {
                     t.reshape((b, n, self.heads, self.head_dim))?.transpose(1, 2)?.contiguous()
                 };
                 let (q, k, v) = (split(&q_lin)?, split(&k_lin)?, split(&v_lin)?);
-                let (k_all, v_all) = match context {
-                    Some(c) => (Tensor::cat(&[&c.k, &k], 2)?, Tensor::cat(&[&c.v, &v], 2)?),
-                    None => (k.clone(), v.clone()),
+                let fa_res = match context {
+                    Some(c) if matches!(x.device(), candle_core::Device::Cuda(_) | candle_core::Device::Rocm(_)) => {
+                        let blocks = [
+                            candle_nn::flash_attn::KvBlockRef { k: &c.k, v: &c.v, rows: c.k.dim(2)? },
+                            candle_nn::flash_attn::KvBlockRef { k: &k, v: &v, rows: n },
+                        ];
+                        candle_nn::flash_attn::flash_attn_blocks(&q, &blocks, &fa_cfg)
+                            .or_else(|_| {
+                                let k_all = Tensor::cat(&[&c.k, &k], 2)?;
+                                let v_all = Tensor::cat(&[&c.v, &v], 2)?;
+                                candle_nn::flash_attn::flash_attn_bhsd(&q, &k_all, &v_all, &fa_cfg)
+                            })
+                    }
+                    Some(c) => {
+                        let k_all = Tensor::cat(&[&c.k, &k], 2)?;
+                        let v_all = Tensor::cat(&[&c.v, &v], 2)?;
+                        candle_nn::flash_attn::flash_attn_bhsd(&q, &k_all, &v_all, &fa_cfg)
+                    }
+                    None => candle_nn::flash_attn::flash_attn_bhsd(&q, &k, &v, &fa_cfg),
                 };
-                if let Ok(ctx) = candle_nn::flash_attn::flash_attn_bhsd(&q, &k_all, &v_all, &fa_cfg) {
+                if let Ok(ctx) = fa_res {
                     let ctx = ctx.transpose(1, 2)?.contiguous()?.reshape((b, n, d))?;
                     return Ok((self.out.forward(&ctx)?, if need_kv { Some(LayerKv { k, v }) } else { None }));
                 }
