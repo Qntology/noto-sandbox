@@ -41,7 +41,9 @@ impl InProj {
     fn new(w: &QWeights, d: usize) -> Result<InProj> {
         if w.qtype("in_proj_weight", d) == crate::quant::QType::F32 && !w.is_cpu_packed() {
             w.record_dense(3 * d, d);
-            let w_all = w.vb().get((3 * d, d), "in_proj_weight")?;
+            let w_all = w
+                .vb()
+                .get_with_hints((3 * d, d), "in_proj_weight", candle_nn::init::DEFAULT_KAIMING_NORMAL)?;
             let b_all = w.vb().get(3 * d, "in_proj_bias")?;
             if w_all.is_variable() || b_all.is_variable() {
                 return Ok(InProj::Var { w: w_all, b: b_all, d });
@@ -346,7 +348,11 @@ impl VisionTower {
             return Ok(t.clone());
         }
         let t = self.resample_positions(grid_h, grid_w)?;
-        self.pos_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, t.clone());
+        let mut cache = self.pos_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, t.clone());
         Ok(t)
     }
 
@@ -522,6 +528,11 @@ impl VisionTower {
     /// The head's pooled embedding of some tokens (1, n, d).
     pub fn head_pooled(&self, tokens: &Tensor) -> Result<Tensor> {
         self.head.forward(tokens)
+    }
+
+    /// Single-pass `(dense, attention, pooled)` over `tokens (b, n, d)`.
+    pub fn head_dense_all(&self, tokens: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        self.head.dense_all(tokens)
     }
 }
 

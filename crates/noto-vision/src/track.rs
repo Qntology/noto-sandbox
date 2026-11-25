@@ -346,6 +346,9 @@ impl MaskTracker for RegionTracker {
     }
 
     fn update(&mut self, rgb: &Rgb, depth: Option<&DepthMap>, prompts: &[PointPrompt]) -> Result<Vec<TrackedMask>> {
+        if self.tracks.is_empty() && prompts.is_empty() {
+            return Ok(Vec::new());
+        }
         let k = self.cfg.downscale.max(1);
         let work = Work::new(rgb, depth, k);
         let kf = k as f32;

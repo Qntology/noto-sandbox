@@ -379,7 +379,7 @@ impl Block {
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let x = (x + self.attn.forward(&self.norm1.forward(x)?)?.broadcast_mul(&self.ls1)?)?;
-        let mlp = self.fc2.forward(&self.fc1.forward(&self.norm2.forward(&x)?)?.gelu_erf()?)?;
+        let mlp = self.fc2.forward(&self.fc1.forward_gelu(&self.norm2.forward(&x)?, true)?)?;
         &x + mlp.broadcast_mul(&self.ls2)?
     }
 }
@@ -454,7 +454,11 @@ impl Encoder {
         let by_rows = wy.matmul(&table)?.reshape((rows, side, d))?;
         let grid = wx.broadcast_matmul(&by_rows)?.reshape((1, rows * cols, d))?;
         let res = Tensor::cat(&[&self.pos_embed.narrow(1, 0, 1)?, &grid], 1)?;
-        self.pos_cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, res.clone());
+        let mut cache = self.pos_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, res.clone());
         Ok(res)
     }
 
@@ -536,8 +540,16 @@ impl PixelShuffleUp {
     }
 }
 
+enum Readout {
+    /// Split `[d, 2d]` dense/CPU-packed readout into `W_patch [d, d]` + `W_cls [d, d]` so
+    /// `W_cls @ cls` runs on 1 CLS token instead of N patches and eliminates `[b, n, 2d]` cat.
+    Split { patch: QLinear, cls: QLinear },
+    /// Quantized readout keeps the single `[d, 2d]` weight to preserve `.qcache` bit-identity.
+    Joint(QLinear),
+}
+
 struct ReassembleLevel {
-    readout: QLinear,
+    readout: Readout,
     /// 1x1 `out_projection` stored as Linear(d -> ch) and applied directly on (b, n, d) before NCHW reshape.
     out_projection: Linear,
     out_channels: usize,
@@ -569,8 +581,29 @@ impl ReassembleLevel {
         let out_vb = vb.pp("out_projections").pp(level);
         let out_w = out_vb.get((ch, d, 1, 1), "weight")?.reshape((ch, d))?;
         let out_b = out_vb.get(ch, "bias")?;
+        let readout_w = w.pp("readout_projects").pp(level);
+        let readout = if w.plan().is_f32() {
+            let rvb = readout_w.vb();
+            let weight = rvb.get((d, 2 * d), "weight")?;
+            let bias = rvb.get(d, "bias")?;
+            let wp = weight.narrow(1, 0, d)?.contiguous()?;
+            let wc = weight.narrow(1, d, d)?.contiguous()?;
+            if w.is_cpu_packed() {
+                Readout::Split {
+                    patch: QLinear::from_dense_packed(&wp, Some(&bias))?,
+                    cls: QLinear::from_dense_packed(&wc, None)?,
+                }
+            } else {
+                Readout::Split {
+                    patch: QLinear::Dense(Linear::new(wp, Some(bias))),
+                    cls: QLinear::Dense(Linear::new(wc, None)),
+                }
+            }
+        } else {
+            Readout::Joint(readout_w.linear(2 * d, d).map_err(to_candle)?)
+        };
         Ok(ReassembleLevel {
-            readout: w.pp("readout_projects").pp(level).linear(2 * d, d).map_err(to_candle)?,
+            readout,
             out_projection: Linear::new(out_w, Some(out_b)),
             out_channels: ch,
             resize,
@@ -580,8 +613,17 @@ impl ReassembleLevel {
 
     fn forward(&self, tap: &Tap) -> candle_core::Result<Tensor> {
         let (b, n, d) = tap.patches.dims3()?;
-        let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
-        let x = self.readout.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?;
+        let x = match &self.readout {
+            Readout::Split { patch, cls } => {
+                let p_out = patch.forward(&tap.patches)?;
+                let c_out = cls.forward(&tap.cls)?.unsqueeze(1)?;
+                p_out.broadcast_add(&c_out)?
+            }
+            Readout::Joint(lin) => {
+                let readout = tap.cls.unsqueeze(1)?.broadcast_as((b, n, d))?;
+                lin.forward(&Tensor::cat(&[&tap.patches, &readout], 2)?.contiguous()?)?
+            }
+        };
         let x = if self.gelu_tanh { x.gelu()? } else { x.gelu_erf()? };
         let x = self.out_projection.forward(&x)?;
         let x = x.transpose(1, 2)?.contiguous()?.reshape((b, self.out_channels, tap.rows, tap.cols))?;
@@ -721,38 +763,55 @@ impl DepthHead {
 
 struct NormalsHead {
     dec: Decoder,
-    out: Linear,
+    /// Direct NCHW 1×1 projection `[3, dpt_channels]` + `[1, 3, 1, 1]` bias (eliminates 2 4D transposes/frame).
+    out_w: Tensor,
+    out_b: Tensor,
 }
 
 impl NormalsHead {
     fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
-        Ok(NormalsHead { dec: Decoder::new(cfg, w)?, out: linear(cfg.dpt_channels, 3, w.vb().pp("normals_head"))? })
+        let vb = w.vb().pp("normals_head");
+        let out_w = vb.get((3, cfg.dpt_channels), "weight")?;
+        let out_b = vb.get(3, "bias")?.reshape((1, 3, 1, 1))?;
+        Ok(NormalsHead { dec: Decoder::new(cfg, w)?, out_w, out_b })
     }
 
     fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
-        let x = self.out.forward(&self.dec.forward(taps)?.permute((0, 2, 3, 1))?.contiguous()?)?;
-        unit_last(&x)?.permute((0, 3, 1, 2))?.contiguous()
+        let feat = self.dec.forward(taps)?;
+        let (b, ch, h, w) = feat.dims4()?;
+        let x = self
+            .out_w
+            .broadcast_matmul(&feat.reshape((b, ch, h * w))?)?
+            .reshape((b, 3, h, w))?
+            .broadcast_add(&self.out_b)?;
+        unit_channels(&x)
     }
 }
 
 struct SegHead {
     dec: Decoder,
-    out: Linear,
+    /// Direct NCHW 1×1 projection `[seg_classes, dpt_channels]` + `[1, seg_classes, 1, 1]` bias.
+    out_w: Tensor,
+    out_b: Tensor,
+    seg_classes: usize,
 }
 
 impl SegHead {
     fn new(cfg: &TipsConfig, w: &QWeights) -> candle_core::Result<Self> {
-        Ok(SegHead { dec: Decoder::new(cfg, w)?, out: linear(cfg.dpt_channels, cfg.seg_classes, w.vb().pp("segmentation_head"))? })
+        let vb = w.vb().pp("segmentation_head");
+        let out_w = vb.get((cfg.seg_classes, cfg.dpt_channels), "weight")?;
+        let out_b = vb.get(cfg.seg_classes, "bias")?.reshape((1, cfg.seg_classes, 1, 1))?;
+        Ok(SegHead { dec: Decoder::new(cfg, w)?, out_w, out_b, seg_classes: cfg.seg_classes })
     }
 
     fn forward(&self, taps: &[Tap]) -> candle_core::Result<Tensor> {
-        self.out.forward(&self.dec.forward(taps)?.permute((0, 2, 3, 1))?.contiguous()?)?.permute((0, 3, 1, 2))?.contiguous()
+        let feat = self.dec.forward(taps)?;
+        let (b, ch, h, w) = feat.dims4()?;
+        self.out_w
+            .broadcast_matmul(&feat.reshape((b, ch, h * w))?)?
+            .reshape((b, self.seg_classes, h, w))?
+            .broadcast_add(&self.out_b)
     }
-}
-
-fn unit_last(x: &Tensor) -> candle_core::Result<Tensor> {
-    let n = (x.sqr()?.sum_keepdim(D::Minus1)?.sqrt()? + 1e-12)?;
-    x.broadcast_div(&n)
 }
 
 fn unit_channels(x: &Tensor) -> candle_core::Result<Tensor> {
@@ -814,6 +873,7 @@ pub struct TipsDepth {
     normals_head: Option<NormalsHead>,
     seg_head: Option<SegHead>,
     device: Device,
+    policy: noto_ml::BatchPolicy,
     pub input_grid: InputGrid,
     /// The pyramid's grid, which overrides `input_grid` while a pipeline runs the 1 : 2 : 4 alignment.
     pub pyramid_grid: Option<InputGrid>,
@@ -900,6 +960,7 @@ impl TipsDepth {
             normals_head,
             seg_head,
             device: device.clone(),
+            policy: noto_ml::BatchPolicy::for_device(device),
             input_grid: InputGrid::default(),
             pyramid_grid: None,
             max_rel_spread: None,
@@ -978,7 +1039,7 @@ impl TipsDepth {
             groups.entry((f.width, f.height)).or_default().push(i);
         }
         let want = want.and(self.heads());
-        let policy = noto_ml::BatchPolicy::for_device(&self.device);
+        let policy = self.policy;
         let p = self.cfg.patch_size;
         let views = if self.flip_tta { 2 } else { 1 };
         let mut out: Vec<Option<RunOut>> = (0..frames.len()).map(|_| None).collect();
@@ -997,7 +1058,14 @@ impl TipsDepth {
                 let depth = merge_views(depth, b, views, None)?.upsample_bilinear2d(h as usize, w as usize, false)?;
                 let sd = sd.map(|t| merge_views(t, b, views, None)?.upsample_bilinear2d(h as usize, w as usize, false)).transpose()?;
                 let normals = match (&self.normals_head, want.normals) {
-                    (Some(head), true) => Some(unit_channels(&merge_views(head.forward(&taps)?, b, views, Some(NORMAL_RIGHT))?)?),
+                    (Some(head), true) => {
+                        let n = head.forward(&taps)?;
+                        if views > 1 {
+                            Some(unit_channels(&merge_views(n, b, views, Some(NORMAL_RIGHT))?)?)
+                        } else {
+                            Some(n)
+                        }
+                    }
                     _ => None,
                 };
                 let seg = match (&self.seg_head, want.segmentation) {
@@ -1093,7 +1161,7 @@ fn u8_to_unit_lut() -> &'static [f32; 256] {
     })
 }
 
-fn rgb_to_chw_f32(rgb: &Rgb, width: u32, height: u32) -> anyhow::Result<Vec<f32>> {
+fn rgb_to_chw_f32_into(rgb: &Rgb, width: u32, height: u32, dst: &mut [f32]) -> anyhow::Result<()> {
     let resized;
     let data: &[u8] = if (rgb.width, rgb.height) == (width, height) {
         &rgb.data
@@ -1105,31 +1173,26 @@ fn rgb_to_chw_f32(rgb: &Rgb, width: u32, height: u32) -> anyhow::Result<Vec<f32>
     };
     let lut = u8_to_unit_lut();
     let plane = (width * height) as usize;
-    let mut chw = vec![0f32; 3 * plane];
-    let (r_plane, rest) = chw.split_at_mut(plane);
+    let (r_plane, rest) = dst.split_at_mut(plane);
     let (g_plane, b_plane) = rest.split_at_mut(plane);
     for (i, px) in data.chunks_exact(3).enumerate() {
         r_plane[i] = lut[px[0] as usize];
         g_plane[i] = lut[px[1] as usize];
         b_plane[i] = lut[px[2] as usize];
     }
-    Ok(chw)
+    Ok(())
 }
 
 fn model_input_batch(chunk: &[usize], frames: &[&Rgb], width: u32, height: u32, device: &Device) -> anyhow::Result<Tensor> {
     let b = chunk.len();
-    if b == 1 {
-        let chw = rgb_to_chw_f32(frames[chunk[0]], width, height)?;
-        return Ok(Tensor::from_vec(chw, (1, 3, height as usize, width as usize), device)?);
-    }
-    let per_frame: Vec<Vec<f32>> = chunk
-        .par_iter()
-        .map(|&i| rgb_to_chw_f32(frames[i], width, height))
-        .collect::<anyhow::Result<Vec<_>>>()?;
     let frame_len = 3 * (width * height) as usize;
-    let mut flat = Vec::with_capacity(b * frame_len);
-    for f in per_frame {
-        flat.extend_from_slice(&f);
+    let mut flat = vec![0f32; b * frame_len];
+    if b == 1 {
+        rgb_to_chw_f32_into(frames[chunk[0]], width, height, &mut flat)?;
+    } else {
+        flat.par_chunks_mut(frame_len)
+            .zip(chunk.par_iter())
+            .try_for_each(|(dst, &i)| rgb_to_chw_f32_into(frames[i], width, height, dst))?;
     }
     Ok(Tensor::from_vec(flat, (b, 3, height as usize, width as usize), device)?)
 }

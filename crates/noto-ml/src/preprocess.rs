@@ -95,7 +95,7 @@ pub fn preprocess_grid(image: &DynamicImage, cfg: &Siglip2Config, grid_h: usize,
     let p = cfg.patch_size;
     let (grid_h, grid_w) = (grid_h.max(1), grid_w.max(1));
     let (rw, rh) = ((grid_w * p) as u32, (grid_h * p) as u32);
-    let rgb = image.resize_exact(rw, rh, FilterType::Triangle).to_rgb8();
+    let rgb = image.resize_exact(rw, rh, FilterType::Triangle).into_rgb8();
     let raw = rgb.as_raw();
     let stride = (rw as usize) * 3;
 

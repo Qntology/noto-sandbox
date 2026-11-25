@@ -177,15 +177,21 @@ impl SamModel {
         let labels = Tensor::ones((n, 1), DType::F32, &self.device)?;
         let (sparse, dense) = self.prompt.forward(Some((&coords, &labels)), None, None)?;
         let (masks, iou) = self.decoder.forward(embedding, &self.image_pe, &sparse, &dense, true)?;
-        let iou: Vec<Vec<f32>> = iou.to_vec2()?;
         let k = masks.dim(1)?;
-        let best: Vec<u32> = iou.iter().enumerate().map(|(i, row)| (i * k + row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |b| b.0)) as u32).collect();
-        let idx = Tensor::new(best.as_slice(), &self.device)?;
+        // Select winning mask index on-device before D2H transfer (avoids host sync + H2D round-trip for n=1).
+        let best_local = iou.argmax(candle_core::D::Minus1)?;
+        let idx = if n == 1 {
+            best_local
+        } else {
+            let offsets = Tensor::from_vec((0..n).map(|i| (i * k) as u32).collect::<Vec<u32>>(), n, &self.device)?;
+            (best_local + offsets)?
+        };
         let chosen: Vec<Vec<f32>> = masks.contiguous()?.reshape((n * k, LOW_RES * LOW_RES))?.index_select(&idx, 0)?.to_vec2()?;
+        let iou_max: Vec<f32> = iou.max(candle_core::D::Minus1)?.to_vec1()?;
         Ok(chosen
             .into_iter()
-            .zip(&iou)
-            .map(|(logits, row)| Decoded { logits, iou_pred: row.iter().copied().fold(f32::MIN, f32::max) })
+            .zip(iou_max)
+            .map(|(logits, iou_pred)| Decoded { logits, iou_pred })
             .collect())
     }
 }

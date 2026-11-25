@@ -350,12 +350,25 @@ pub fn label_heats(dense: &noto_ml::DenseEmbedding, texts: &LabelTexts, cfg: &Lo
         LocateScoring::Contrast => {
             let t = cfg.logit_scale.unwrap_or(logit_scale);
             let mut out = vec![vec![0.0f32; n]; texts.labels.len()];
+            let total_k = texts.labels.len() + texts.background.len();
+            let mut logits = Vec::with_capacity(total_k);
             for (i, v) in dense.vectors.iter().enumerate() {
-                let logits: Vec<f32> = texts.labels.iter().map(|(_, p, _)| t * dot(v, p)).chain(texts.background.iter().map(|b| t * dot(v, b))).collect();
+                logits.clear();
+                for (_, p, _) in &texts.labels {
+                    logits.push(t * dot(v, p));
+                }
+                for b in &texts.background {
+                    logits.push(t * dot(v, b));
+                }
                 let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let z: f32 = logits.iter().map(|l| (l - m).exp()).sum();
+                let mut z = 0.0f32;
+                for l in &mut logits {
+                    *l = (*l - m).exp();
+                    z += *l;
+                }
+                let inv_z = 1.0 / z;
                 for (k, row) in out.iter_mut().enumerate() {
-                    row[i] = (logits[k] - m).exp() / z;
+                    row[i] = logits[k] * inv_z;
                 }
             }
             out

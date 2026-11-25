@@ -394,34 +394,38 @@ pub fn rms_norm_1p(x: &[f32], h: usize, w: &[f32], eps: f32, out: &mut [f32]) {
     }
 }
 
-/// 1-pass per-row LayerNorm (`(x - mean) / sqrt(var + eps) * w + bias`) for SigLIP2 CPU path.
+/// Two-pass centered per-row LayerNorm (`(x - mean) / sqrt(var + eps) * w + bias`) with f64
+/// mean/variance accumulation to eliminate catastrophic cancellation on large DC offsets (BUG LN-1).
 pub fn layer_norm(x: &[f32], h: usize, w: &[f32], bias: Option<&[f32]>, eps: f32, out: &mut [f32]) {
     assert_eq!(w.len(), h);
     if let Some(b) = bias {
         assert_eq!(b.len(), h);
     }
-    let inv_h = 1.0 / h as f32;
+    let inv_h = 1.0f64 / h as f64;
+    let eps64 = eps as f64;
     let f = |(row, o): (&[f32], &mut [f32])| {
-        let mut sum = 0f32;
+        let mut sum = 0.0f64;
         for &v in row {
-            sum += v;
+            sum += v as f64;
         }
         let mean = sum * inv_h;
-        let mut var = 0f32;
+        let mut var = 0.0f64;
         for &v in row {
-            let d = v - mean;
-            var = d.mul_add(d, var);
+            let d = v as f64 - mean;
+            var += d * d;
         }
-        let inv_std = 1.0 / (var * inv_h + eps).sqrt();
+        let inv_std = 1.0f64 / (var * inv_h + eps64).sqrt();
         match bias {
             Some(b) => {
                 for j in 0..h {
-                    o[j] = ((row[j] - mean) * inv_std).mul_add(w[j], b[j]);
+                    let norm = ((row[j] as f64 - mean) * inv_std) as f32;
+                    o[j] = norm.mul_add(w[j], b[j]);
                 }
             }
             None => {
                 for j in 0..h {
-                    o[j] = ((row[j] - mean) * inv_std) * w[j];
+                    let norm = ((row[j] as f64 - mean) * inv_std) as f32;
+                    o[j] = norm * w[j];
                 }
             }
         }
@@ -812,6 +816,21 @@ mod tests {
         let mut one = vec![0f32; h];
         layer_norm(&x[..h], h, &w, Some(&b), 1e-6, &mut one);
         assert_eq!(bits(&one), bits(&out[..h]));
+
+        // Large DC-offset stability (BUG LN-1): +1000.0 + small signal matches two-pass f64 reference.
+        let x_dc: Vec<f32> = det(h, 53).into_iter().map(|v| v * 0.05 + 1000.0).collect();
+        let mut out_dc = vec![0f32; h];
+        layer_norm(&x_dc, h, &w, Some(&b), 1e-6, &mut out_dc);
+        let mean = x_dc.iter().map(|&v| v as f64).sum::<f64>() / h as f64;
+        let var = x_dc.iter().map(|&v| { let d = v as f64 - mean; d * d }).sum::<f64>() / h as f64;
+        let inv_std = 1.0 / (var + 1e-6).sqrt();
+        let max_dc_err = (0..h)
+            .map(|j| {
+                let want = ((x_dc[j] as f64 - mean) * inv_std * w[j] as f64 + b[j] as f64) as f32;
+                (out_dc[j] - want).abs()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(max_dc_err < 1e-4, "layer_norm large-mean error {max_dc_err}");
 
         // dot_argmax_rows_f32 deterministic tie-break
         let q = vec![1.0f32; 64];

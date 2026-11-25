@@ -371,10 +371,20 @@ impl Siglip2 {
 
     /// The vectors of `fresh`'s cells (all of the pass's when `None`) and the pooled embedding over the whole pass.
     fn fill_sparse(&self, sd: &mut SparseDense, fresh: Option<&SparsePass>) -> Result<()> {
-        let pooled = self.vision.head_pooled(&sd.pass.tokens)?;
-        let src = fresh.unwrap_or(&sd.pass);
-        let dense = l2_normalize(&self.vision.head_dense(&src.tokens)?)?.squeeze(0)?.to_vec2::<f32>()?;
-        for (c, v) in src.cells.iter().zip(dense) {
+        let (dense_t, pooled, cells) = match fresh {
+            None => {
+                // Single pass over sd.pass.tokens shares in_proj and batches out/ln/mlp.
+                let (dense, _, pooled) = self.vision.head_dense_all(&sd.pass.tokens)?;
+                (dense, pooled, &sd.pass.cells)
+            }
+            Some(src) => {
+                let pooled = self.vision.head_pooled(&sd.pass.tokens)?;
+                let dense = self.vision.head_dense(&src.tokens)?;
+                (dense, pooled, &src.cells)
+            }
+        };
+        let dense = l2_normalize(&dense_t)?.squeeze(0)?.to_vec2::<f32>()?;
+        for (c, v) in cells.iter().zip(dense) {
             sd.vectors[*c as usize] = Some(v);
         }
         sd.pooled = l2_normalize(&pooled)?.flatten_all()?.to_vec1()?;

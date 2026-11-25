@@ -418,7 +418,14 @@ pub fn prepare_scaled(series: &[f64], context_length: usize, policy: &TtmInputPo
 /// Top-`k` DFT frequency indices computed strictly over the observed slice so frequency selection
 /// is completely invariant to padding length (Phase 4 – Part 1 · D2).
 pub fn fft_top_indices(obs: &[f64], k: usize, max_bins: usize, ignore_dc: bool) -> Vec<usize> {
+    fft_top_indices_lut(obs, k, max_bins, ignore_dc, None)
+}
+
+/// Same as [`fft_top_indices`], using an L1-resident cos/sin twiddle LUT of length `obs.len()` when given
+/// (valid only for unpadded full-context slices; results are identical to the trig path).
+pub fn fft_top_indices_lut(obs: &[f64], k: usize, max_bins: usize, ignore_dc: bool, lut: Option<(&[f64], &[f64])>) -> Vec<usize> {
     let n = obs.len().max(1);
+    let lut = lut.filter(|(c, s)| c.len() == n && s.len() == n);
     let bins = (n / 2 + 1).min(max_bins.max(1));
     let mut mag: Vec<(usize, f64)> = (0..bins)
         .map(|kf| {
@@ -427,10 +434,23 @@ pub fn fft_top_indices(obs: &[f64], k: usize, max_bins: usize, ignore_dc: bool) 
             }
             let mut re = 0.0;
             let mut im = 0.0;
-            for (tt, &v) in obs.iter().enumerate() {
-                let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / n as f64;
-                re += v * a.cos();
-                im += v * a.sin();
+            if let Some((cos_lut, sin_lut)) = lut {
+                let step = kf % n;
+                let mut idx = 0usize;
+                for &v in obs {
+                    re += v * cos_lut[idx];
+                    im += v * sin_lut[idx];
+                    idx += step;
+                    if idx >= n {
+                        idx -= n;
+                    }
+                }
+            } else {
+                for (tt, &v) in obs.iter().enumerate() {
+                    let a = -2.0 * std::f64::consts::PI * (kf * tt) as f64 / n as f64;
+                    re += v * a.cos();
+                    im += v * a.sin();
+                }
             }
             (kf, (re * re + im * im).sqrt())
         })
@@ -777,6 +797,9 @@ enum FftEmbed {
 struct FftTokens {
     k: usize,
     max_bins: usize,
+    context_length: usize,
+    cos_lut: Vec<f64>,
+    sin_lut: Vec<f64>,
     embed: FftEmbed,
     one: Option<(Linear, usize)>,
     ignore_dc: bool,
@@ -1070,9 +1093,20 @@ impl Predictor {
                     candle_nn::linear(dim, dim, fv.pp("freq_index_mlp").pp(2))?,
                 )
             };
+            let sl = sc.context_length.max(1);
+            let mut cos_lut = Vec::with_capacity(sl);
+            let mut sin_lut = Vec::with_capacity(sl);
+            for m in 0..sl {
+                let a = -2.0 * std::f64::consts::PI * (m as f64) / (sl as f64);
+                cos_lut.push(a.cos());
+                sin_lut.push(a.sin());
+            }
             Some(FftTokens {
                 k,
                 max_bins,
+                context_length: sl,
+                cos_lut,
+                sin_lut,
                 embed,
                 one,
                 ignore_dc: cfg.fft_ignore_dc,
@@ -1218,7 +1252,8 @@ impl Predictor {
             for (scaled, obs_start, _, _) in &prepared {
                 // Frequency selection runs strictly on the observed slice so padding never distorts FFT tokens.
                 let obs_slice = &scaled[*obs_start..sl];
-                let idx_usize = fft_top_indices(obs_slice, f.k, bins, f.ignore_dc);
+                let lut = (obs_slice.len() == f.context_length).then(|| (f.cos_lut.as_slice(), f.sin_lut.as_slice()));
+                let idx_usize = fft_top_indices_lut(obs_slice, f.k, bins, f.ignore_dc, lut);
                 let idx: Vec<u32> = idx_usize.into_iter().map(|v| v as u32).collect();
                 let emb = match &f.embed {
                     FftEmbed::Table(tab) => tab.index_select(&Tensor::from_vec(idx, f.k, &self.device)?, 0)?,
@@ -1303,8 +1338,9 @@ fn sincos_pe(n: usize, d: usize, device: &Device) -> Result<Tensor> {
 
 fn lower_median(v: &[f64]) -> f64 {
     let mut s = v.to_vec();
-    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    s[(s.len() - 1) / 2]
+    let mid = (s.len() - 1) / 2;
+    let (_, val, _) = s.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    *val
 }
 
 pub fn robust_lowess_like(x: &[f64], frac: f64, iters: usize) -> Vec<f64> {
