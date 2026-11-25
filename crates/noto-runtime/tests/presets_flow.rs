@@ -1,5 +1,5 @@
 use noto_core::parts::{BodyPlan, Tier};
-use noto_sds::{Scope, Track};
+use noto_runtime::sds::{Scope, Track};
 use noto_runtime::{Runtime, RuntimeConfig};
 use serde_json::json;
 use world_sim::Camera;

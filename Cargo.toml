@@ -2,15 +2,10 @@
 resolver = "2"
 members = [
     "crates/noto-core",
-    "crates/noto-cpu-kernels",
-    "crates/noto-ml",
     "crates/noto-data",
     "crates/world-sim",
-    "crates/noto-sds",
-    "crates/noto-ts",
     "crates/noto-search",
     "crates/noto-quest",
-    "crates/noto-vision",
     "crates/noto-runtime",
     "src-tauri",
 ]
@@ -25,19 +20,34 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-tokenizers = "0.22"
-lancedb = { version = "0.31.0", default-features = false }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+lancedb = { version = "0.41", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 futures = "0.3"
 rayon = "1"
 webp = "0.3"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
-candle-transformers = "0.11.0"
+candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+
+# Tier 0 (Qntology/premium-discount) pinned to PD_LIB_PIN_REV_2
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-eval        = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-manifest    = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-nms         = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-quant       = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
+premium-discount-sds         = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675", features = ["audit"] }
+
+# Tier 1 (Qntology/louis-vision) pinned to LV_LIB_PIN_REV_2
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "341e54cdc822aa7ee6201fba8f48472df11e1bd6" }
 
 [patch.crates-io]
 candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 candle-nn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
+candle-flash-attn = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 
 [profile.dev.package.candle-core]
 opt-level = 3
@@ -51,15 +61,21 @@ opt-level = 3
 [profile.dev.package.world-sim]
 opt-level = 3
 
-[profile.dev.package.noto-vision]
+[profile.dev.package.lv-kernels]
 opt-level = 3
 
-# The block encoder quantizes the models when they load (a weighted search per 32 weights).
-[profile.dev.package.noto-ml]
+[profile.dev.package.lv-spatial]
 opt-level = 3
 
-# candle's CPU matmul (and the convolutions the ROCm and Vulkan backends run on the host, im2col + matmul). Unoptimized,
-# one TIPSv2 DPT frame took 36 s in the test profile.
+[profile.dev.package.lv-core]
+opt-level = 2
+
+[profile.dev.package.premium-discount-cpu-kernels]
+opt-level = 3
+
+[profile.dev.package.premium-discount-quant]
+opt-level = 3
+
 [profile.dev.package.gemm]
 opt-level = 3
 
@@ -75,16 +91,7 @@ opt-level = 3
 [profile.dev.package.pulp]
 opt-level = 3
 
-[profile.dev.package.candle-transformers]
-opt-level = 3
-
 [profile.dev.package.noto-core]
-opt-level = 3
-
-[profile.dev.package.noto-cpu-kernels]
-opt-level = 3
-
-[profile.dev.package.noto-ts]
 opt-level = 3
 
 [profile.release]

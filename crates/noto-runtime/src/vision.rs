@@ -1,4 +1,4 @@
-use noto_sds::{DriftState, Scope, SdsStore, Track, Window};
+use crate::sds::{DriftState, Scope, SdsStore, Track, Window};
 use serde::{Deserialize, Serialize};
 use world_sim::odometry::{LEG_SCALE_SD, RANDOM_WALK_M, WHEEL_SCALE_SD};
 use world_sim::Camera;
@@ -45,7 +45,7 @@ pub struct GazeCheck {
     /// The share of the box with depth, where the look put the item, and which way it lies and how big it is.
     pub depth_valid: Option<f32>,
     pub at: Option<(f32, f32)>,
-    pub item: Option<noto_vision::ItemPose>,
+    pub item: Option<crate::vision_compat::ItemPose>,
 }
 
 /// One look at an item through one camera: the scan's match of its kind nearest the memory (its label, score and
@@ -78,8 +78,8 @@ pub struct Sighting {
     pub depth_sigma_m: Option<f32>,
     /// The share of the box with depth (SGBM leaves what it cannot match empty).
     pub depth_valid: Option<f32>,
-    /// Which way the item lies, its size and its top, from the depth over the whole box (`noto_vision::item_pose`).
-    pub item: Option<noto_vision::ItemPose>,
+    /// Which way the item lies, its size and its top, from the depth over the whole box (`crate::vision_compat::item_pose`).
+    pub item: Option<crate::vision_compat::ItemPose>,
 }
 
 impl Sighting {

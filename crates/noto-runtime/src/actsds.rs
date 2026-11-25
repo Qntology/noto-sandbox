@@ -4,7 +4,7 @@ use noto_core::balance::{reference, RefCtx, Source, G};
 use noto_core::kin;
 use noto_core::parts::Segment;
 use noto_core::BaseKind;
-use noto_sds::{Scope, SdsStore, Track};
+use crate::sds::{Scope, SdsStore, Track};
 use world_sim::{TimedEvent, WorldEvent};
 
 use crate::record::{capture_keyframe, KeyEvent};

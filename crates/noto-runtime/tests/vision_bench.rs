@@ -36,14 +36,15 @@ fn the_engine_never_names_a_vision_benchmark_source() {
         "crates/noto-core/src/act/grasp.rs",
         "crates/noto-core/src/kin.rs",
         "crates/noto-core/src/morph.rs",
-        "crates/noto-vision/src/decide.rs",
-        "crates/noto-vision/src/align.rs",
-        "crates/noto-vision/src/calib.rs",
+        "crates/noto-runtime/src/vision_compat/mod.rs",
+        "crates/noto-runtime/src/vision_compat/decide.rs",
+        "crates/noto-runtime/src/vision_compat/locate.rs",
+        "crates/noto-runtime/src/vision_compat/tips.rs",
+        "crates/noto-runtime/src/vision_compat/stairs.rs",
+        "crates/noto-runtime/src/stereo.rs",
         "crates/noto-runtime/src/ml.rs",
         "crates/noto-runtime/src/embedding.rs",
         "crates/noto-runtime/src/perception.rs",
-        "crates/noto-vision/src/locate.rs",
-        "crates/noto-vision/src/tips.rs",
     ];
     let banned = ["Loomis", "Rieser", "Thomson", "Steenhuis", "Elliott", "Madalena", "Westwood", "Hesse", "Patla", "Hollands", "Laurent", "Assaiante", "TidyBot", "Dusty", "Deyle", "Ramanan", "Holbein", "Wysog", "King, Judge", "Toussaint", "van der Burg"];
     for f in engine {

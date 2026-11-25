@@ -11,15 +11,24 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 image = { workspace = true }
 base64 = "0.22"
+half = "2.4"
+sha2 = "0.10"
+rayon = { workspace = true }
+tokenizers = { workspace = true }
 candle-core = { workspace = true }
+candle-nn = { workspace = true }
 noto-core = { path = "../noto-core" }
-noto-ml = { path = "../noto-ml" }
 noto-search = { path = "../noto-search" }
 noto-quest = { path = "../noto-quest" }
-noto-sds = { path = "../noto-sds" }
-noto-ts = { path = "../noto-ts" }
-noto-vision = { path = "../noto-vision" }
 world-sim = { path = "../world-sim" }
+lv-kernels = { workspace = true }
+lv-sds = { workspace = true }
+lv-core = { workspace = true }
+lv-spatial = { workspace = true }
+premium-discount-cpu-kernels = { workspace = true }
+premium-discount-eval = { workspace = true }
+premium-discount-quant = { workspace = true }
+premium-discount-sds = { workspace = true }
 
 [dev-dependencies]
 candle-nn = { workspace = true }
@@ -28,7 +37,7 @@ tokio = { workspace = true }
 
 [features]
 default = []
-cuda = ["noto-vision/cuda", "noto-ml/cuda"]
-metal = ["noto-vision/metal", "noto-ml/metal"]
-vulkan = ["noto-vision/vulkan", "noto-ml/vulkan"]
-rocm = ["noto-vision/rocm", "noto-ml/rocm"]
+cuda = ["lv-core/cuda", "lv-spatial/cuda", "candle-core/cuda", "candle-nn/cuda"]
+metal = ["lv-core/metal", "lv-spatial/metal", "candle-core/metal", "candle-nn/metal"]
+vulkan = ["lv-core/vulkan", "lv-spatial/vulkan", "candle-core/vulkan", "candle-nn/vulkan"]
+rocm = ["lv-core/rocm", "lv-spatial/rocm", "candle-core/rocm", "candle-nn/rocm"]

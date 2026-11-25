@@ -7,11 +7,11 @@ use noto_runtime::ml::{DepthErrModel, DepthStandIn, KeyTruth, LocateErrModel, Lo
 use noto_runtime::record::{intrinsics, odometry};
 use noto_runtime::{DepthEngine, EmbeddingCfg, EmbeddingPerception, LocateEngine, NoiseCfg, OraclePerception, Recognizer, Runtime, RuntimeConfig, ScanInput};
 use noto_search::{Lexicon, VisionPrompting};
-use noto_vision::calib::{auroc, average_precision, fit_label};
-use noto_vision::locate::points_with_presence;
-use noto_vision::{
+use noto_runtime::vision_compat::calib::{auroc, average_precision, fit_label};
+use noto_runtime::vision_compat::locate::points_with_presence;
+use noto_runtime::vision_compat::{
     depth_metrics, label_heats, AlignCfg, AlignSpace, CalibTable, DepthKind, DepthMap, DepthModel, Intrinsics, LabelPrompt, LabelTexts, LocateCfg, LocateScoring, MaskTracker, Pose, RegionTracker, Rgb,
-    InputGrid, SamModel, SamTracker, SemanticLocator, SemanticPoint, TipsDepth,
+    InputGrid, SemanticLocator, SemanticPoint, StereoSpatialTier, StereoTierTracker, TipsDepth,
 };
 use world_sim::render::pack_id;
 use world_sim::world::{DropItem, Node};
@@ -460,7 +460,7 @@ fn arm(name: &'static str, lex: &Lexicon, depth: Src, locate: Src, tracker: Box<
     Arm { name, pipe, depth, locate, honest: None }
 }
 
-fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Option<noto_vision::align::HeightFn>) {
+fn run_arm(book: &mut Book, a: &mut Arm, shot: &Shot, scene: &Scene, height: Option<noto_runtime::vision_compat::align::HeightFn>) {
     a.pipe.reset();
     if a.depth == Src::StandIn {
         let mut d = DepthStandIn::new(scene.seed * 1000 + scene.dist_m as u64);
@@ -661,7 +661,7 @@ impl ScanFit {
             return None;
         }
         let pos = self.det.iter().filter(|d| **d).count();
-        let (det_a, det_b) = match noto_vision::calib::platt_fit(&self.lnpx, &self.det) {
+        let (det_a, det_b) = match noto_runtime::vision_compat::calib::platt_fit(&self.lnpx, &self.det) {
             Some(f) => f,
             None => {
                 let p = (pos as f32 + 0.5) / (self.det.len() as f32 + 1.0);
@@ -704,10 +704,10 @@ fn fit_scan_calibration(cands: &[ScanCand]) -> CalibTable {
         }
         let rate = (pos as f32 + 0.5) / (h.len() as f32 + 1.0);
         let flat = (0.0f32, logit(rate));
-        let fit = if pos >= 5 { noto_vision::calib::platt_fit(&s, &h).filter(|f| f.0 > 0.0) } else { None };
+        let fit = if pos >= 5 { noto_runtime::vision_compat::calib::platt_fit(&s, &h).filter(|f| f.0 > 0.0) } else { None };
         if let Some((a, b)) = fit.or(Some(flat)) {
             let threshold = if a > 0.0 { (logit(GATE_SCORE) - b) / a } else { f32::MAX };
-            t.labels.insert(key.into(), noto_vision::LabelCalib { threshold, platt: Some((a, b)), positives: pos as u32, negatives: (h.len() - pos) as u32, precision: None, recall: None });
+            t.labels.insert(key.into(), noto_runtime::vision_compat::LabelCalib { threshold, platt: Some((a, b)), positives: pos as u32, negatives: (h.len() - pos) as u32, precision: None, recall: None });
         }
     };
     add("*", cands.iter().map(|c| c.score).collect(), cands.iter().map(|c| c.tp).collect());
@@ -747,7 +747,7 @@ fn locate_errmodel(per_frame: &[serde_json::Value], variant: &str, table: &Calib
         }
     }
     let pos = hits.iter().filter(|h| **h).count();
-    let (hit_a, hit_b) = match noto_vision::calib::platt_fit(&lnpx, &hits) {
+    let (hit_a, hit_b) = match noto_runtime::vision_compat::calib::platt_fit(&lnpx, &hits) {
         Some(f) => f,
         None if hits.is_empty() => return None,
         None => {
@@ -770,7 +770,7 @@ fn locate_errmodel(per_frame: &[serde_json::Value], variant: &str, table: &Calib
 }
 
 fn device() -> candle_core::Device {
-    noto_ml::preferred().backend.device(0).expect("device")
+    noto_runtime::ml_bridge::preferred().backend.device(0).expect("device")
 }
 
 fn bank_dir() -> PathBuf {
@@ -799,9 +799,9 @@ fn print_rank(book: &Book, variant: &str, stat: &str) {
     println!("[MLAB] {variant}/eval/{stat} 라벨별 AUROC: {}", per.join(" · "));
 }
 
-struct Sig(Arc<RwLock<noto_ml::Siglip2>>);
+struct Sig(Arc<RwLock<noto_runtime::ml_bridge::Siglip2>>);
 
-impl noto_ml::ImageEmbedder for Sig {
+impl noto_runtime::ml_bridge::ImageEmbedder for Sig {
     fn embedding_dim(&self) -> usize {
         self.0.read().unwrap().embedding_dim()
     }
@@ -810,7 +810,7 @@ impl noto_ml::ImageEmbedder for Sig {
     }
 }
 
-impl noto_ml::TextEmbedder for Sig {
+impl noto_runtime::ml_bridge::TextEmbedder for Sig {
     fn embedding_dim(&self) -> usize {
         self.0.read().unwrap().embedding_dim()
     }
@@ -842,16 +842,15 @@ fn ml_ab_benchmark() {
     let dev = device();
     let lex = Lexicon::from_json(LEX).unwrap();
     let prompting = VisionPrompting::from_lexicon_json(LEX).unwrap();
-    let siglip = noto_ml::Siglip2::load(&PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR")), &dev).expect("SigLIP2");
+    let siglip = noto_runtime::ml_bridge::Siglip2::load(&PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR")), &dev).expect("SigLIP2");
     let mut tips = TipsDepth::load(&PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR")), &dev).expect("TIPS");
-    let sam = Arc::new(SamModel::load(&PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR")), &dev).expect("SAM"));
     let (scale, bias) = siglip.logit_scale_bias();
     // A quantized SigLIP2 runs its locator under `<settings>+q-<plan>` (`SiglipLocator`): the fitted table carries the
     // same mode, so the runtime finds it only for the model it was fitted on.
     let msuf = siglip.mode_suffix();
     println!(
         "[MLAB] 장치 {} · SigLIP2 exp(t) {scale:.1}, b {bias:.2} (짝 확률 0.5인 코사인 {:.3}) · 양자화 SigLIP2 {:?} · TIPS {:?}",
-        noto_ml::device_label(&dev),
+        noto_runtime::ml_bridge::device_label(&dev),
         -bias / scale,
         siglip.quant_plan().tag,
         tips.quant_plan().tag
@@ -873,7 +872,7 @@ fn ml_ab_benchmark() {
     ];
     let siglip = Arc::new(siglip);
     let texts: Vec<LabelTexts> = {
-        let mut loc = noto_vision::SiglipLocator::with_cfg(Arc::clone(&siglip), LocateCfg::default());
+        let mut loc = noto_runtime::vision_compat::SiglipLocator::with_cfg(Arc::clone(&siglip), LocateCfg::default());
         variants.iter().map(|(_, c)| loc.label_texts(&labels, c).unwrap()).collect()
     };
     let sig = Arc::new(Sig(Arc::new(RwLock::new(Arc::try_unwrap(siglip).ok().expect("the locator is gone")))));
@@ -884,7 +883,7 @@ fn ml_ab_benchmark() {
     let bank = bank_dir();
     let phrases = noto_runtime::BankedPhrases::new(Arc::clone(&sig), Some(&bank));
     let calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync> = Arc::new(move |c| 1.0 / (1.0 + (-(scale * c + bias)).exp()));
-    let image: Arc<dyn noto_ml::ImageEmbedder + Send + Sync> = sig.clone();
+    let image: Arc<dyn noto_runtime::ml_bridge::ImageEmbedder + Send + Sync> = sig.clone();
     let mut scan = EmbeddingPerception::new_with(&lex, &phrases, Arc::clone(&image), Arc::clone(&calibrate), "gpu", EmbeddingCfg::default(), None).unwrap();
     let mut scan_tpl = EmbeddingPerception::new_with(&lex, &phrases, Arc::clone(&image), Arc::clone(&calibrate), "gpu", EmbeddingCfg::default(), Some(&prompting)).unwrap();
     let mut scan_cal = EmbeddingPerception::new_with(&lex, &phrases, Arc::clone(&image), Arc::clone(&calibrate), "gpu", EmbeddingCfg::default(), None).unwrap();
@@ -897,10 +896,10 @@ fn ml_ab_benchmark() {
         arm("A0", &lex, Src::StandIn, Src::StandIn, Box::new(RegionTracker::default()), &d_cell, &p_cell, "", "", legacy.clone()),
         arm("A1", &lex, Src::Model, Src::StandIn, Box::new(RegionTracker::default()), &d_cell, &p_cell, "tipsv2-b14-dpt", "", legacy.clone()),
         arm("A2", &lex, Src::StandIn, Src::Model, Box::new(RegionTracker::default()), &d_cell, &p_cell, "", "siglip2-dense", legacy.clone()),
-        arm("A3", &lex, Src::StandIn, Src::StandIn, Box::new(SamTracker::new(Arc::clone(&sam))), &d_cell, &p_cell, "", "", legacy.clone()),
-        arm("A4", &lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(&sam))), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone()),
+        arm("A3", &lex, Src::StandIn, Src::StandIn, Box::new(StereoTierTracker::new(StereoSpatialTier::StereoMetricGrasp)), &d_cell, &p_cell, "", "", legacy.clone()),
+        arm("A4", &lex, Src::Model, Src::Model, Box::new(StereoTierTracker::new(StereoSpatialTier::StereoMetricGrasp)), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone()),
     ];
-    let mut a4n = arm("A4new", &lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(&sam))), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone());
+    let mut a4n = arm("A4new", &lex, Src::Model, Src::Model, Box::new(StereoTierTracker::new(StereoSpatialTier::StereoMetricGrasp)), &d_cell, &p_cell, "tipsv2-b14-dpt", "siglip2-dense", legacy.clone());
     let shipped: Option<Vec<CalibTable>> = {
         let t = CalibTable::parse(noto_runtime::ml::ML_CALIB_JSON).unwrap_or_default();
         let dense = t.iter().any(|x| x.mode.starts_with("siglip2-dense"));
@@ -916,7 +915,7 @@ fn ml_ab_benchmark() {
         println!("[MLAB] 실린 보정 사용: 위치 {} · {} / 스캔 라벨 {}개", dense.mode, dense.statistic, scan_t.labels.len());
         scan_cal.set_calibration(Some(scan_t.clone()));
         tables = vec![dense, scan_t];
-        a5 = Some(a5_arms(&lex, &prompting, &tables[0], vk, &sam, &d_cell, &p_cell));
+        a5 = Some(a5_arms(&lex, &prompting, &tables[0], vk, &d_cell, &p_cell));
     }
     let mut scan_honest_fit = ScanFit::default();
     let mut honest_scan: Option<OraclePerception> = None;
@@ -957,7 +956,7 @@ fn ml_ab_benchmark() {
                 println!("[MLAB] 스캔 보정: 맞춤 후보 {}개 (참 {}), 라벨 {}개", scan_fit.len(), scan_fit.iter().filter(|c| c.tp).count(), scan_table.labels.len());
                 scan_cal.set_calibration(Some(scan_table.clone()));
                 tables = vec![table, scan_table];
-                a5 = Some(a5_arms(&lex, &prompting, &tables[0], vk, &sam, &d_cell, &p_cell));
+                a5 = Some(a5_arms(&lex, &prompting, &tables[0], vk, &d_cell, &p_cell));
             }
             let vk = a5.as_ref().map(|a| a.2).unwrap();
             let dmodel = errfit_ground.model(f32::INFINITY);
@@ -965,7 +964,7 @@ fn ml_ab_benchmark() {
             println!("[MLAB] 정직한 대역 (맞춤 시드): 깊이 {}", dmodel.map_or("없음".into(), |m| depth_model_rs(&m)));
             println!("[MLAB] 정직한 대역 (맞춤 시드): 위치 {lmodel:?}");
             if let (Some(dm), Some(lm)) = (dmodel, lmodel) {
-                for (name, tracker) in [("A0h", Box::new(RegionTracker::default()) as Box<dyn MaskTracker>), ("A0hsam", Box::new(SamTracker::new(Arc::clone(&sam))))] {
+                for (name, tracker) in [("A0h", Box::new(RegionTracker::default()) as Box<dyn MaskTracker>), ("A0hsam", Box::new(StereoTierTracker::new(StereoSpatialTier::StereoMetricGrasp)))] {
                     let mut h = arm(name, &lex, Src::StandIn, Src::StandIn, tracker, &d_cell, &p_cell, "", "", legacy.clone());
                     h.honest = Some((dm, lm));
                     honest.push(h);
@@ -1050,17 +1049,17 @@ fn ml_ab_benchmark() {
                 book.add("depth/tips_v1_sq448/median_scale", m.median_scale);
             }
             let mut d = sq.clone();
-            noto_vision::ground_align(&mut d, &shot.intr, &shot.pose, Some(&dem as noto_vision::align::HeightFn), Some(10.0), &AlignCfg::default());
+            noto_runtime::vision_compat::ground_align(&mut d, &shot.intr, &shot.pose, Some(&dem as noto_runtime::vision_compat::align::HeightFn), Some(10.0), &AlignCfg::default());
             record_depth(&mut book, "depth/tips_v1_sq448_ground_map", &d, &shot.truth, shot.target_raw);
         });
         for (name, h, cfg) in [
             ("depth/tips_v1_ground_flat", None, AlignCfg::default()),
-            ("depth/tips_v1_ground_map", Some(&dem as noto_vision::align::HeightFn), AlignCfg::default()),
-            ("depth/tips_v1_ground_scale", Some(&dem as noto_vision::align::HeightFn), AlignCfg { space: AlignSpace::Scale, ..AlignCfg::default() }),
-            ("depth/tips_v1_ground_map_noclip", Some(&dem as noto_vision::align::HeightFn), AlignCfg { clip_to_support: false, ..AlignCfg::default() }),
+            ("depth/tips_v1_ground_map", Some(&dem as noto_runtime::vision_compat::align::HeightFn), AlignCfg::default()),
+            ("depth/tips_v1_ground_scale", Some(&dem as noto_runtime::vision_compat::align::HeightFn), AlignCfg { space: AlignSpace::Scale, ..AlignCfg::default() }),
+            ("depth/tips_v1_ground_map_noclip", Some(&dem as noto_runtime::vision_compat::align::HeightFn), AlignCfg { clip_to_support: false, ..AlignCfg::default() }),
         ] {
             let mut d = raw1.clone();
-            let fit = timers.time("align", || noto_vision::ground_align(&mut d, &shot.intr, &shot.pose, h, Some(10.0), &cfg));
+            let fit = timers.time("align", || noto_runtime::vision_compat::ground_align(&mut d, &shot.intr, &shot.pose, h, Some(10.0), &cfg));
             book.flag(format!("{name}/fitted"), fit.is_some());
             record_depth(&mut book, name, &d, &shot.truth, shot.target_raw);
             if name == "depth/tips_v1_ground_map" && s.fit() {
@@ -1214,7 +1213,7 @@ fn ml_ab_benchmark() {
     book.line("A5gate/eval/precision", "보정 게이트를 통과한 점의 정밀도 (평가 시드)");
     book.line("A5gate/eval/recall", "보이는 라벨 중 게이트 통과");
     if let Some((s, h)) = book.pairs.get("A5gate/eval/platt") {
-        println!("[MLAB] A5gate/eval/ece {:.3} (n {}) — {CITE_CALIB}", noto_vision::calib::ece(s, h, noto_vision::calib::ECE_BINS).unwrap_or(f32::NAN), s.len());
+        println!("[MLAB] A5gate/eval/ece {:.3} (n {}) — {CITE_CALIB}", noto_runtime::vision_compat::calib::ece(s, h, noto_runtime::vision_compat::calib::ECE_BINS).unwrap_or(f32::NAN), s.len());
     }
     println!("[MLAB] ===== 추적과 거리 (사슬 전체, 같은 키프레임) =====");
     for a in ["A0", "A1", "A2", "A3", "A4", "A4new", "A5", "A5region", "A0h", "A0hsam"] {
@@ -1234,7 +1233,7 @@ fn ml_ab_benchmark() {
     for k in ["A5raw/scan/eval_score", "A5cal/scan/platt"] {
         if let Some((s, h)) = book.pairs.get(k) {
             let probs: Vec<f32> = s.iter().map(|x| x.clamp(0.0, 1.0)).collect();
-            println!("[MLAB] {k} AUROC {} · ECE {:.3} (후보 {}, 참 {})", auroc(s, h).map_or("-".into(), |v| format!("{v:.3}")), noto_vision::calib::ece(&probs, h, noto_vision::calib::ECE_BINS).unwrap_or(f32::NAN), s.len(), h.iter().filter(|x| **x).count());
+            println!("[MLAB] {k} AUROC {} · ECE {:.3} (후보 {}, 참 {})", auroc(s, h).map_or("-".into(), |v| format!("{v:.3}")), noto_runtime::vision_compat::calib::ece(&probs, h, noto_runtime::vision_compat::calib::ECE_BINS).unwrap_or(f32::NAN), s.len(), h.iter().filter(|x| **x).count());
         }
     }
 
@@ -1255,12 +1254,12 @@ fn ml_ab_benchmark() {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn a5_arms(lex: &Lexicon, prompting: &VisionPrompting, table: &CalibTable, vk: usize, sam: &Arc<SamModel>, d: &Arc<Mutex<Option<DepthMap>>>, p: &Arc<Mutex<Vec<SemanticPoint>>>) -> (Arm, Arm, usize) {
+fn a5_arms(lex: &Lexicon, prompting: &VisionPrompting, table: &CalibTable, vk: usize, d: &Arc<Mutex<Option<DepthMap>>>, p: &Arc<Mutex<Vec<SemanticPoint>>>) -> (Arm, Arm, usize) {
     let vcfg = LocateCfg::from_mode(&table.mode, &prompting.background, &prompting.templates).expect("a dense locator mode");
     let mut fix = MlFixCfg::v1(prompting);
     fix.locate = vcfg.clone();
     // The arms' locator runs under the table's mode (the model's quantization suffix included), as the runtime's would.
-    let mut x = arm("A5", lex, Src::Model, Src::Model, Box::new(SamTracker::new(Arc::clone(sam))), d, p, "tipsv2-b14-dpt", &table.mode, fix.clone());
+    let mut x = arm("A5", lex, Src::Model, Src::Model, Box::new(StereoTierTracker::new(StereoSpatialTier::StereoMetricGrasp)), d, p, "tipsv2-b14-dpt", &table.mode, fix.clone());
     x.pipe.calib = vec![table.clone()];
     let mut y = arm("A5region", lex, Src::Model, Src::Model, Box::new(RegionTracker::default()), d, p, "tipsv2-b14-dpt", &table.mode, fix);
     y.pipe.calib = vec![table.clone()];
@@ -1292,7 +1291,6 @@ fn ml_ab_quests() {
     let seeds: Vec<u64> = env_list("MLAB_QUEST_SEEDS", &[7]);
     let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
     let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
-    let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
     let bank = bank_dir();
     let mut rows: BTreeMap<&str, Vec<serde_json::Value>> = BTreeMap::new();
     // `MLAB_QUEST_ARMS=real_v1.3`: only some arms. Each arm also reports where its keyframes spent their time.
@@ -1303,7 +1301,7 @@ fn ml_ab_quests() {
             continue;
         }
         let siglip = arm.starts_with("real").then(|| {
-            let mut s = noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
+            let mut s = noto_runtime::ml_bridge::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
             s.set_position_antialias(arm != "real_v0.9");
             Arc::new(s)
         });
@@ -1324,7 +1322,7 @@ fn ml_ab_quests() {
                         match arm {
                             "real_v1.3_region" => rt.use_region_tracker(),
                             "real_v1.3_region_clamp" => rt.use_region_tracker_clamped(),
-                            _ => rt.use_sam(&sam_dir, &dev).expect("SAM"),
+                            _ => rt.use_stereo_metric_grasp(),
                         }
                         rt.use_siglip(Arc::clone(siglip.as_ref().unwrap()), Some(&bank)).expect("SigLIP2");
                     }
@@ -1409,7 +1407,7 @@ fn ml_port_dump() {
     std::fs::create_dir_all(&dir).unwrap();
     let dev = device();
     let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
-    let mut siglip = noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
+    let mut siglip = noto_runtime::ml_bridge::Siglip2::load(&sig_dir, &dev).expect("SigLIP2");
     let mut tips = TipsDepth::load(&PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR")), &dev).expect("TIPS");
     let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
     let scene = |target: &'static str, dist_m: f32, tilt_deg: f32| Scene {
@@ -1438,7 +1436,7 @@ fn ml_port_dump() {
             tips.set_readout_gelu_tanh(tanh);
             write_f32(dir.join(format!("kf{k}_tips_{tag}.f32")), &tips.predict(&t_rgb).unwrap().data);
         }
-        let (gh, gw) = noto_ml::preprocess::naflex_grid(shot.rgb.width, shot.rgb.height, cfg.patch_size, cfg.max_patches);
+        let (gh, gw) = noto_runtime::ml_bridge::preprocess::naflex_grid(shot.rgb.width, shot.rgb.height, cfg.patch_size, cfg.max_patches);
         let s_img = shot.rgb.to_dynamic().resize_exact((gw * cfg.patch_size) as u32, (gh * cfg.patch_size) as u32, image::imageops::FilterType::Triangle).to_rgb8();
         s_img.save(dir.join(format!("kf{k}_siglip.png"))).unwrap();
         for (tag, aa) in [("aa", true), ("bilinear", false)] {
@@ -1449,7 +1447,7 @@ fn ml_port_dump() {
     }
     siglip.set_position_antialias(true);
     let prompts = ["a cardboard parcel", "a photo of a cardboard parcel.", "a wooden log", "a grey boulder", "green grass", "a rendering of a stone.", "a tree in a video game."];
-    let tok = noto_ml::tokenizer::TextTokenizer::from_file(&sig_dir.join("tokenizer.json"), cfg.text_pad_id, cfg.text_max_len).unwrap();
+    let tok = noto_runtime::ml_bridge::tokenizer::TextTokenizer::from_file(&sig_dir.join("tokenizer.json"), cfg.text_pad_id, cfg.text_max_len).unwrap();
     let (ids, mask) = tok.encode(&prompts).unwrap();
     let vecs = siglip.embed_texts(&prompts).unwrap();
     write_f32(dir.join("text_rust.f32"), &vecs.concat());
@@ -1540,8 +1538,8 @@ fn quantile(mut v: Vec<f32>, q: f32) -> Option<f32> {
 #[test]
 #[ignore]
 fn ml_quant_screen() {
-    use noto_ml::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
-    use noto_ml::preprocess::DenseGrid;
+    use noto_runtime::ml_bridge::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
+    use noto_runtime::ml_bridge::preprocess::DenseGrid;
 
     let t0 = std::time::Instant::now();
     let dev = device();
@@ -1555,7 +1553,7 @@ fn ml_quant_screen() {
     let scenes = scenes();
     let shots: Vec<(Scene, Shot)> = scenes.iter().map(|s| (s.clone(), shoot(&mut bases, s))).collect();
     drop(bases);
-    println!("[MLQ] 장치 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_ml::device_label(&dev), shots.len(), t0.elapsed().as_secs_f32());
+    println!("[MLQ] 장치 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_runtime::ml_bridge::device_label(&dev), shots.len(), t0.elapsed().as_secs_f32());
 
     // `MLQ_FUSED=1`: the plans' vision towers run their Q, K and V as one GEMM (the reference keeps three).
     let fused = std::env::var("MLQ_FUSED").is_ok_and(|v| v.trim() == "1");
@@ -1567,13 +1565,13 @@ fn ml_quant_screen() {
     };
     let load_tips = |plan: &QuantPlan| -> TipsDepth {
         let t = std::time::Instant::now();
-        let mut m = TipsDepth::load_quant(&tips_dir, &dev, noto_vision::SceneHeads::NONE, plan).expect("TIPS");
+        let mut m = TipsDepth::load_quant(&tips_dir, &dev, noto_runtime::vision_compat::SceneHeads::NONE, plan).expect("TIPS");
         m.set_readout_gelu_tanh(true);
-        println!("[MLQ]   TIPS {:?} ({}): {} · 올리기 {:.1} s", plan.tag, noto_vision::DepthModel::mode(&m), m.quant_stats().summary(), t.elapsed().as_secs_f32());
+        println!("[MLQ]   TIPS {:?} ({}): {} · 올리기 {:.1} s", plan.tag, noto_runtime::vision_compat::DepthModel::mode(&m), m.quant_stats().summary(), t.elapsed().as_secs_f32());
         m
     };
     let run_loc = |m: &Arc<Siglip2>| -> Vec<LocOut> {
-        let texts = noto_vision::SiglipLocator::with_cfg(Arc::clone(m), cfg.clone()).label_texts(&labels, &cfg).unwrap();
+        let texts = noto_runtime::vision_compat::SiglipLocator::with_cfg(Arc::clone(m), cfg.clone()).label_texts(&labels, &cfg).unwrap();
         let (scale, bias) = m.logit_scale_bias();
         shots
             .iter()
@@ -1621,7 +1619,7 @@ fn ml_quant_screen() {
             if let Some(dep) = dep {
                 let e = depth_eval(&dep[k].raw, &shot.truth, 10.0, shot.target_raw);
                 let mut g = dep[k].raw.clone();
-                let ge = noto_vision::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).and_then(|_| depth_eval(&g, &shot.truth, 10.0, shot.target_raw));
+                let ge = noto_runtime::vision_compat::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).and_then(|_| depth_eval(&g, &shot.truth, 10.0, shot.target_raw));
                 row["depth"] = serde_json::json!([e.as_ref().map(|e| e.absrel), e.as_ref().map(|e| e.delta1), ge.as_ref().map(|e| e.absrel), ge.as_ref().map(|e| e.delta1)]);
             }
             rows.lock().unwrap().push(row.to_string());
@@ -1663,7 +1661,7 @@ fn ml_quant_screen() {
                     }
                 }
                 let mut g = o.raw.clone();
-                if noto_vision::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).is_some() {
+                if noto_runtime::vision_compat::ground_align(&mut g, &shot.intr, &shot.pose, None, Some(10.0), &AlignCfg::default()).is_some() {
                     if let Some(e) = depth_eval(&g, &shot.truth, 10.0, shot.target_raw) {
                         b.add("ground_absrel", e.absrel);
                         b.add("ground_delta1", e.delta1);
@@ -1696,9 +1694,9 @@ fn ml_quant_screen() {
         let (sa, _, _, _) = b.rank("spread_flags_err");
         // The calibrated gate's ECE: a Platt fit of the peak on the fit seeds, its probabilities on the eval seeds (15 bins).
         let ece = match (b.pairs.get("peak_fit"), b.pairs.get("peak_eval")) {
-            (Some((fs, fh)), Some((es, eh))) => noto_vision::calib::platt_fit(fs, fh).and_then(|(a, c)| {
+            (Some((fs, fh)), Some((es, eh))) => noto_runtime::vision_compat::calib::platt_fit(fs, fh).and_then(|(a, c)| {
                 let probs: Vec<f32> = es.iter().map(|s| 1.0 / (1.0 + (-(a * s + c)).exp())).collect();
-                noto_vision::calib::ece(&probs, eh, noto_vision::calib::ECE_BINS)
+                noto_runtime::vision_compat::calib::ece(&probs, eh, noto_runtime::vision_compat::calib::ECE_BINS)
             }),
             _ => None,
         };
@@ -1720,7 +1718,7 @@ fn ml_quant_screen() {
         let out = run_loc(&sig_ref);
         let vs = sig_ref.vocab_stats();
         println!("[MLQ] 텍스트 토큰 표 (장면의 라벨 문구만): 장치에 {} / {} 행 ({:.2} MB, 쓰는 중에 더한 행 {})", vs.rows_on_device, vs.vocab, vs.device_bytes as f64 / 1e6, vs.added_on_demand);
-        let dict = noto_ml::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
+        let dict = noto_runtime::ml_bridge::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
         let texts = noto_runtime::vocab_texts(LEX, Some(&dict)).unwrap();
         let (added, unk) = sig_ref.prime_vocab(&texts.iter().map(String::as_str).collect::<Vec<_>>()).unwrap();
         let vs = sig_ref.vocab_stats();
@@ -1750,7 +1748,7 @@ fn ml_quant_screen() {
     println!("[MLQ-SUM] {:.0} s", t0.elapsed().as_secs_f32());
 }
 
-/// The perforated L1 pass (`noto_vision::perforate`) against the full dense pass on the harness's keyframes, with the
+/// The perforated L1 pass (`noto_runtime::vision_compat::perforate`) against the full dense pass on the harness's keyframes, with the
 /// model as the app loads it (`LoadOpts::for_device`; `NOTO_QUANT` to change): peak and presence AP, the calibrated
 /// gate's ECE (Platt on the fit seeds, 15 bins on the eval seeds), peaks in the true box and their distance to the
 /// object, far small objects (stone, coal, iron ore, parcel at 7 m) on their own, the peak cell and heat next to the
@@ -1760,9 +1758,9 @@ fn ml_quant_screen() {
 #[test]
 #[ignore]
 fn ml_perforated() {
-    use noto_ml::preprocess::DenseGrid;
-    use noto_vision::perforate::{perforated_heats, PerfPattern, PerforatedCfg};
-    use noto_vision::ExpandCfg;
+    use noto_runtime::ml_bridge::preprocess::DenseGrid;
+    use noto_runtime::vision_compat::perforate::{perforated_heats, PerfPattern, PerforatedCfg};
+    use noto_runtime::vision_compat::ExpandCfg;
 
     let t0 = std::time::Instant::now();
     let dev = device();
@@ -1770,14 +1768,14 @@ fn ml_perforated() {
     let prompting = VisionPrompting::from_lexicon_json(LEX).unwrap();
     let labels: Vec<LabelPrompt> = MlPipeline::stand_in(&lex, 7).labels().to_vec();
     let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
-    let model = Arc::new(noto_ml::Siglip2::load_with(&sig_dir, &dev, &noto_ml::LoadOpts::for_device(&dev).unwrap()).expect("SigLIP2"));
+    let model = Arc::new(noto_runtime::ml_bridge::Siglip2::load_with(&sig_dir, &dev, &noto_runtime::ml_bridge::LoadOpts::for_device(&dev).unwrap()).expect("SigLIP2"));
     let cfg = LocateCfg { scoring: LocateScoring::Contrast, background: prompting.background.clone(), grid: DenseGrid::pyramid(), ..LocateCfg::default() };
-    let texts = noto_vision::SiglipLocator::with_cfg(Arc::clone(&model), cfg.clone()).label_texts(&labels, &cfg).unwrap();
+    let texts = noto_runtime::vision_compat::SiglipLocator::with_cfg(Arc::clone(&model), cfg.clone()).label_texts(&labels, &cfg).unwrap();
     let (scale, bias) = model.logit_scale_bias();
     let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
     let shots: Vec<(Scene, Shot)> = scenes().iter().map(|s| (s.clone(), shoot(&mut bases, s))).collect();
     drop(bases);
-    println!("[MLP] 장치 {} · SigLIP2 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_ml::device_label(&dev), model.quant_plan().tag, shots.len(), t0.elapsed().as_secs_f32());
+    println!("[MLP] 장치 {} · SigLIP2 {} · 키프레임 {}개 · 렌더 {:.0} s", noto_runtime::ml_bridge::device_label(&dev), model.quant_plan().tag, shots.len(), t0.elapsed().as_secs_f32());
 
     let arm_cfg = |name: &str| -> Option<PerforatedCfg> {
         let x = |pattern| PerforatedCfg { pattern, expand: Some(ExpandCfg::default()) };
@@ -1817,7 +1815,7 @@ fn ml_perforated() {
                     None => {
                         let d = model.embed_dense_batch_grid(&[image], cfg.grid).unwrap().pop().unwrap();
                         let n = d.grid_h * d.grid_w;
-                        (label_heats(&d, &texts, &cfg, scale, bias), noto_vision::PerfReport { cells: n, first: n, seeds: 0, opened: 0, tokens_run: n })
+                        (label_heats(&d, &texts, &cfg, scale, bias), noto_runtime::vision_compat::PerfReport { cells: n, first: n, seeds: 0, opened: 0, tokens_run: n })
                     }
                     Some(p) => perforated_heats(&model, &image, &texts, &cfg, p, Some(&shot.intr), scale, bias).unwrap(),
                 };
@@ -1878,9 +1876,9 @@ fn ml_perforated() {
         let (_, rp, _, _) = b.rank("presence");
         let (_, fp, fpos, fnn) = b.rank("far_small_peak");
         let ece = match (b.pairs.get("peak_fit"), b.pairs.get("peak_eval")) {
-            (Some((fs, fh)), Some((es, eh))) => noto_vision::calib::platt_fit(fs, fh).and_then(|(a, c)| {
+            (Some((fs, fh)), Some((es, eh))) => noto_runtime::vision_compat::calib::platt_fit(fs, fh).and_then(|(a, c)| {
                 let probs: Vec<f32> = es.iter().map(|s| 1.0 / (1.0 + (-(a * s + c)).exp())).collect();
-                noto_vision::calib::ece(&probs, eh, noto_vision::calib::ECE_BINS)
+                noto_runtime::vision_compat::calib::ece(&probs, eh, noto_runtime::vision_compat::calib::ECE_BINS)
             }),
             _ => None,
         };
@@ -1917,10 +1915,9 @@ fn ml_stage_times() {
     let dev = device();
     let sig_dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
     let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
-    let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
-    let siglip = Arc::new(noto_ml::Siglip2::load(&sig_dir, &dev).expect("SigLIP2"));
+    let siglip = Arc::new(noto_runtime::ml_bridge::Siglip2::load(&sig_dir, &dev).expect("SigLIP2"));
     let steps: usize = env_list("MLST_STEPS", &[12usize])[0];
-    // `MLST_TRACKERS=sam,region,region_clamp`: the mask tracker each pass runs with.
+    // `MLST_TRACKERS=stereo_fast,stereo_grasp,region,region_clamp`: the mask tracker each pass runs with.
     let trackers: Vec<String> = std::env::var("MLST_TRACKERS").unwrap_or_else(|_| "region,region_clamp".into()).split(',').map(|x| x.trim().to_string()).collect();
     for tracker in &trackers {
     let mut book: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -1928,7 +1925,8 @@ fn ml_stage_times() {
         let mut rt = Runtime::new(RuntimeConfig { seed: 7, noise: NoiseCfg::none(), ..RuntimeConfig::default() }, LEX, None).expect("runtime");
         rt.use_tips(&tips_dir, &dev).expect("TIPS");
         match tracker.as_str() {
-            "sam" => rt.use_sam(&sam_dir, &dev).expect("SAM"),
+            "stereo_fast" => rt.use_stereo_fast_tick(),
+            "sam" | "stereo_grasp" => rt.use_stereo_metric_grasp(),
             "region" => rt.use_region_tracker(),
             _ => rt.use_region_tracker_clamped(),
         }
@@ -1981,26 +1979,17 @@ fn ml_stage_times() {
 #[ignore]
 fn ml_device_split() {
     let dev = device();
-    let sam_dir = PathBuf::from(std::env::var("SAM_DIR").expect("SAM_DIR"));
     let tips_dir = PathBuf::from(std::env::var("TIPS_DIR").expect("TIPS_DIR"));
     let mut bases: BTreeMap<(u64, u8, u8), World> = BTreeMap::new();
     let scene = scenes().into_iter().find(|s| s.target == Some("log") && s.dist_m == 4.0).unwrap();
     let shot = shoot(&mut bases, &scene);
     for (name, d) in [("gpu", dev.clone()), ("cpu", candle_core::Device::Cpu)] {
-        let sam = noto_vision::SamModel::load(&sam_dir, &d).expect("SAM");
-        let mut ms = Vec::new();
-        for _ in 0..3 {
-            let t = std::time::Instant::now();
-            let _ = sam.encode_batch(&[&shot.rgb]).expect("encode");
-            ms.push(t.elapsed().as_secs_f64() * 1e3);
-        }
-        println!("[MLDEV] SAM 인코더 {name} ({}): {:.0} · {:.0} · {:.0} ms", noto_ml::device_label(&d), ms[0], ms[1], ms[2]);
-        let mut tips = TipsDepth::load_with(&tips_dir, &d, noto_vision::SceneHeads::ALL).expect("TIPS");
-        tips.set_pyramid(Some(&noto_vision::PyramidCfg::default()));
+        let mut tips = TipsDepth::load_with(&tips_dir, &d, noto_runtime::vision_compat::SceneHeads::ALL).expect("TIPS");
+        tips.set_pyramid(Some(&noto_runtime::vision_compat::PyramidCfg::default()));
         let mut ms = Vec::new();
         for _ in 0..2 {
             let t = std::time::Instant::now();
-            let _ = tips.infer_scene(&shot.rgb, noto_vision::SceneHeads::ALL).expect("tips");
+            let _ = tips.infer_scene(&shot.rgb, noto_runtime::vision_compat::SceneHeads::ALL).expect("tips");
             ms.push(t.elapsed().as_secs_f64() * 1e3);
         }
         println!("[MLDEV] TIPSv2 깊이 · 분할 · 법선 {name}: {:.0} · {:.0} ms", ms[0], ms[1]);
@@ -2018,9 +2007,9 @@ fn ml_scan_dense() {
     let t0 = std::time::Instant::now();
     let dev = device();
     let lex = Lexicon::from_json(LEX).unwrap();
-    let sig = Arc::new(noto_ml::Siglip2::load(&PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR")), &dev).expect("SigLIP2"));
+    let sig = Arc::new(noto_runtime::ml_bridge::Siglip2::load(&PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR")), &dev).expect("SigLIP2"));
     let phrases = noto_runtime::BankedPhrases::new(Arc::clone(&sig), None);
-    let image: Arc<dyn noto_ml::ImageEmbedder + Send + Sync> = sig.clone();
+    let image: Arc<dyn noto_runtime::ml_bridge::ImageEmbedder + Send + Sync> = sig.clone();
     let m = Arc::clone(&sig);
     let calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync> = Arc::new(move |c| m.pair_probability(c));
     let arm = |dense: DenseTileCfg| EmbeddingPerception::new_with(&lex, &phrases, Arc::clone(&image), Arc::clone(&calibrate), "gpu", EmbeddingCfg { dense, ..EmbeddingCfg::default() }, None).unwrap();
@@ -2068,10 +2057,10 @@ fn ml_scan_dense() {
 #[test]
 #[ignore]
 fn ml_vocab_check() {
-    use noto_ml::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
+    use noto_runtime::ml_bridge::{LoadOpts, QuantPlan, Siglip2, VocabPolicy};
     let dev = device();
     let dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
-    let dict = noto_ml::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
+    let dict = noto_runtime::ml_bridge::Dictionary::from_json(include_str!("../../../data/logistics_dictionary.json")).unwrap();
     let mut texts = noto_runtime::vocab_texts(LEX, Some(&dict)).unwrap();
     let primed = texts.len();
     let commands = ["원목 3개를 창고로 가져와 주세요", "택배 상자를 베이스캠프에 내려놔", "bring two logs to the warehouse", "철광석을 찾아서 캐 와줘", "빨간 지게차 옆 팔레트로 가"];
@@ -2105,13 +2094,13 @@ fn ml_vocab_check() {
 fn the_engine_never_names_an_ml_benchmark_source() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let engine = [
-        "crates/noto-vision/src/align.rs",
-        "crates/noto-vision/src/calib.rs",
-        "crates/noto-vision/src/locate.rs",
-        "crates/noto-vision/src/tips.rs",
-        "crates/noto-vision/src/depth.rs",
-        "crates/noto-vision/src/decide.rs",
-        "crates/noto-ml/src/vision.rs",
+        "crates/noto-runtime/src/vision_compat/mod.rs",
+        "crates/noto-runtime/src/vision_compat/locate.rs",
+        "crates/noto-runtime/src/vision_compat/tips.rs",
+        "crates/noto-runtime/src/vision_compat/decide.rs",
+        "crates/noto-runtime/src/vision_compat/stairs.rs",
+        "crates/noto-runtime/src/stereo.rs",
+        "crates/noto-runtime/src/ml_bridge/vision.rs",
         "crates/noto-search/src/vision.rs",
         "crates/noto-runtime/src/ml.rs",
         "crates/noto-runtime/src/mlsds.rs",
@@ -2119,7 +2108,7 @@ fn the_engine_never_names_an_ml_benchmark_source() {
         "crates/noto-runtime/src/precision.rs",
         "crates/noto-runtime/src/perception.rs",
         "crates/noto-runtime/src/runtime.rs",
-        "crates/noto-ml/src/model.rs",
+        "crates/noto-runtime/src/ml_bridge/model.rs",
         "data/world_lexicon.json",
         "data/ml_calib.json",
     ];

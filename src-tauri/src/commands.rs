@@ -8,8 +8,8 @@ use noto_data::schema::{
     TABLE_SAMPLES, TABLE_TACTILE, TABLE_VISION,
 };
 use noto_data::{dictionary_batch, random_scene, simulate_scene, LanceStore};
-use noto_ml::classify::{classify, Prediction};
-use noto_ml::{Backend, BackendStatus, DictEntry, Dictionary};
+use noto_runtime::ml_bridge::classify::{classify, Prediction};
+use noto_runtime::ml_bridge::{Backend, BackendStatus, DictEntry, Dictionary};
 use serde::Serialize;
 use tauri::State;
 

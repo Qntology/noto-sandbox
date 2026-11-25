@@ -17,7 +17,7 @@ use noto_core::math::Vec3;
 use noto_core::sim::ShapeKind;
 use noto_core::tactile::{contact_probability, pad_geometry_mapped, TactileCfg};
 use noto_core::{BaseKind, NotoConfig};
-use noto_vision::egoexo::{fuse, inv3, occlusion_ratio, stereo_sigma_z, view_covariance, ViewObs};
+use noto_runtime::vision_compat::egoexo::{fuse, inv3, occlusion_ratio, stereo_sigma_z, view_covariance, ViewObs};
 use world_sim::render::{render_boxes_only, render_rays, Exposure, Obb, Rays, View, NEUTRAL_BG};
 use world_sim::world::DropItem;
 use world_sim::{Action, Camera, Frame, ItemKind, World, WorldConfig};

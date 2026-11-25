@@ -1,9 +1,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use noto_sds::{DriftState, Scope, SdsStore, Track, Window};
-use noto_ts::ttm::TtmForecaster;
-use noto_ts::{
+use crate::sds::{DriftState, Scope, SdsStore, Track, Window};
+use crate::ts::ttm::TtmForecaster;
+use crate::ts::{
     forecast, forecast_with_prior, temporal_verdict, Cusum, ErrBook, Forecast, GateBand, HistoryMse, PendingRing,
     Predictor, PredictorRegistry, TemporalOutcome, TemporalVerdict, TtmPredictor,
 };
@@ -378,7 +378,7 @@ impl PrecisionGates {
         self.registry.remove_by_id("ttm");
         if let Some(t) = &ttm {
             let p = TtmPredictor(t.as_ref());
-            let _ = self.registry.register(noto_ts::PredictorSpec {
+            let _ = self.registry.register(crate::ts::PredictorSpec {
                 id: "ttm".into(),
                 rev: t.fp8().to_string(),
                 caps: p.caps(),
@@ -559,7 +559,7 @@ impl PrecisionGates {
                 } else {
                     let sd = est.se * est.n_eff.max(1.0).sqrt();
                     let pred = if (self.cfg.adaptive_k - 2.0).abs() < 0.05 {
-                        noto_sds::estimate::pred_lower(est.value, sd, est.n_eff, 0.0228)
+                        crate::sds::estimate::pred_lower(est.value, sd, est.n_eff, 0.0228)
                     } else {
                         est.value - self.cfg.adaptive_k * sd * (1.0 + 1.0 / est.n_eff.max(1.0)).sqrt()
                     };

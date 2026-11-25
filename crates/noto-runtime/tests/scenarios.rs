@@ -327,7 +327,7 @@ fn logs_are_chained_on_disk_and_the_ledgers_are_written() {
             assert!(cats.contains(c), "category {c} missing in {cats:?}");
         }
     }
-    let ok = noto_sds::verify_file(&path).expect("the hash chain verifies");
+    let ok = noto_runtime::sds::verify_file(&path).expect("the hash chain verifies");
     assert!(ok.lines > 20, "{} lines", ok.lines);
     let ledgers: Vec<_> = std::fs::read_dir(dir.join("sds")).map(|d| d.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect()).unwrap_or_default();
     assert!(ledgers.iter().any(|f| f.ends_with(".json")), "SDS files: {ledgers:?}");

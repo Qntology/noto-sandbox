@@ -15,10 +15,11 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 noto-core = { path = "../crates/noto-core" }
-noto-ml = { path = "../crates/noto-ml" }
 noto-data = { path = "../crates/noto-data" }
 noto-runtime = { path = "../crates/noto-runtime" }
-noto-vision = { path = "../crates/noto-vision" }
+lv-core = { workspace = true }
+lv-spatial = { workspace = true }
+premium-discount-manifest = { workspace = true }
 candle-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
@@ -31,7 +32,7 @@ sha2 = "0.10"
 
 [features]
 default = []
-cuda = ["noto-ml/cuda", "noto-runtime/cuda"]
-metal = ["noto-ml/metal", "noto-runtime/metal"]
-vulkan = ["noto-ml/vulkan", "noto-runtime/vulkan"]
-rocm = ["noto-ml/rocm", "noto-runtime/rocm"]
+cuda = ["noto-runtime/cuda", "lv-core/cuda"]
+metal = ["noto-runtime/metal", "lv-core/metal"]
+vulkan = ["noto-runtime/vulkan", "lv-core/vulkan"]
+rocm = ["noto-runtime/rocm", "lv-core/rocm"]

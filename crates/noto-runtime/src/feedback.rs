@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use noto_sds::{classify, DriftState, Provenance, Scope, SdsEstimate, SdsStore, Track, Window};
+use crate::sds::{classify, DriftState, Provenance, Scope, SdsEstimate, SdsStore, Track, Window};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -181,6 +181,7 @@ pub struct FeedbackHub {
     mode: SdsMode,
     frozen: Option<SdsStore>,
     records: Mutex<BTreeMap<FeedbackPath, FeedbackRecord>>,
+    last_seen: Mutex<BTreeMap<(FeedbackPath, String), (Mode, Option<f64>)>>,
     pending_changes: Mutex<Vec<FeedbackChange>>,
 }
 
@@ -196,6 +197,7 @@ impl FeedbackHub {
             mode: SdsMode::default(),
             frozen: None,
             records: Mutex::new(BTreeMap::new()),
+            last_seen: Mutex::new(BTreeMap::new()),
             pending_changes: Mutex::new(Vec::new()),
         }
     }
@@ -256,25 +258,39 @@ impl FeedbackHub {
         Some(prov)
     }
 
-    fn record_use(&self, path: FeedbackPath, prov: Provenance, val: Option<f64>, key: Option<String>, n: u64, tick: u64) {
+    fn query_tag(scope: &Scope, axis: &str) -> String {
+        format!("{}|{}|{}::{axis}", scope.track.as_str(), scope.primary, scope.secondary)
+    }
+
+    fn record_use(&self, path: FeedbackPath, query: &str, prov: Provenance, val: Option<f64>, key: Option<String>, n: u64, tick: u64) {
         let mode = self.effective_mode(path);
         let level = key.as_deref().map(|k| scope_level(k).to_string());
         let mut changed = false;
-        if let Ok(mut map) = self.records.lock() {
-            if let Some(prev) = map.get(&path) {
-                let v_diff = match (prev.value, val) {
+        if let Ok(mut seen) = self.last_seen.lock() {
+            let slot = (path, query.to_string());
+            if let Some((prev_mode, prev_val)) = seen.get(&slot) {
+                let v_diff = match (*prev_val, val) {
                     (Some(a), Some(b)) => (a - b).abs() > 1e-6,
                     (None, None) => false,
                     _ => true,
                 };
-                changed = v_diff || prev.mode != mode || prev.key != key;
+                changed = v_diff || *prev_mode != mode;
             } else if val.is_some() {
                 changed = true;
             }
-            map.insert(
-                path,
-                FeedbackRecord { path, mode, value: val, key: key.clone(), level, n, last_tick: tick, provenance: prov },
-            );
+            if seen.len() < 4096 || seen.contains_key(&slot) {
+                seen.insert(slot, (mode, val));
+            }
+        }
+        if let Ok(mut map) = self.records.lock() {
+            let update = val.is_some()
+                || map.get(&path).is_none_or(|p| p.mode != mode || p.value.is_none());
+            if update {
+                map.insert(
+                    path,
+                    FeedbackRecord { path, mode, value: val, key: key.clone(), level, n, last_tick: tick, provenance: prov },
+                );
+            }
         }
         if changed {
             if let Ok(mut q) = self.pending_changes.lock() {
@@ -287,14 +303,15 @@ impl FeedbackHub {
 
     pub fn baseline_scoped(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, tick: u64) -> Option<((f64, f64, u64), String)> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.adaptive_baseline_scoped(scope, axis);
         match &got {
-            Some(((m, _, n), k)) => self.record_use(path, prov, Some(*m), Some(k.clone()), *n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(((m, _, n), k)) => self.record_use(path, &qtag, prov, Some(*m), Some(k.clone()), *n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
@@ -305,28 +322,30 @@ impl FeedbackHub {
 
     pub fn agreement_scoped(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, tick: u64) -> Option<((f64, u64), String)> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.agreement_rate_scoped(scope, axis);
         match &got {
-            Some(((r, n), k)) => self.record_use(path, prov, Some(*r), Some(k.clone()), *n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(((r, n), k)) => self.record_use(path, &qtag, prov, Some(*r), Some(k.clone()), *n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
 
     pub fn calibration(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, tick: u64) -> Option<(f64, u64, f64, String)> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.calibration_factor(scope, axis);
         match &got {
-            Some((f, n, _, k)) => self.record_use(path, prov, Some(*f), Some(k.clone()), *n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some((f, n, _, k)) => self.record_use(path, &qtag, prov, Some(*f), Some(k.clone()), *n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
@@ -338,56 +357,60 @@ impl FeedbackHub {
 
     pub fn estimate_mean(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, window: Window, tick: u64) -> Option<SdsEstimate> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.estimate_mean(scope, axis, window, 0.95);
         match &got {
-            Some(est) => self.record_use(path, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(est) => self.record_use(path, &qtag, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
 
     pub fn estimate_rate(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, window: Window, tick: u64) -> Option<SdsEstimate> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.estimate_rate(scope, axis, window, 0.95);
         match &got {
-            Some(est) => self.record_use(path, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(est) => self.record_use(path, &qtag, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
 
     pub fn estimate_spread(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, window: Window, tick: u64) -> Option<SdsEstimate> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.estimate_spread(scope, axis, window, 0.95);
         match &got {
-            Some(est) => self.record_use(path, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(est) => self.record_use(path, &qtag, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
 
     pub fn estimate_factor(&self, path: FeedbackPath, live: &SdsStore, scope: &Scope, axis: &str, window: Window, tick: u64) -> Option<SdsEstimate> {
         let prov = Self::guard_provenance(scope, axis)?;
+        let qtag = Self::query_tag(scope, axis);
         let Some(store) = self.store_for(path, live) else {
-            self.record_use(path, prov, None, None, 0, tick);
+            self.record_use(path, &qtag, prov, None, None, 0, tick);
             return None;
         };
         let got = store.estimate_factor(scope, axis, window, 0.95);
         match &got {
-            Some(est) => self.record_use(path, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
-            None => self.record_use(path, prov, None, None, 0, tick),
+            Some(est) => self.record_use(path, &qtag, prov, Some(est.value), Some(est.key.clone()), est.n, tick),
+            None => self.record_use(path, &qtag, prov, None, None, 0, tick),
         }
         got
     }
@@ -523,5 +546,21 @@ mod tests {
         let fb = FeedbackHub::live();
         let scope = Scope::new(Track::Balance, concat!("nn", ":s4"), "brake_1.0");
         let _ = fb.baseline(FeedbackPath::F, &sds, &scope, "score", 1);
+    }
+
+    #[test]
+    fn polling_multiple_scopes_on_one_path_does_not_spam_changes() {
+        let mut sds = SdsStore::memory();
+        let scope = Scope::new(Track::Forecast, "world", "");
+        for _ in 0..10 {
+            sds.record_baseline(&scope, "fusion_mse:holt", 0.02);
+        }
+        let fb = FeedbackHub::live();
+        for tick in 1..=10u64 {
+            assert!(fb.fusion_mse(FeedbackPath::C, &sds, &scope, "holt", tick).is_some());
+            assert!(fb.fusion_mse(FeedbackPath::C, &sds, &scope, "ttm", tick).is_none());
+        }
+        assert_eq!(fb.drain_changes().len(), 1);
+        assert!(fb.values_at_start()["C"].is_some());
     }
 }

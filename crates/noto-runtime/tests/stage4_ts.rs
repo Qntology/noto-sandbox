@@ -67,7 +67,7 @@ fn a_long_carry_keeps_nn_and_wear_samples() {
     assert!(nn_max >= 10, "expected >= 10 nn.score dwell samples over 620 ticks, got {nn_max}");
 
     // Verify 50-tick dwell resamples did NOT inflate SDS transition score count.
-    let s1_slope = noto_sds::Scope::new(noto_sds::Track::Balance, "nn:S1", "slope");
+    let s1_slope = noto_runtime::sds::Scope::new(noto_runtime::sds::Track::Balance, "nn:S1", "slope");
     if let Some((_, _, n)) = rt.sds().exact_baseline(&s1_slope, "score") {
         assert!(n <= 4, "50-tick dwell resamples must NOT inflate SDS transition score n (got {n})");
     }

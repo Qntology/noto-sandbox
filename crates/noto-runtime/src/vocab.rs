@@ -1,16 +1,16 @@
-//! The texts the SigLIP2 token table is primed with (`noto_ml::Siglip2::prime_vocab`): what the engine embeds at
+//! The texts the SigLIP2 token table is primed with (`crate::ml_bridge::Siglip2::prime_vocab`): what the engine embeds at
 //! start-up and the endings commands end with, so the rows a session needs are on the device before its first phrase.
 //! Any other text (a free-form command) still embeds: its rows come from the mapped checkpoint the first time.
 
 use anyhow::Result;
 use noto_search::{Lexicon, VisionPrompting};
-use noto_vision::locate::apply_template;
+use crate::vision_compat::locate::apply_template;
 use serde_json::Value;
 
 /// Every string of the world lexicon (names, aliases, phrases, quantities), the prompt templates applied to the
 /// lexicon's vision phrases and the background classes, the logistics dictionary's prompts and labels, and the Korean
 /// command endings (`noto_search::tails`). Sorted, without duplicates.
-pub fn vocab_texts(lexicon_json: &str, dictionary: Option<&noto_ml::Dictionary>) -> Result<Vec<String>> {
+pub fn vocab_texts(lexicon_json: &str, dictionary: Option<&crate::ml_bridge::Dictionary>) -> Result<Vec<String>> {
     let mut out = Vec::new();
     collect_strings(&serde_json::from_str::<Value>(lexicon_json)?, &mut out);
     let lex = Lexicon::from_json(lexicon_json)?;
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn the_priming_texts_cover_what_the_engine_embeds() {
-        let dict = noto_ml::Dictionary::from_json(DICT).unwrap();
+        let dict = crate::ml_bridge::Dictionary::from_json(DICT).unwrap();
         let texts = vocab_texts(LEX, Some(&dict)).unwrap();
         let has = |s: &str| texts.binary_search(&s.to_string()).is_ok();
         let lex = Lexicon::from_json(LEX).unwrap();

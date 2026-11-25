@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use noto_core::balance::{reference, Source};
-use noto_sds::{BalanceRow, DriftState, Facet, KeyframeRow, Level, NnPhaseRow, QuestRun, Scope, ScopeKey, StepRecord, Track, Window};
-use noto_vision::{features, flags, FlagCfg, FusionInput, Rgb, Sighting};
+use crate::sds::{BalanceRow, DriftState, Facet, KeyframeRow, Level, NnPhaseRow, QuestRun, Scope, ScopeKey, StepRecord, Track, Window};
+use crate::vision_compat::{features, flags, FlagCfg, FusionInput, Rgb, Sighting};
 use serde_json::json;
 use world_sim::encode_webp;
 
@@ -22,6 +22,24 @@ fn default_floor(mode: &str) -> f32 {
 
 fn is_stand_in(mode: &str) -> bool {
     mode.starts_with("stand-in")
+}
+
+fn point_margin(
+    points: &[crate::vision_compat::SemanticPoint],
+    p: &crate::vision_compat::SemanticPoint,
+) -> f32 {
+    let Some((c, r, peak)) = p.heat.argmax() else {
+        return 0.0;
+    };
+    let other = points
+        .iter()
+        .filter(|q| q.label != p.label && c < q.heat.cols && r < q.heat.rows)
+        .map(|q| {
+            let v = q.heat.values[(r * q.heat.cols + c) as usize];
+            if v.is_finite() { v } else { 0.0 }
+        })
+        .fold(0.0f32, f32::max);
+    peak - other
 }
 
 /// Predictive z-score `(x - m) / (s * sqrt(1 + 1/n_e))` with resolved observation count, key, and `thin` flag.
@@ -95,7 +113,7 @@ impl Runtime {
                     .filter(|est| !(matches!(est.state, DriftState::Shifted { .. }) && (est.window != Window::Span || est.n_eff < 4.0)))
                     .map(|est| {
                         let sd = est.se * est.n_eff.max(1.0).sqrt();
-                        noto_sds::estimate::pred_lower(est.value, sd, est.n_eff, 0.0228) as f32
+                        crate::sds::estimate::pred_lower(est.value, sd, est.n_eff, 0.0228) as f32
                     });
                 let f = learned.unwrap_or(floor_default).max(floor_default.min(0.2));
                 (l.clone(), f)
@@ -155,7 +173,7 @@ impl Runtime {
             }
             if let Some(p) = &point {
                 sds.record_baseline(&lscope, "score", p.score as f64);
-                sds.record_baseline(&lscope, "margin", p.margin as f64);
+                sds.record_baseline(&lscope, "margin", point_margin(&frame.points, p) as f64);
                 sds.record_baseline(&lscope, "presence", p.presence as f64);
                 if let Some(e) = frame.locate_err_px {
                     sds.record_baseline(&lscope, "err_px", e as f64);
@@ -179,7 +197,7 @@ impl Runtime {
             keyframe: kf.index,
             pose: kf.pose,
             heading: t.heading,
-            sigma: noto_vision::centroid_sigma(kf.intr.width, kf.intr.fov_deg, 2.0),
+            sigma: crate::vision_compat::centroid_sigma(kf.intr.width, kf.intr.fov_deg, 2.0),
             extent: target_track.map_or(0.0, |m| (kf.intr.relative_bearing(&kf.pose, m.bbox[2], m.cy) - kf.intr.relative_bearing(&kf.pose, m.bbox[0], m.cy)).abs()),
             depth_range_m: t.depth_range_m,
             track_id: t.track_id,
@@ -202,7 +220,7 @@ impl Runtime {
         let fscope = Scope::new(Track::Fusion, &label, "");
         let mut zmax = 0.0f64;
         let mut zmax_det: Option<(u64, String)> = None;
-        let num_feats = noto_vision::fusion::numeric(&feats);
+        let num_feats = crate::vision_compat::fusion::numeric(&feats);
         for &(axis, x) in &num_feats {
             if let Some((z, n, key, _)) = z_detail(self, &fscope, axis, x) {
                 if z.abs() > zmax.abs() {
@@ -236,7 +254,19 @@ impl Runtime {
             locate_mode: lmode.clone(),
             track_mode: tmode.clone(),
             depth_metrics: frame.depth_metrics,
-            points: frame.points.iter().filter(|p| wanted.contains(&p.label) || p.score > 0.5).map(|p| PointView { label: p.label.clone(), x: p.px / w, y: p.py / h, score: p.score, margin: p.margin, presence: p.presence }).collect(),
+            points: frame
+                .points
+                .iter()
+                .filter(|p| wanted.contains(&p.label) || p.score > 0.5)
+                .map(|p| PointView {
+                    label: p.label.clone(),
+                    x: p.px / w,
+                    y: p.py / h,
+                    score: p.score,
+                    margin: point_margin(&frame.points, p),
+                    presence: p.presence,
+                })
+                .collect(),
             tracks: frame
                 .tracks
                 .iter()
@@ -255,7 +285,7 @@ impl Runtime {
             track_iou_truth: frame.track_iou_truth,
             features: feats,
             flags: fl,
-            pyramid: frame.pyramid,
+            pyramid: frame.pyramid.clone(),
             stage_ms: frame.stage_ms,
         };
         let ov = overlay(&frame, kf.intr.width, kf.intr.height, wanted);
@@ -842,7 +872,7 @@ impl Runtime {
             time_s: r.as_ref().map_or(0.0, |r| r.time_s),
             energy_j: r.as_ref().map_or(0.0, |r| r.energy_j),
             steps: steps.clone(),
-            created_ms: noto_sds::store::now_ms(),
+            created_ms: crate::sds::store::now_ms(),
             generation,
             ledger_digest,
             sds_mode,
@@ -860,7 +890,7 @@ impl Runtime {
         }
         let stat = {
             self.db.record_run(run);
-            self.db.stat(&self.pass, kind, &target, &self.world.cfg.body.id(), noto_sds::WHOLE_QUEST).cloned()
+            self.db.stat(&self.pass, kind, &target, &self.world.cfg.body.id(), crate::sds::WHOLE_QUEST).cloned()
         };
         if let Some(st) = stat {
             let msg = format!("[{}] {kind} {target}: 성공 {}/{} ({:.0}%) · 프리셋 {}", self.pass, st.successes, st.attempts, st.rate * 100.0, st.preset);

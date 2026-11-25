@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use noto_ml::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
+use noto_runtime::ml_bridge::{probe_backends, Anchors, Backend, BackendStatus, Dictionary, Selection, Siglip2};
 use noto_runtime::{Runtime, RuntimeConfig};
 use serde_json::{json, Value};
 
@@ -50,7 +50,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let startup = noto_ml::preferred();
+        let startup = noto_runtime::ml_bridge::preferred();
         AppState {
             device: Mutex::new((startup.backend, startup.ordinal)),
             startup,
@@ -142,10 +142,10 @@ impl AppState {
 
     pub fn prefer_gpu(&self) -> bool {
         let (backend, _) = self.selected();
-        if backend != Backend::Cpu || std::env::var(noto_ml::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
+        if backend != Backend::Cpu || std::env::var(noto_runtime::ml_bridge::device::DEVICE_ENV).is_ok_and(|v| v.trim().eq_ignore_ascii_case("cpu")) {
             return false;
         }
-        let picked = noto_ml::device::select(None);
+        let picked = noto_runtime::ml_bridge::device::select(None);
         if picked.backend == Backend::Cpu {
             return false;
         }
@@ -301,17 +301,10 @@ pub fn ttm_download_dir() -> PathBuf {
 }
 
 pub fn tips_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("TIPS_DIR") {
+    if let Ok(p) = std::env::var(lv_spatial::tips::DIR_ENV) {
         return PathBuf::from(p);
     }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("tipsv2-b14-dpt")
-}
-
-pub fn sam_dir() -> PathBuf {
-    if let Ok(p) = std::env::var(noto_vision::sam::DIR_ENV) {
-        return PathBuf::from(p);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("models").join("sam")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join(lv_spatial::tips::DEFAULT_DIR)
 }
 
 pub fn bank_dir() -> PathBuf {

@@ -1,6 +1,6 @@
 use noto_data::test_tables::{write_mirror, write_ts_samples, TsSampleEntry, TABLE_BALANCE_EFFORT, TABLE_ML_KEYFRAMES, TABLE_NN_PHASES, TABLE_QUEST_RUNS, TABLE_QUEST_STATS, TABLE_QUEST_STEPS, TABLE_TS_SAMPLES};
 use noto_data::LanceStore;
-use noto_sds::{BalanceRow, KeyframeRow, NnPhaseRow, QuestRun, StepRecord, TestDb};
+use noto_quest::records::{BalanceRow, KeyframeRow, NnPhaseRow, QuestRun, StepRecord, TestDb};
 
 fn run(pass: &str, ok: bool) -> QuestRun {
     QuestRun {

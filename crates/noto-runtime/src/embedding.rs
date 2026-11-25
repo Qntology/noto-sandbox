@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
-use noto_ml::parallel::{aligned_tile_grids, embed_frame_tiles, pool_dense_tiles, BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};
-use noto_ml::preprocess::{pyramid_grid, DenseGrid, PYRAMID_SHORT_SIDE};
-use noto_ml::Siglip2;
+use crate::ml_bridge::parallel::{aligned_tile_grids, embed_frame_tiles, pool_dense_tiles, BatchOpts, ImageEmbedder, PhraseBank, TextEmbedder, Tile};
+use crate::ml_bridge::preprocess::{pyramid_grid, DenseGrid, PYRAMID_SHORT_SIDE};
+use crate::ml_bridge::Siglip2;
 use noto_search::semantic::PhraseEmbedder;
 use noto_search::vision::EntityScore;
 use noto_search::{Lexicon, VisionBank};
@@ -129,7 +129,7 @@ pub struct EmbeddingPerception {
     calibrate: Arc<dyn Fn(f32) -> f32 + Send + Sync>,
     cfg: EmbeddingCfg,
     device: String,
-    calib: Option<noto_vision::CalibTable>,
+    calib: Option<crate::vision_compat::CalibTable>,
 }
 
 impl EmbeddingPerception {
@@ -157,11 +157,11 @@ impl EmbeddingPerception {
         Ok(EmbeddingPerception { image, bank, table: EntityTable::from_lexicon(lex), calibrate, cfg, device: device.to_string(), calib: None })
     }
 
-    pub fn set_calibration(&mut self, table: Option<noto_vision::CalibTable>) {
+    pub fn set_calibration(&mut self, table: Option<crate::vision_compat::CalibTable>) {
         self.calib = table;
     }
 
-    pub fn calibration(&self) -> Option<&noto_vision::CalibTable> {
+    pub fn calibration(&self) -> Option<&crate::vision_compat::CalibTable> {
         self.calib.as_ref()
     }
 
@@ -179,7 +179,7 @@ impl EmbeddingPerception {
 
     pub fn siglip_with(model: Arc<Siglip2>, lex: &Lexicon, bank_dir: Option<&Path>, cfg: EmbeddingCfg, prompting: Option<&noto_search::VisionPrompting>) -> Result<EmbeddingPerception> {
         let phrases = BankedPhrases::new(Arc::clone(&model), bank_dir);
-        let device = noto_ml::device_label(model.device());
+        let device = crate::ml_bridge::device_label(model.device());
         let m = Arc::clone(&model);
         EmbeddingPerception::new_with(lex, &phrases, model, Arc::new(move |c| m.pair_probability(c)), &device, cfg, prompting)
     }
@@ -194,7 +194,7 @@ impl EmbeddingPerception {
         if !self.cfg.dense.enabled {
             return self.cfg.grids.clone();
         }
-        let (rows, cols) = pyramid_grid(width, height, PYRAMID_SHORT_SIDE, noto_ml::Siglip2Config::default().max_patches);
+        let (rows, cols) = pyramid_grid(width, height, PYRAMID_SHORT_SIDE, crate::ml_bridge::Siglip2Config::default().max_patches);
         aligned_tile_grids(&self.cfg.grids, cols as u32, rows as u32)
     }
 
@@ -247,7 +247,7 @@ impl Recognizer for EmbeddingPerception {
         let hv = input.world.head_view(input.camera);
         let view = hv.est;
         let sc = TileScene { frame: f, camera: input.camera, view: &view, ground_y: view.origin[1] - hv.eye_m };
-        let all = noto_ml::parallel::tile_layout(dw, dh, &self.tile_grids(dw, dh), self.cfg.overlap);
+        let all = crate::ml_bridge::parallel::tile_layout(dw, dh, &self.tile_grids(dw, dh), self.cfg.overlap);
         let (tiles, mut filter) = roi_tiles(&all, &sc, &self.cfg.roi);
         let t0 = Instant::now();
         let vecs = if self.cfg.dense.enabled { self.dense_tiles(&img, &tiles)? } else { embed_frame_tiles(&*self.image, &[(&img, &tiles)])?.pop().unwrap_or_default() };
@@ -659,7 +659,7 @@ mod tests {
     fn a_tile_that_names_the_tree_becomes_a_candidate_on_the_tree() {
         let (w, cam) = world_with_tree_ahead();
         let f = w.render(&cam);
-        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2), (4, 3)], 0.15);
+        let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2), (4, 3)], 0.15);
         let table = EntityTable::from_lexicon(&lexicon());
         let hit = tile_with_most(&tiles, &f, &w, "tree");
         let scores: Vec<Vec<EntityScore>> =
@@ -683,7 +683,7 @@ mod tests {
     fn overlapping_tiles_of_one_label_merge_and_a_rival_label_on_the_same_tree_folds_in() {
         let (w, cam) = world_with_tree_ahead();
         let f = w.render(&cam);
-        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.5);
+        let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.5);
         let table = EntityTable::from_lexicon(&lexicon());
         let hit = tile_with_most(&tiles, &f, &w, "tree");
         let scores: Vec<Vec<EntityScore>> = (0..tiles.len())
@@ -710,7 +710,7 @@ mod tests {
     fn tiles_below_the_report_floor_say_nothing() {
         let (w, cam) = world_with_tree_ahead();
         let f = w.render(&cam);
-        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2)], 0.0);
+        let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &[(2, 2)], 0.0);
         let table = EntityTable::from_lexicon(&lexicon());
         let scores: Vec<Vec<EntityScore>> = tiles.iter().map(|_| vec![score("tree", 0.09)]).collect();
         let (cands, _) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &EmbeddingCfg::default()));
@@ -721,7 +721,7 @@ mod tests {
     fn sky_and_far_tiles_are_left_out_before_they_are_embedded() {
         let (w, cam) = world_with_tree_ahead();
         let f = w.render(&cam);
-        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &EmbeddingCfg::default().grids, 0.15);
+        let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &EmbeddingCfg::default().grids, 0.15);
         with_scene(&w, &f, &cam, |sc| {
             let (kept, filter) = roi_tiles(&tiles, sc, &RoiCfg::default());
             assert!(filter.skipped_sky > 0, "the top row of tiles is sky: {filter:?}");
@@ -743,7 +743,7 @@ mod tests {
         let probe = |kind: NodeKind, label: &str| {
             let (w, cam) = world_with_ahead(kind, 2.6);
             let f = w.render(&cam);
-            let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
+            let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
             let hit = tile_with_most(&tiles, &f, &w, label);
             with_scene(&w, &f, &cam, |sc| object_extent(sc, &tiles[hit]).expect("the object stands up out of the ground"))
         };
@@ -755,7 +755,7 @@ mod tests {
         assert!(g("boulder", &boulder) > 0.9 && g("log", &boulder) < 0.6 && g("tree", &boulder) < 0.2, "{} {} {}", g("boulder", &boulder), g("log", &boulder), g("tree", &boulder));
         let (w, cam) = world_with_ahead(NodeKind::Tree, 2.6);
         let f = w.render(&cam);
-        let tiles = noto_ml::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
+        let tiles = crate::ml_bridge::parallel::tile_layout(f.width as u32, f.height as u32, &[(4, 3)], 0.15);
         let hit = tile_with_most(&tiles, &f, &w, "tree");
         let scores: Vec<Vec<EntityScore>> = (0..tiles.len()).map(|i| if i == hit { vec![score("boulder", 0.62), score("tree", 0.48), score("log", 0.2)] } else { vec![] }).collect();
         let (cands, v) = with_scene(&w, &f, &cam, |sc| candidates_from_tiles(&tiles, &scores, &table, sc, &cfg));
@@ -831,7 +831,7 @@ mod tests {
             self.crops.fetch_add(images.len(), std::sync::atomic::Ordering::Relaxed);
             Greens.embed_images_batch(images)
         }
-        fn embed_dense_images(&self, images: &[DynamicImage], grid: DenseGrid) -> Result<Option<Vec<noto_ml::DenseEmbedding>>> {
+        fn embed_dense_images(&self, images: &[DynamicImage], grid: DenseGrid) -> Result<Option<Vec<crate::ml_bridge::DenseEmbedding>>> {
             let whole = Greens.embed_images_batch(images)?;
             Ok(Some(
                 images
@@ -839,7 +839,7 @@ mod tests {
                     .zip(whole)
                     .map(|(im, v)| {
                         let (gh, gw) = grid.grid_for(im.width(), im.height(), 16, 256);
-                        noto_ml::DenseEmbedding { grid_h: gh, grid_w: gw, vectors: vec![v.clone(); gh * gw], attention: vec![1.0 / (gh * gw) as f32; gh * gw], pooled: v }
+                        crate::ml_bridge::DenseEmbedding { grid_h: gh, grid_w: gw, vectors: vec![v.clone(); gh * gw], attention: vec![1.0 / (gh * gw) as f32; gh * gw], pooled: v }
                     })
                     .collect(),
             ))
@@ -900,8 +900,8 @@ mod tests {
         let mut p = perception();
         let raw = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();
         assert_eq!(Recognizer::scope(&p), "embedding");
-        let mut t = noto_vision::CalibTable { mode: SCAN_CALIB_MODE.into(), statistic: "tile_score".into(), ..Default::default() };
-        t.labels.insert("tree".into(), noto_vision::LabelCalib { threshold: 1.0, platt: Some((10.0, -10.0)), positives: 5, negatives: 5, precision: None, recall: None });
+        let mut t = crate::vision_compat::CalibTable { mode: SCAN_CALIB_MODE.into(), statistic: "tile_score".into(), ..Default::default() };
+        t.labels.insert("tree".into(), crate::vision_compat::LabelCalib { threshold: 1.0, platt: Some((10.0, -10.0)), positives: 5, negatives: 5, precision: None, recall: None });
         p.set_calibration(Some(t));
         assert_eq!(Recognizer::scope(&p), "embedding+cal", "calibrated statistics stay apart");
         let cal = p.scan(ScanInput { world: &w, frame: &f, camera: &cam }).unwrap();

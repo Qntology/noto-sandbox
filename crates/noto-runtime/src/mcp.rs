@@ -181,7 +181,7 @@ impl Runtime {
         let (plan, now) = self.unit_body(unit)?;
         if wishes.is_empty() {
             let msg = "무엇을 바꿀지 알아듣지 못했습니다. 예: \"팔 길이를 15cm 늘려줘\", \"포크 길이를 1.2m로\", \"트랙으로 바꿔줘\"".to_string();
-            self.log("mcp", noto_sds::Level::Warn, format!("유닛 {unit}: {msg}"), None);
+            self.log("mcp", crate::sds::Level::Warn, format!("유닛 {unit}: {msg}"), None);
             return Ok(json!({"ok": false, "unit": unit, "calls": [], "error_ko": msg}));
         }
         let base = wishes.iter().find_map(|w| if let Wish::Base(b) = w { Some(*b) } else { None });
@@ -202,11 +202,11 @@ impl Runtime {
             Ok(design) => {
                 let name = self.rigs.pending.get(&unit).map(|p| p.name.clone()).unwrap_or_default();
                 let summary = calls.iter().filter_map(|c| c["result_ko"].as_str()).collect::<Vec<_>>().join(" · ");
-                self.log("mcp", noto_sds::Level::Info, format!("유닛 {unit}: \"{text}\" → {summary}"), Some(json!({"calls": calls})));
+                self.log("mcp", crate::sds::Level::Info, format!("유닛 {unit}: \"{text}\" → {summary}"), Some(json!({"calls": calls})));
                 Ok(json!({"ok": true, "unit": unit, "name": name, "summary_ko": summary, "calls": calls, "design": design}))
             }
             Err(e) => {
-                self.log("mcp", noto_sds::Level::Warn, format!("유닛 {unit}: {e}"), None);
+                self.log("mcp", crate::sds::Level::Warn, format!("유닛 {unit}: {e}"), None);
                 Ok(json!({"ok": false, "unit": unit, "calls": calls, "error_ko": e}))
             }
         }
@@ -235,14 +235,14 @@ impl Runtime {
         let stands = checks.iter().find(|c| c["label"] == "기립 균형").is_none_or(|c| c["ok"] == true);
         if !stands {
             let msg = "기립 균형을 잡지 못하는 설계라 유닛에 적용하지 않았습니다".to_string();
-            self.log("mcp", noto_sds::Level::Warn, format!("유닛 {unit}: {msg}"), Some(json!({"checks": checks})));
+            self.log("mcp", crate::sds::Level::Warn, format!("유닛 {unit}: {msg}"), Some(json!({"checks": checks})));
             return Ok(json!({"ok": false, "unit": unit, "preset_id": id, "name_ko": name, "summary_ko": msg, "checks": checks, "warnings": imported["warnings"], "sds_key": key}));
         }
         self.unit_to_preset(unit, &id, Some(pending.base))?;
         self.rigs.pending.remove(&unit);
         let mass = imported["mass_kg"].as_f64().unwrap_or(0.0);
         let summary = format!("{name} ({mass:.1} kg · 무게중심 {:.2} m) 유닛 {unit}에 적용 · {}", imported["com_m"].as_f64().unwrap_or(0.0), if cad { "SolidCraft 내보내기" } else { "런타임 내보내기" });
-        self.log("mcp", noto_sds::Level::Info, summary.clone(), Some(json!({"unit": unit, "preset": id, "sds_key": key})));
+        self.log("mcp", crate::sds::Level::Info, summary.clone(), Some(json!({"unit": unit, "preset": id, "sds_key": key})));
         Ok(json!({"ok": true, "unit": unit, "preset_id": id, "name_ko": name, "summary_ko": summary, "checks": checks, "warnings": imported["warnings"], "mass_kg": imported["mass_kg"], "com_m": imported["com_m"], "eye_m": imported["eye_m"], "sds_key": key}))
     }
 
@@ -330,7 +330,7 @@ impl Runtime {
         let (plan, base) = self.unit_body(unit)?;
         let body = body_of(plan.build, base);
         let summary = format!("유닛 {unit}: {} · {}", if body.legged() { "휴머노이드" } else { "지게차" }, base_ko(base));
-        self.log("mcp", noto_sds::Level::Info, summary.clone(), None);
+        self.log("mcp", crate::sds::Level::Info, summary.clone(), None);
         Ok(json!({"ok": true, "unit": unit, "summary_ko": summary, "checks": crate::rigs::checks(&body), "warnings": []}))
     }
 }

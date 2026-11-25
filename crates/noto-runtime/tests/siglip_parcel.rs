@@ -12,8 +12,8 @@ const LEX: &str = include_str!("../../../data/world_lexicon.json");
 #[ignore]
 fn siglip2_sees_a_parcel_at_these_distances() {
     let dir = PathBuf::from(std::env::var("SIGLIP2_DIR").expect("SIGLIP2_DIR"));
-    let device = noto_ml::preferred().backend.device(0).expect("device");
-    let model = Arc::new(noto_ml::Siglip2::load(&dir, &device).expect("SigLIP2"));
+    let device = noto_runtime::ml_bridge::preferred().backend.device(0).expect("device");
+    let model = Arc::new(noto_runtime::ml_bridge::Siglip2::load(&dir, &device).expect("SigLIP2"));
     let lex = noto_search::Lexicon::from_json(LEX).unwrap();
     let bank = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/runtime/bank");
     let cfg = RuntimeConfig { seed: 7, noise: NoiseCfg::none(), parcels: Some(0), terrain: TerrainKind::Open, noto: NotoConfig { base: BaseKind::HumanFoot, ..RuntimeConfig::default().noto }, ..RuntimeConfig::default() };

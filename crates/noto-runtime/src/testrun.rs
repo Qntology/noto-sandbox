@@ -8,8 +8,8 @@ use noto_core::balance::{reference, Source};
 use noto_core::parts::Segment;
 use noto_core::{BaseKind, BodyPlan};
 use noto_quest::{Quest, QuestBook};
-use noto_sds::{Level, Scope, Track};
-use noto_vision::{triangulate, Bearing, Rgb};
+use crate::sds::{Level, Scope, Track};
+use crate::vision_compat::{triangulate, Bearing, Rgb};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use world_sim::World;
@@ -485,7 +485,7 @@ impl Runtime {
         let prev_run = std::mem::replace(&mut self.run_id, run);
         let mut decoded: HashMap<usize, Rgb> = HashMap::new();
         if let Some(g) = t.game.as_ref() {
-            let mut intrs: Vec<(usize, noto_vision::Intrinsics)> = Vec::new();
+            let mut intrs: Vec<(usize, crate::vision_compat::Intrinsics)> = Vec::new();
             for i in t.perceive_next..cap {
                 if let Some(k) = g.keyframes.get(i) {
                     if let Ok(rgb) = k.rgb() {
@@ -494,7 +494,7 @@ impl Runtime {
                     }
                 }
             }
-            let refs: Vec<(&Rgb, Option<&noto_vision::Intrinsics>)> = intrs
+            let refs: Vec<(&Rgb, Option<&crate::vision_compat::Intrinsics>)> = intrs
                 .iter()
                 .filter_map(|(i, intr)| decoded.get(i).map(|rgb| (rgb, Some(intr))))
                 .collect();
@@ -524,7 +524,7 @@ impl Runtime {
                     }
                     if let Ok(fix) = triangulate(rays, 6.0) {
                         let label = out.frame.target.as_ref().map(|x| x.label.clone()).unwrap_or_default();
-                        if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(&fix, &s)) {
+                        if let Some(d) = s.depth_range_m.filter(|_| crate::vision_compat::scale_usable(&fix, &s)) {
                             let dmode = self.ml.depth_mode();
                             let scope = Scope::new(Track::Depth, &dmode, &label);
                             self.active_sds_mut().record_calibration(&scope, "scale", fix.range_m as f64, d as f64);
@@ -533,7 +533,7 @@ impl Runtime {
                             tv.tri_range_m = Some(fix.range_m);
                             tv.tri_parallax_deg = Some(fix.parallax_deg);
                             tv.tri_sigma_m = Some(fix.sigma_m);
-                            tv.depth_scale = s.depth_range_m.filter(|_| noto_vision::scale_usable(&fix, &s)).map(|d| fix.range_m / d);
+                            tv.depth_scale = s.depth_range_m.filter(|_| crate::vision_compat::scale_usable(&fix, &s)).map(|d| fix.range_m / d);
                             tv.range_used_m = Some(fix.range_m);
                         }
                     }
@@ -869,7 +869,7 @@ impl Runtime {
         let mut frozen_mode = manifest.sds_mode.clone();
         frozen_mode.default = crate::feedback::Mode::Frozen;
         let loaded_snap = self.data_dir().and_then(|d| {
-            noto_sds::SdsStore::load_snapshot(&d.join("sds").join("snap"), &manifest.snapshot_digest).ok()
+            crate::sds::SdsStore::load_snapshot(&d.join("sds").join("snap"), &manifest.snapshot_digest).ok()
         });
         match loaded_snap {
             Some(snap) => self.feedback.set_mode_with_snapshot(frozen_mode, snap),

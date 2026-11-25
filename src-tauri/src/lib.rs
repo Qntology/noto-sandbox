@@ -64,7 +64,7 @@ pub fn run() {
         .expect("error while building the Noto logistics robot simulator")
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
-                noto_ml::device::rocm_exit_now_if_used(0);
+                lv_core::device::rocm_exit_now_if_used(0);
             }
         });
 }

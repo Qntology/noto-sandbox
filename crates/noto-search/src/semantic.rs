@@ -470,4 +470,42 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node, "warehouse");
     }
+
+    #[test]
+    fn shared_pd_double_center_and_nms_dedup_work() {
+        let centered = double_center_scores(&[vec![1.0, 3.0], vec![3.0, 5.0]]);
+        assert_eq!(centered.len(), 2);
+        let kept = deduplicate_spans_nms(
+            vec![((0, 2), 0.9), ((1, 3), 0.7), ((3, 4), 0.8)],
+            0.2,
+        );
+        assert_eq!(kept, vec![((0, 2), 0.9), ((3, 4), 0.8)]);
+    }
+}
+
+/// Applies `premium_discount_sds::matrix::double_center` onto a `[label x span]` similarity matrix.
+pub fn double_center_scores(scores: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    premium_discount_sds::matrix::double_center(scores)
+}
+
+/// Non-maximum suppression over scored `[start, end)` token spans backed by `premium_discount_nms::spatial`.
+pub fn deduplicate_spans_nms(
+    spans: Vec<((usize, usize), f32)>,
+    iou_threshold: f32,
+) -> Vec<((usize, usize), f32)> {
+    use premium_discount_nms::spatial::{greedy_nms, BoxCand};
+    use premium_discount_sds::geometry::{BBox, Polar};
+
+    let cands: Vec<BoxCand> = spans
+        .iter()
+        .map(|&((start, end), confidence)| BoxCand {
+            bbox: BBox::new(start as f32, 0.0, end as f32, 1.0),
+            label: "span".to_string(),
+            feature: Vec::new(),
+            polar: Polar { r: 0.0, theta_deg: 0.0 },
+            confidence,
+        })
+        .collect();
+    let (kept_idx, _) = greedy_nms(&cands, iou_threshold.max(1e-6));
+    kept_idx.into_iter().map(|i| spans[i]).collect()
 }
