@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use anyhow::Result;
 use noto_search::{EntityKind, Lexicon, VisionPrompting};
-use noto_vision::{
+use crate::vision_compat::{
     depth_metrics, AlignCfg, AlignFit, CalibTable, DepthKind, DepthMap, DepthMetrics, DepthModel, Heat, Intrinsics, LabelPrompt, LocateCfg, LocateScoring, Mask, MaskTracker,
     PointPrompt, Pose, Pyramid, PyramidCfg, PyramidReport, RegionTracker, Rgb, SemanticLocator, SemanticPoint, TrackedMask,
 };
@@ -47,8 +47,8 @@ pub struct MlFixCfg {
 
 /// The depth model's extra heads a configuration asks for: the ADE20K segmentation to take the sky out of the
 /// depth, the surface normals to keep objects out of the ground fit.
-pub fn scene_heads(fix: &MlFixCfg) -> noto_vision::SceneHeads {
-    noto_vision::SceneHeads { normals: fix.normals && fix.align.is_some(), segmentation: fix.sky_mask }
+pub fn scene_heads(fix: &MlFixCfg) -> crate::vision_compat::SceneHeads {
+    crate::vision_compat::SceneHeads { normals: fix.normals && fix.align.is_some(), segmentation: fix.sky_mask }
 }
 
 fn default_pitch_sigma() -> f32 {
@@ -373,7 +373,10 @@ impl LocateStandIn {
 
     fn heat_grid(&self, truth: &KeyTruth) -> (u32, u32) {
         match &self.pyramid {
-            Some(p) => Pyramid::for_frame(truth.src_width, truth.src_height, p).l1(),
+            Some(p) => {
+                let pyr = Pyramid::for_frame(truth.src_width, truth.src_height, p);
+                (pyr.cols, pyr.rows)
+            }
             None => (19, 13),
         }
     }
@@ -428,7 +431,7 @@ impl LocateStandIn {
                 (l.id.clone(), Heat { cols, rows, values }, presence)
             })
             .collect();
-        noto_vision::locate::points_with_presence(truth.src_width, truth.src_height, heats)
+        crate::vision_compat::locate::points_with_presence(truth.src_width, truth.src_height, heats)
     }
 
     fn run_measured(&mut self, truth: &KeyTruth, labels: &[LabelPrompt], m: &LocateErrModel) -> Vec<SemanticPoint> {
@@ -467,7 +470,7 @@ impl LocateStandIn {
                 (l.id.clone(), Heat { cols, rows, values }, score)
             })
             .collect();
-        noto_vision::locate::points_with_presence(truth.src_width, truth.src_height, heats)
+        crate::vision_compat::locate::points_with_presence(truth.src_width, truth.src_height, heats)
     }
 }
 
@@ -541,12 +544,12 @@ pub const PREFETCH_MAX: usize = 32;
 
 #[derive(Default)]
 struct Prefetched {
-    depth: Option<noto_vision::DepthScene>,
+    depth: Option<crate::vision_compat::DepthScene>,
     points: Option<Vec<SemanticPoint>>,
 }
 
 pub fn frame_key(rgb: &Rgb) -> u64 {
-    use noto_ml::parallel::{fnv1a, FNV_OFFSET};
+    use crate::ml_bridge::parallel::{fnv1a, FNV_OFFSET};
     let h = fnv1a(fnv1a(FNV_OFFSET, &rgb.width.to_le_bytes()), &rgb.height.to_le_bytes());
     fnv1a(h, &rgb.data)
 }
@@ -664,10 +667,7 @@ impl MlPipeline {
             return Ok(0);
         }
         self.sync_pyramid();
-        let lazy = self.fix.pyramid.is_some_and(|p| p.lazy_sam) && matches!(self.locate, LocateEngine::Model(_));
-        if !lazy {
-            self.tracker.prepare(&sel)?;
-        }
+        self.tracker.prepare(&sel)?;
         let heads = scene_heads(&self.fix);
         // A stereo engine needs each frame's right image, which a batch of left frames does not carry; it runs per
         // keyframe in `analyse_with`, on the CPU.
@@ -684,31 +684,6 @@ impl MlPipeline {
             }
             LocateEngine::StandIn(_) => None,
         };
-        if lazy {
-            let pyr_cfg = self.fix.pyramid.filter(|p| p.gate.enabled);
-            let any: Vec<&Rgb> = match &points {
-                Some(pts) => sel
-                    .iter()
-                    .enumerate()
-                    .filter(|&(i, f)| {
-                        if let (Some(cfg), Some(ds)) = (pyr_cfg, depths.as_ref()) {
-                            let mut gated = pts[i].clone();
-                            let pyr = Pyramid::for_frame(f.width, f.height, &cfg);
-                            let geo = noto_vision::cell_geometry(&pyr, &ds[i].depth, ds[i].segmentation.as_ref(), None, cfg.gate.far_m);
-                            noto_vision::gate_points(&mut gated, &pyr, &geo, &cfg.gate);
-                            !self.prompts_for(&gated, None, &|_| f32::NEG_INFINITY).is_empty()
-                        } else {
-                            !self.prompts_for(&pts[i], None, &|_| f32::NEG_INFINITY).is_empty()
-                        }
-                    })
-                    .map(|(_, f)| *f)
-                    .collect(),
-                None => sel.clone(),
-            };
-            if !any.is_empty() {
-                self.tracker.prepare(&any)?;
-            }
-        }
         if depths.is_none() && points.is_none() {
             return Ok(0);
         }
@@ -780,7 +755,7 @@ impl MlPipeline {
     }
 
     /// The stereo rig of the depth slot's engine, when it is a stereo pair's (SGBM) rather than one camera's.
-    pub fn stereo_rig(&self) -> Option<noto_vision::StereoRig> {
+    pub fn stereo_rig(&self) -> Option<crate::vision_compat::StereoRig> {
         match &self.depth {
             DepthEngine::Model(m) => m.stereo_rig(),
             DepthEngine::StandIn(_) => None,
@@ -788,7 +763,7 @@ impl MlPipeline {
     }
 
     /// What the stereo engine's last pair gave (grid, share with depth, why the rest has none).
-    pub fn stereo_stats(&self) -> Option<noto_vision::StereoStats> {
+    pub fn stereo_stats(&self) -> Option<crate::vision_compat::StereoStats> {
         match &self.depth {
             DepthEngine::Model(m) => m.stereo_stats(),
             DepthEngine::StandIn(_) => None,
@@ -806,7 +781,7 @@ impl MlPipeline {
         wanted: &[String],
         floor: &dyn Fn(&str) -> f32,
         prefer_track: Option<u32>,
-        height: Option<noto_vision::align::HeightFn>,
+        height: Option<crate::vision_compat::align::HeightFn>,
     ) -> Result<MlFrame> {
         self.sync_pyramid();
         let key = frame_key(rgb);
@@ -835,7 +810,7 @@ impl MlPipeline {
                     std::thread::scope(|s| {
                         let dh = s.spawn(|| {
                             let t0 = std::time::Instant::now();
-                            let d = dm.infer_pair(rgb, r).map(noto_vision::DepthScene::depth_only);
+                            let d = dm.infer_pair(rgb, r).map(crate::vision_compat::DepthScene::depth_only);
                             (d, t0.elapsed().as_secs_f32() * 1000.0)
                         });
                         let t1 = std::time::Instant::now();
@@ -855,12 +830,12 @@ impl MlPipeline {
                 // Two cameras: SGBM on the pair, metric, NaN where it could not match. No right image is an error, not a
                 // reason to guess from the left one.
                 (_, DepthEngine::Model(m), _) if m.stereo_rig().is_some() => match right {
-                    Some(r) => noto_vision::DepthScene::depth_only(m.infer_pair(rgb, r)?),
+                    Some(r) => crate::vision_compat::DepthScene::depth_only(m.infer_pair(rgb, r)?),
                     None => anyhow::bail!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"),
                 },
                 (Some(d), DepthEngine::Model(_), _) => d,
                 (_, DepthEngine::Model(m), _) => m.infer_scene(rgb, heads)?,
-                (_, DepthEngine::StandIn(s), Some(t)) => noto_vision::DepthScene::depth_only(s.run(t)),
+                (_, DepthEngine::StandIn(s), Some(t)) => crate::vision_compat::DepthScene::depth_only(s.run(t)),
                 (_, DepthEngine::StandIn(_), None) => anyhow::bail!("깊이 대역 모델에는 정답 버퍼가 필요합니다"),
             };
             ms.depth = lap(&mut t);
@@ -884,20 +859,26 @@ impl MlPipeline {
         // skips the fit (and its clipping at the model's saturation).
         let stereo = self.stereo_rig().zip(self.stereo_stats());
         let align = match (&self.depth, &self.fix.align) {
-            (DepthEngine::Model(m), Some(cfg)) if m.stereo_rig().is_none() => noto_vision::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
+            (DepthEngine::Model(m), Some(cfg)) if m.stereo_rig().is_none() => crate::vision_compat::ground_align_with(&mut depth, normals.as_ref(), intr, pose, height, m.max_depth_m(), cfg),
             _ => None,
         };
         ms.align = lap(&mut t);
         let pyramid = self.fix.pyramid.map(|cfg| {
             let pyr = Pyramid::for_frame(rgb.width, rgb.height, &cfg);
-            let view = noto_vision::pyramid::View { intr, pose, height };
-            let mut rep = PyramidReport::of(&pyr);
+            let view = crate::vision_compat::pyramid::View { intr, pose, height };
+            let mut rep = PyramidReport {
+                l1: (pyr.cols, pyr.rows),
+                l2: pyr.l2(),
+                mask: pyr.mask(),
+                blocked_cells: 0,
+                snapped_points: 0,
+            };
             if cfg.gate.enabled {
-                let geo = noto_vision::cell_geometry(&pyr, &depth, seg.as_ref(), Some(view), cfg.gate.far_m);
-                rep.gated_cells = noto_vision::gate_points(&mut points, &pyr, &geo, &cfg.gate);
+                let geo = crate::vision_compat::cell_geometry(&pyr, &depth, seg.as_ref(), Some(view), cfg.gate.far_m);
+                rep.blocked_cells = crate::vision_compat::gate_points(&mut points, &pyr, &geo, &cfg.gate) as u32;
             }
             if cfg.snap.enabled {
-                rep.snapped = noto_vision::snap_points(&mut points, &pyr, &depth, Some(view), &cfg.snap);
+                rep.snapped_points = crate::vision_compat::snap_points(&mut points, &pyr, &depth, Some(view), &cfg.snap);
             }
             rep
         });
@@ -928,7 +909,7 @@ impl MlPipeline {
                     }
                 };
                 if self.fix.contact_range && self.drops.contains(&t.label) {
-                    if let Some((rc, sc)) = noto_vision::contact_range(intr, pose, &t.mask, height, self.fix.pitch_sigma_deg, 20.0) {
+                    if let Some((rc, sc)) = crate::vision_compat::contact_range(intr, pose, &t.mask, height, self.fix.pitch_sigma_deg, 20.0) {
                         (range, sigma) = match (range, sigma) {
                             (Some(ra), Some(sa)) if sa > 0.0 => {
                                 let (wa, wc) = (1.0 / (sa * sa), 1.0 / (sc * sc));
@@ -1023,7 +1004,7 @@ pub fn overlay(f: &MlFrame, src_w: u32, src_h: u32, wanted: &[String]) -> Rgb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noto_vision::{CalibTable, LabelCalib};
+    use crate::vision_compat::{CalibTable, LabelCalib};
 
     const LEX: &str = include_str!("../../../data/world_lexicon.json");
 
@@ -1114,7 +1095,7 @@ mod tests {
     }
 
     fn point(label: &str, score: f32, presence: f32) -> SemanticPoint {
-        SemanticPoint { label: label.into(), px: 0.0, py: 0.0, score, margin: 0.0, presence, bbox: [0.0; 4], heat: Heat { cols: 1, rows: 1, values: vec![score] } }
+        SemanticPoint { label: label.into(), px: 0.0, py: 0.0, score, presence, heat: Heat { cols: 1, rows: 1, values: vec![score] } }
     }
 
     #[test]

@@ -5,7 +5,7 @@ use noto_runtime::Runtime;
 use serde_json::{json, Value};
 use tauri::{Emitter, State};
 
-use crate::state::{bank_dir, default_store_dir, model_dir, sam_dir, tips_dir, ttm_dir, AppState};
+use crate::state::{bank_dir, default_store_dir, model_dir, tips_dir, ttm_dir, AppState};
 
 type App<'a> = State<'a, Arc<AppState>>;
 
@@ -110,16 +110,12 @@ pub async fn tips_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, St
 pub async fn sam_use(state: App<'_>, enabled: Option<bool>) -> Result<Value, String> {
     let shared: Arc<AppState> = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
-        if enabled == Some(false) {
-            return shared.with_world(|rt| {
-                rt.use_region_tracker_clamped();
-                models_json(&shared, rt)
-            });
-        }
-        let device = selected_device(&shared)?;
-        let dir = sam_dir();
         shared.with_world(|rt| {
-            rt.use_sam(&dir, &device).map_err(|e| format!("{e:#}"))?;
+            if enabled == Some(false) {
+                rt.use_stereo_fast_tick();
+            } else {
+                rt.use_stereo_metric_grasp();
+            }
             models_json(&shared, rt)
         })
     })
@@ -249,8 +245,7 @@ pub(crate) fn models_json(state: &AppState, rt: &Runtime) -> Result<Value, Strin
     v["ttm_files"] = json!({"dir": ttm.display().to_string(), "present": ttm.join("config.json").is_file()});
     let tips = tips_dir();
     v["tips_files"] = json!({"dir": tips.display().to_string(), "present": tips.join("model.safetensors").is_file()});
-    let sam = sam_dir();
-    v["sam_files"] = json!({"dir": sam.display().to_string(), "present": noto_vision::SamModel::find_weights(&sam).is_some()});
+    v["stereo_tier"] = json!(rt.stereo_tier_name());
     let s = state.startup();
     v["startup"] = json!({"backend": s.backend.name(), "ordinal": s.ordinal, "reason": s.reason});
     v["ready"] = json!(state.models_ready());

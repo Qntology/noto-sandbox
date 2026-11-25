@@ -6,10 +6,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use noto_core::{BodyStatus, NotoConfig};
 use noto_quest::{Labels, Quest, QuestBook};
-use noto_sds::{AuditLog, DriftState, Level, LogLine, SdsStatus, SdsStore, Window};
+use crate::sds::{AuditLog, DriftState, Level, LogLine, SdsStatus, SdsStore, Window};
 use noto_search::semantic::PhraseEmbedder;
 use noto_search::{Lexicon, ParsedCommand, Parser, Plan};
-use noto_ts::Forecast;
+use crate::ts::Forecast;
 use serde::Serialize;
 use serde_json::{json, Value};
 use world_sim::{amount_text, encode_webp, Action, Camera, ItemKind, NodeKind, TimedEvent, World, WorldConfig, WorldEvent, WorldSnapshot};
@@ -22,7 +22,7 @@ use crate::perception::EntKind;
 use crate::precision::{Judged, MemCtx, PrecisionGates};
 use crate::vision::{in_view, memory_ok, DriftRate, VisionMark};
 use world_sim::world::DELIVER_REACH_M;
-use noto_sds::{Scope, Track};
+use crate::sds::{Scope, Track};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ScanReport {
@@ -159,7 +159,7 @@ pub struct Detection {
     pub bbox: [f32; 4],
     pub landmark: Option<u32>,
     pub floor_source: String,
-    pub temporal: Option<noto_ts::TemporalVerdict>,
+    pub temporal: Option<crate::ts::TemporalVerdict>,
 }
 
 pub struct DepthView {
@@ -169,22 +169,22 @@ pub struct DepthView {
     pub mode: String,
     pub device: String,
     pub infer_ms: f32,
-    pub metrics: Option<noto_vision::DepthMetrics>,
+    pub metrics: Option<crate::vision_compat::DepthMetrics>,
     pub scale_m: (f32, f32),
     pub max_depth_m: Option<f32>,
     pub rgb_webp: Vec<u8>,
     pub pred_webp: Vec<u8>,
     pub truth_webp: Vec<u8>,
-    pub metrics_raw: Option<noto_vision::DepthMetrics>,
+    pub metrics_raw: Option<crate::vision_compat::DepthMetrics>,
     pub raw_webp: Option<Vec<u8>>,
     pub seg_webp: Option<Vec<u8>>,
     pub normals_webp: Option<Vec<u8>>,
-    pub align: Option<noto_vision::AlignFit>,
+    pub align: Option<crate::vision_compat::AlignFit>,
     pub sky_frac: Option<f32>,
     pub flip_tta: bool,
     /// The right camera's frame and what SGBM made of the pair, when the eye is a stereo pair.
     pub right_webp: Option<Vec<u8>>,
-    pub stereo: Option<noto_vision::StereoStats>,
+    pub stereo: Option<crate::vision_compat::StereoStats>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -314,7 +314,7 @@ pub struct Runtime {
     pub(crate) eval: EvalCounters,
     last_flush_tick: u64,
     pub(crate) focus: Option<String>,
-    pub(crate) db: noto_sds::TestDb,
+    pub(crate) db: crate::sds::TestDb,
     pub(crate) pass: String,
     pub(crate) run_id: String,
     pub(crate) session_id: String,
@@ -345,12 +345,12 @@ impl Runtime {
         let ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
         let (mut sds, eval_sds, audit, db) = match data_dir {
             Some(dir) => (
-                SdsStore::open_with(&dir.join("sds"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
-                SdsStore::open_with(&dir.join("sds").join("eval"), noto_sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
+                SdsStore::open_with(&dir.join("sds"), crate::sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
+                SdsStore::open_with(&dir.join("sds").join("eval"), crate::sds::OpenOptions::stamped(noto_core::bench::ENGINE_REV)),
                 AuditLog::open(&dir.join("logs"), &format!("session_{ms}"), 4000)?,
-                noto_sds::TestDb::open(&dir.join("db")),
+                crate::sds::TestDb::open(&dir.join("db")),
             ),
-            None => (SdsStore::memory(), SdsStore::memory(), AuditLog::memory(4000), noto_sds::TestDb::memory()),
+            None => (SdsStore::memory(), SdsStore::memory(), AuditLog::memory(4000), crate::sds::TestDb::memory()),
         };
         sds.set_generation_id(&crate::generation_id());
         let cam = cfg.camera.camera();
@@ -884,11 +884,11 @@ impl Runtime {
         &mut self.ml
     }
 
-    pub fn test_db(&self) -> &noto_sds::TestDb {
+    pub fn test_db(&self) -> &crate::sds::TestDb {
         &self.db
     }
 
-    pub fn test_db_mut(&mut self) -> &mut noto_sds::TestDb {
+    pub fn test_db_mut(&mut self) -> &mut crate::sds::TestDb {
         &mut self.db
     }
 
@@ -901,23 +901,32 @@ impl Runtime {
             anyhow::bail!("카메라 2대(스테레오)에서는 깊이를 SGBM이 재므로 TIPSv2를 불러오지 않습니다. 단안으로 쓰려면 카메라를 1대로 바꾸세요");
         }
         let t0 = Instant::now();
-        let m = noto_vision::TipsDepth::load(dir, device)?;
+        let m = crate::vision_compat::TipsDepth::load(dir, device)?;
         self.ml.depth = crate::ml::DepthEngine::Model(Box::new(m));
         self.ml.sync_pyramid();
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
-        self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {} · {}", noto_ml::device_label(device), dir.display()), None);
+        self.log("embed", Level::Info, format!("TIPSv2 DPT 깊이 모델 로드 ({ms:.0} ms) · {} · {}", crate::ml_bridge::device_label(device), dir.display()), None);
         Ok(())
     }
 
-    pub fn use_sam(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
-        let t0 = Instant::now();
-        let m = noto_vision::SamModel::load(dir, device)?;
-        let mode = m.variant().mode();
-        self.ml.tracker = Box::new(noto_vision::SamTracker::new(Arc::new(m)));
+    pub fn use_stereo_fast_tick(&mut self) {
+        self.ml.tracker = Box::new(crate::vision_compat::StereoTierTracker::new(
+            crate::vision_compat::StereoSpatialTier::StereoFastTick,
+        ));
         self.ml.sync_pyramid();
-        let ms = t0.elapsed().as_secs_f32() * 1000.0;
-        self.log("embed", Level::Info, format!("{mode} 마스크 모델 로드 ({ms:.0} ms) · {} · {}", noto_ml::device_label(device), dir.display()), None);
-        Ok(())
+        self.log("embed", Level::Info, "마스크 추적: 스테레오 고속 틱", None);
+    }
+
+    pub fn use_stereo_metric_grasp(&mut self) {
+        self.ml.tracker = Box::new(crate::vision_compat::StereoTierTracker::new(
+            crate::vision_compat::StereoSpatialTier::StereoMetricGrasp,
+        ));
+        self.ml.sync_pyramid();
+        self.log("embed", Level::Info, "마스크 추적: 스테레오 정밀 파지", None);
+    }
+
+    pub fn stereo_tier_name(&self) -> &str {
+        self.ml.tracker.mode()
     }
 
     pub fn use_depth_stand_in(&mut self) {
@@ -950,9 +959,9 @@ impl Runtime {
     pub fn use_stereo(&mut self) {
         let rig = crate::stereo::rig_for(&self.cam, self.world.body.head.sensor);
         let had_model = matches!(&self.ml.depth, crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_none());
-        self.ml.depth = crate::ml::DepthEngine::Model(Box::new(noto_vision::SgbmDepth::new(rig, noto_vision::SgbmCfg::default())));
+        self.ml.depth = crate::ml::DepthEngine::Model(Box::new(crate::vision_compat::SgbmDepth::new(rig, crate::vision_compat::SgbmCfg::default())));
         self.ml.sync_pyramid();
-        let (gw, gh) = noto_vision::stereo_grid(self.cam.width as u32, self.cam.height as u32, self.ml.fix.pyramid.as_ref(), noto_vision::SgbmCfg::default().per_l2);
+        let (gw, gh) = crate::vision_compat::stereo_grid(self.cam.width as u32, self.cam.height as u32, self.ml.fix.pyramid.as_ref(), crate::vision_compat::SgbmCfg::default().per_l2);
         let msg = format!(
             "깊이: SGBM 스테레오 (카메라 2대 · 기선 {:.1} cm · 초점 {:.0} px · 매칭 격자 {gw}×{gh}){}",
             rig.baseline_m * 100.0,
@@ -986,24 +995,24 @@ impl Runtime {
     /// is a stereo pair, else the head sensor's own.
     pub(crate) fn sigma_camera(&self) -> (f32, f32, f32) {
         match self.ml.stereo_rig() {
-            Some(rig) if self.stereo() => crate::stereo::sigma_camera(&rig, &self.cam, &noto_vision::SgbmCfg::default()),
+            Some(rig) if self.stereo() => crate::stereo::sigma_camera(&rig, &self.cam, &crate::vision_compat::SgbmCfg::default()),
             _ => world_sim::world::camera_of(self.world.body.head.sensor),
         }
     }
 
     pub fn use_region_tracker(&mut self) {
-        self.ml.tracker = Box::new(noto_vision::RegionTracker::default());
+        self.ml.tracker = Box::new(crate::vision_compat::RegionTracker::default());
         self.ml.sync_pyramid();
         self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow)", None);
     }
 
     /// The region tracker with each label's region kept to the item's size: R = max(the lexicon's tallest height for
-    /// it, 0.5 m) at the seed's depth through this camera (`noto_vision::ExtentClamp`), so a region does not run onto a
+    /// it, 0.5 m) at the seed's depth through this camera (`crate::vision_compat::ExtentClamp`), so a region does not run onto a
     /// neighbour of the same colour and depth beyond the item.
     pub fn use_region_tracker_clamped(&mut self) {
         let radius_m = self.parser.lexicon().vision.iter().filter_map(|e| e.height_m.map(|(_, hi)| (e.id.clone(), hi.max(0.5)))).collect();
         let focal_px = self.cam.width as f32 * 0.5 / (self.cam.fov_deg.to_radians() * 0.5).tan();
-        self.ml.tracker = Box::new(noto_vision::RegionTracker::default().with_extent(noto_vision::ExtentClamp { focal_px, radius_m }));
+        self.ml.tracker = Box::new(crate::vision_compat::RegionTracker::default().with_extent(crate::vision_compat::ExtentClamp { focal_px, radius_m }));
         self.ml.sync_pyramid();
         self.log("embed", Level::Info, "마스크 추적: 영역 확장(region-grow), 물체 크기로 제한", None);
     }
@@ -1030,10 +1039,10 @@ impl Runtime {
         self.log("vision", Level::Info, format!("인식기 교체: {mode}"), None);
     }
 
-    pub fn use_siglip(&mut self, model: Arc<noto_ml::Siglip2>, bank_dir: Option<&Path>) -> Result<()> {
+    pub fn use_siglip(&mut self, model: Arc<crate::ml_bridge::Siglip2>, bank_dir: Option<&Path>) -> Result<()> {
         let t0 = Instant::now();
         let phrases = Arc::new(crate::embedding::BankedPhrases::new(Arc::clone(&model), bank_dir));
-        self.ml.locate = crate::ml::LocateEngine::Model(Box::new(noto_vision::SiglipLocator::with_cfg(Arc::clone(&model), self.ml.fix.locate.clone())));
+        self.ml.locate = crate::ml::LocateEngine::Model(Box::new(crate::vision_compat::SiglipLocator::with_cfg(Arc::clone(&model), self.ml.fix.locate.clone())));
         self.ml.sync_pyramid();
         let prompting = self.ml.fix.scan_prompting.then(|| self.ml.prompting.clone());
         let mut rec = crate::embedding::EmbeddingPerception::siglip_with(model, self.parser.lexicon(), bank_dir, Default::default(), prompting.as_ref())?;
@@ -1047,7 +1056,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn attach_ttm(&mut self, ttm: Option<Arc<noto_ts::ttm::TtmForecaster>>) {
+    pub fn attach_ttm(&mut self, ttm: Option<Arc<crate::ts::ttm::TtmForecaster>>) {
         let msg = match &ttm {
             Some(t) => format!("Granite TTM 연결: 문맥 {} · 예측 {} 스텝", t.context_length(), t.prediction_length()),
             None => "Granite TTM 해제: last/ewma/holt 융합만 사용".to_string(),
@@ -1062,10 +1071,10 @@ impl Runtime {
 
     pub fn load_ttm(&mut self, dir: &Path, device: &candle_core::Device) -> Result<()> {
         let t0 = Instant::now();
-        let pref = noto_ts::ttm_device_pref();
+        let pref = crate::ts::ttm_device_pref();
         let mut chosen = if pref == "cpu" { candle_core::Device::Cpu } else { device.clone() };
         if !matches!(chosen, candle_core::Device::Cpu) {
-            match noto_ts::ttm_parity_check(dir, &chosen, 1e-3) {
+            match crate::ts::ttm_parity_check(dir, &chosen, 1e-3) {
                 Ok(diff) => {
                     self.log("ts", Level::Debug, format!("TTM GPU/CPU 대조 통과 (최대 오차 {diff:.2e})"), None);
                 }
@@ -1075,7 +1084,7 @@ impl Runtime {
                 }
             }
         }
-        let ttm = noto_ts::ttm::TtmForecaster::load(dir, &chosen).map_err(|e| anyhow!("Granite TTM 을 {} 에서 읽지 못했습니다: {e}", dir.display()))?;
+        let ttm = crate::ts::ttm::TtmForecaster::load(dir, &chosen).map_err(|e| anyhow!("Granite TTM 을 {} 에서 읽지 못했습니다: {e}", dir.display()))?;
         let fp = ttm.fingerprint().clone();
         self.attach_ttm(Some(Arc::new(ttm)));
         let ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -1084,12 +1093,12 @@ impl Runtime {
             Level::Info,
             format!(
                 "Granite TTM 로드 완료 ({ms:.0} ms) · 장치 {} · fp8 {} · {} · {}",
-                noto_ml::device_label(&chosen),
+                crate::ml_bridge::device_label(&chosen),
                 fp.fp8,
                 if fp.verified { "공식 해시 검증됨" } else { "미검증 사용자 가중치" },
                 dir.display()
             ),
-            Some(json!({"ms": ms, "device": noto_ml::device_label(&chosen), "fp8": fp.fp8, "verified": fp.verified, "context": fp.context, "prediction": fp.prediction})),
+            Some(json!({"ms": ms, "device": crate::ml_bridge::device_label(&chosen), "fp8": fp.fp8, "verified": fp.verified, "context": fp.context, "prediction": fp.prediction})),
         );
         for w in &fp.warnings {
             self.log("ts", Level::Warn, w.clone(), Some(json!({"fp8": fp.fp8})));
@@ -1432,8 +1441,8 @@ impl Runtime {
         for j in &judged {
             if let Some(lm) = j.landmark {
                 let subj = format!("{}:lm{lm}", j.cand.label);
-                let extra_q = if j.temporal.as_ref().is_some_and(|tv| tv.outcome == noto_ts::TemporalOutcome::Held) {
-                    noto_ts::series::q::HELD
+                let extra_q = if j.temporal.as_ref().is_some_and(|tv| tv.outcome == crate::ts::TemporalOutcome::Held) {
+                    crate::ts::series::q::HELD
                 } else {
                     0
                 };
@@ -1658,7 +1667,7 @@ impl Runtime {
             }
             if let Some(v) = &j.temporal {
                 match v.outcome {
-                    noto_ts::TemporalOutcome::Held => {
+                    crate::ts::TemporalOutcome::Held => {
                         let msg = format!("시계열 게이트가 {}의 점수 {:.2}를 보류: {}", j.cand.label, v.observed, v.reason);
                         self.holds.push(crate::progress::HoldItem {
                             tick: r.tick,
@@ -1691,7 +1700,7 @@ impl Runtime {
                             }))),
                         );
                     }
-                    noto_ts::TemporalOutcome::Warn => {
+                    crate::ts::TemporalOutcome::Warn => {
                         let msg = format!("시계열 게이트 경고 {} 점수 {:.2}: {}", j.cand.label, v.observed, v.reason);
                         self.audit.log(
                             "vision",
@@ -1780,7 +1789,7 @@ impl Runtime {
     pub fn depth_view(&mut self, quality: f32) -> Result<DepthView> {
         let frame = self.world.render(&self.cam);
         let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
-        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let rgb = crate::vision_compat::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
         let intr = crate::record::intrinsics(&self.world, &self.cam);
         let pose = crate::record::odometry(&self.world, &self.cam);
         let t0 = Instant::now();
@@ -1789,25 +1798,25 @@ impl Runtime {
         let (scene, max_depth_m, stereo) = match &mut self.ml.depth {
             crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
                 let r = right.as_ref().ok_or_else(|| anyhow!("스테레오 깊이(SGBM)에 오른쪽 화면이 없습니다"))?;
-                let pair = noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone());
-                (noto_vision::DepthScene::depth_only(m.infer_pair(&rgb, &pair)?), m.max_depth_m(), m.stereo_stats())
+                let pair = crate::vision_compat::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone());
+                (crate::vision_compat::DepthScene::depth_only(m.infer_pair(&rgb, &pair)?), m.max_depth_m(), m.stereo_stats())
             }
-            crate::ml::DepthEngine::Model(m) => (m.infer_scene(&rgb, noto_vision::SceneHeads::ALL)?, m.max_depth_m(), None),
-            crate::ml::DepthEngine::StandIn(s) => (noto_vision::DepthScene::depth_only(s.run(&truth)), None, None),
+            crate::ml::DepthEngine::Model(m) => (m.infer_scene(&rgb, crate::vision_compat::SceneHeads::ALL)?, m.max_depth_m(), None),
+            crate::ml::DepthEngine::StandIn(s) => (crate::vision_compat::DepthScene::depth_only(s.run(&truth)), None, None),
         };
         let infer_ms = t0.elapsed().as_secs_f32() * 1000.0;
         let raw = scene.depth.clone();
         let mut pred = scene.depth.clone();
         // A stereo pair's depth is metric already: no ground fit, and the raw panel would be the same map.
         let align = match (max_depth_m, &fix.align) {
-            (Some(max), Some(cfg)) if stereo.is_none() => noto_vision::ground_align_with(&mut pred, scene.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg),
+            (Some(max), Some(cfg)) if stereo.is_none() => crate::vision_compat::ground_align_with(&mut pred, scene.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg),
             _ => None,
         };
         let true_map = truth.depth_map();
-        let metrics = noto_vision::depth_metrics(&pred, &true_map, 24.0, false);
-        let metrics_raw = max_depth_m.filter(|_| stereo.is_none()).and_then(|_| noto_vision::depth_metrics(&raw, &true_map, 24.0, false));
+        let metrics = crate::vision_compat::depth_metrics(&pred, &true_map, 24.0, false);
+        let metrics_raw = max_depth_m.filter(|_| stereo.is_none()).and_then(|_| crate::vision_compat::depth_metrics(&raw, &true_map, 24.0, false));
         let (lo, hi) = true_map.range();
-        let enc = |img: &noto_vision::Rgb| encode_webp(&img.data, img.width, img.height, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"));
+        let enc = |img: &crate::vision_compat::Rgb| encode_webp(&img.data, img.width, img.height, quality).map(|e| e.bytes).map_err(|e| anyhow!("WebP 인코딩 실패: {e}"));
         Ok(DepthView {
             tick: self.world.tick,
             width: frame.width as u32,

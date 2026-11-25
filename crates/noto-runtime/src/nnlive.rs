@@ -1638,7 +1638,7 @@ fn event_to_mark(seq: u64, ev: &WorldEvent) -> Option<(u32, Mark)> {
 pub struct NnView;
 
 impl NnView {
-    pub fn from_store(sds: &noto_sds::SdsStore, window: &str, live: &NnLive) -> Value {
+    pub fn from_store(sds: &crate::sds::SdsStore, window: &str, live: &NnLive) -> Value {
         if window == "instance" {
             return json!({
                 "window": "instance",
@@ -1647,11 +1647,11 @@ impl NnView {
             });
         }
         let defs = nn::defs();
-        let ledger = noto_sds::Track::Balance.ledger();
-        let keys = sds.scope_keys_for_track(noto_sds::Track::Balance);
+        let ledger = crate::sds::Track::Balance.ledger();
+        let keys = sds.scope_keys_for_track(crate::sds::Track::Balance);
 
         // Extract per-(scenario_upper, phase) stats from persisted SDS keys (v2 `+ph` rung preferred, fallback v1 `balance|nn:<scn>|<ph>`).
-        let mut by_phase: BTreeMap<(String, String), (noto_sds::ScopeStat, String, BTreeMap<String, String>)> = BTreeMap::new();
+        let mut by_phase: BTreeMap<(String, String), (crate::sds::ScopeStat, String, BTreeMap<String, String>)> = BTreeMap::new();
         for key in &keys {
             let st_opt = if window == "run" {
                 sds.run_scope_by_key(ledger, key)
@@ -1662,10 +1662,10 @@ impl NnView {
             if !st.baseline.contains_key("score") {
                 continue;
             }
-            if let Ok(sk) = noto_sds::ScopeKey::parse(key) {
+            if let Ok(sk) = crate::sds::ScopeKey::parse(key) {
                 if let Some(scn_raw) = sk.subject.strip_prefix("nn:") {
                     // Use the `+ph` rung (exactly one facet: Ph) for scenario-phase rollups.
-                    if sk.facets.len() == 1 && sk.facets[0].0 == noto_sds::Facet::Ph {
+                    if sk.facets.len() == 1 && sk.facets[0].0 == crate::sds::Facet::Ph {
                         let scn = scn_raw.to_ascii_uppercase();
                         let ph = sk.facets[0].1.clone();
                         let facets: BTreeMap<String, String> = sk.facets.iter().map(|(f, v)| (f.as_str().into(), v.clone())).collect();

@@ -1360,7 +1360,7 @@ impl World {
     /// What the head camera sees of its own body: the tines and their load on a lift truck the rider looks down at,
     /// or the item in the hands — with the forearms and hands round it while a pick or a set-down has them out in
     /// front, where a head bent to watch them sees them. Walking with a load the eyes look ahead over it, and the step
-    /// they read in the depth (`noto_vision::stairs`) lies where the arms would be drawn: there the item rides alone,
+    /// they read in the depth (`lv_spatial::stairs`) lies where the arms would be drawn: there the item rides alone,
     /// as before.
     pub fn own_view_boxes(&self) -> Vec<Obb> {
         if self.rider_sees_forks() {

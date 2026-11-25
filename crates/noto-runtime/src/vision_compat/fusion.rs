@@ -1,0 +1,198 @@
+use serde::{Deserialize, Serialize};
+
+use super::frame::{DepthMap, Mask};
+use super::locate::SemanticPoint;
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Features {
+    pub peak_in_mask: Option<bool>,
+    pub peak_depth_gap: Option<f32>,
+    pub heat_in_mask: Option<f32>,
+    pub range_gap: Option<f32>,
+    pub motion_residual_deg: Option<f32>,
+    pub head_tilt_deg: Option<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FlagCfg {
+    pub depth_gap: f32,
+    pub heat_in_mask: f32,
+    pub range_gap: f32,
+    pub residual_deg: f32,
+    pub head_tilt_deg: f32,
+}
+
+impl Default for FlagCfg {
+    fn default() -> Self {
+        FlagCfg { depth_gap: 0.25, heat_in_mask: 0.25, range_gap: 0.25, residual_deg: 8.0, head_tilt_deg: 5.0 }
+    }
+}
+
+pub struct FusionInput<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub depth: Option<&'a DepthMap>,
+    pub point: Option<&'a SemanticPoint>,
+    pub mask: Option<&'a Mask>,
+    pub depth_range_m: Option<f32>,
+    pub depth_scale: Option<f32>,
+    pub tri_range_m: Option<f32>,
+    pub residual_deg: Option<f32>,
+    pub head_tilt_deg: Option<f32>,
+}
+
+pub fn features(inp: &FusionInput<'_>) -> Features {
+    let mut f = Features { motion_residual_deg: inp.residual_deg, head_tilt_deg: inp.head_tilt_deg, ..Default::default() };
+    if let (Some(p), Some(m)) = (inp.point, inp.mask) {
+        let to_mask = |x: f32, y: f32| -> Option<(u32, u32)> {
+            let mx = (x / inp.width.max(1) as f32 * m.width as f32) as i64;
+            let my = (y / inp.height.max(1) as f32 * m.height as f32) as i64;
+            (mx >= 0 && my >= 0 && mx < m.width as i64 && my < m.height as i64).then_some((mx as u32, my as u32))
+        };
+        f.peak_in_mask = Some(to_mask(p.px, p.py).map_or(false, |(x, y)| m.get(x, y)));
+        let h = &p.heat;
+        let peak = h.values.iter().copied().fold(0.0f32, f32::max);
+        let (mut inside, mut total) = (0.0f32, 0.0f32);
+        for r in 0..h.rows {
+            for c in 0..h.cols {
+                let v = h.values[(r * h.cols + c) as usize];
+                if v < 0.5 * peak {
+                    continue;
+                }
+                total += v;
+                inside += v * cell_coverage(m, c, r, h.cols, h.rows);
+            }
+        }
+        if total > 0.0 {
+            f.heat_in_mask = Some(inside / total);
+        }
+        if let Some(d) = inp.depth {
+            let at_peak = d.at_scaled(p.px, p.py, inp.width, inp.height);
+            if let Some(med) = d.median_in(m) {
+                if at_peak.is_finite() && med > 0.0 {
+                    f.peak_depth_gap = Some((at_peak - med).abs() / med);
+                }
+            }
+        }
+    }
+    if let (Some(r), Some(t)) = (inp.depth_range_m, inp.tri_range_m) {
+        if t > 0.1 {
+            f.range_gap = Some((r * inp.depth_scale.unwrap_or(1.0) - t).abs() / t);
+        }
+    }
+    f
+}
+
+/// The share of the heat cell (c, r) of a `cols` × `rows` heat that the mask covers, by area: on the 1 : 2 : 4
+/// pyramid a cell is a whole block of mask pixels, otherwise the pixels it cuts count by the part inside it.
+pub fn cell_coverage(m: &Mask, c: u32, r: u32, cols: u32, rows: u32) -> f32 {
+    let (sx, sy) = (m.width as f32 / cols.max(1) as f32, m.height as f32 / rows.max(1) as f32);
+    let (x0, x1, y0, y1) = (c as f32 * sx, (c + 1) as f32 * sx, r as f32 * sy, (r + 1) as f32 * sy);
+    let (mut covered, area) = (0.0f32, (x1 - x0) * (y1 - y0));
+    for y in (y0.floor() as u32)..(y1.ceil() as u32).min(m.height) {
+        let oy = ((y + 1) as f32).min(y1) - (y as f32).max(y0);
+        for x in (x0.floor() as u32)..(x1.ceil() as u32).min(m.width) {
+            if m.get(x, y) {
+                covered += (((x + 1) as f32).min(x1) - (x as f32).max(x0)) * oy;
+            }
+        }
+    }
+    if area > 0.0 {
+        (covered / area).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+pub fn flags(f: &Features, cfg: &FlagCfg) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    if f.peak_in_mask == Some(false) {
+        v.push("peak_off_mask");
+    }
+    if f.peak_depth_gap.map_or(false, |g| g > cfg.depth_gap) {
+        v.push("depth_edge");
+    }
+    if f.heat_in_mask.map_or(false, |h| h < cfg.heat_in_mask) {
+        v.push("heat_spill");
+    }
+    if f.range_gap.map_or(false, |g| g > cfg.range_gap) {
+        v.push("range_disagree");
+    }
+    if f.motion_residual_deg.map_or(false, |r| r.abs() > cfg.residual_deg) {
+        v.push("motion_residual");
+    }
+    if f.head_tilt_deg.map_or(false, |t| t.abs() > cfg.head_tilt_deg) {
+        v.push("head_tilt");
+    }
+    v
+}
+
+pub fn numeric(f: &Features) -> Vec<(&'static str, f64)> {
+    let mut v = Vec::new();
+    if let Some(b) = f.peak_in_mask {
+        v.push(("peak_in_mask", if b { 1.0 } else { 0.0 }));
+    }
+    for (k, x) in [("peak_depth_gap", f.peak_depth_gap), ("heat_in_mask", f.heat_in_mask), ("range_gap", f.range_gap), ("motion_residual_deg", f.motion_residual_deg), ("head_tilt_deg", f.head_tilt_deg)] {
+        if let Some(x) = x {
+            v.push((k, x as f64));
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vision_compat::frame::DepthKind;
+    use crate::vision_compat::locate::Heat;
+
+    #[test]
+    fn agreeing_tracks_raise_no_flags_and_a_background_peak_does() {
+        let mut m = Mask::empty(8, 4);
+        for x in 2..5 {
+            for y in 1..3 {
+                m.set(x, y);
+            }
+        }
+        let mut values = vec![0.0; 32];
+        values[1 * 8 + 3] = 0.9;
+        let heat = Heat { cols: 8, rows: 4, values };
+        let depth = DepthMap { width: 8, height: 4, kind: DepthKind::Metric, data: (0..32).map(|i| if m.bits[i] { 4.0 } else { 9.0 }).collect() };
+        let on = SemanticPoint { label: "stone".into(), px: 3.5, py: 1.5, score: 0.9, presence: 1.0, heat: heat.clone() };
+        let inp = FusionInput { width: 8, height: 4, depth: Some(&depth), point: Some(&on), mask: Some(&m), depth_range_m: Some(5.0), depth_scale: Some(1.2), tri_range_m: Some(6.0), residual_deg: Some(1.0), head_tilt_deg: Some(0.5) };
+        let f = features(&inp);
+        assert_eq!(f.peak_in_mask, Some(true));
+        assert_eq!(f.heat_in_mask, Some(1.0));
+        assert!(f.range_gap.unwrap() < 1e-6);
+        assert!(flags(&f, &FlagCfg::default()).is_empty(), "{f:?}");
+        let off = SemanticPoint { px: 7.5, py: 3.5, ..on.clone() };
+        let f2 = features(&FusionInput { point: Some(&off), ..inp });
+        let fl = flags(&f2, &FlagCfg::default());
+        assert!(fl.contains(&"peak_off_mask") && fl.contains(&"depth_edge"), "{fl:?}");
+        assert_eq!(numeric(&f2).len(), 6);
+    }
+
+    #[test]
+    fn heat_in_mask_integrates_each_cell_over_its_mask_block() {
+        let mut m = Mask::empty(288, 192);
+        for y in 0..192 {
+            for x in 0..288 {
+                if (16 * 9..16 * 9 + 8).contains(&x) && (16 * 6..16 * 7).contains(&y) {
+                    m.set(x, y);
+                }
+            }
+        }
+        assert!((cell_coverage(&m, 9, 6, 18, 12) - 0.5).abs() < 1e-6, "half of the 16 x 16 block");
+        assert_eq!(cell_coverage(&m, 8, 6, 18, 12), 0.0);
+        let mut values = vec![0.0; 18 * 12];
+        values[6 * 18 + 9] = 0.9;
+        values[6 * 18 + 8] = 0.9;
+        let heat = Heat { cols: 18, rows: 12, values };
+        let p = SemanticPoint { label: "stone".into(), px: 9.25 * 384.0 / 18.0, py: 6.5 * 256.0 / 12.0, score: 0.9, presence: 1.0, heat };
+        let f = features(&FusionInput { width: 384, height: 256, depth: None, point: Some(&p), mask: Some(&m), depth_range_m: None, depth_scale: None, tri_range_m: None, residual_deg: None, head_tilt_deg: None });
+        assert!((f.heat_in_mask.unwrap() - 0.25).abs() < 1e-6, "half of one of two equal cells: {:?}", f.heat_in_mask);
+        assert_eq!(f.peak_in_mask, Some(true));
+        let coarse = Mask { width: 8, height: 4, bits: (0..32).map(|i| i % 8 >= 4).collect() };
+        assert!((cell_coverage(&coarse, 1, 0, 3, 1) - 0.5).abs() < 1e-5, "a cell cutting mask pixels counts their inside part");
+    }
+}

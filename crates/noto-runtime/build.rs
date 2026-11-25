@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 const ENGINE_FILES: [&str; 12] = [
     "crates/noto-core/src/**/*.rs",
     "crates/world-sim/src/**/*.rs",
-    "crates/noto-vision/src/**/*.rs",
+    "crates/noto-runtime/src/stereo.rs",
     "crates/noto-runtime/src/driver.rs",
     "crates/noto-runtime/src/mldrive.rs",
     "crates/noto-runtime/src/vision.rs",

@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use noto_sds::catalog;
-use noto_sds::{Scope, SdsStore, Track};
+use crate::sds::catalog;
+use crate::sds::{Scope, SdsStore, Track};
 use serde::Serialize;
 use serde_json::{json, Value};
 

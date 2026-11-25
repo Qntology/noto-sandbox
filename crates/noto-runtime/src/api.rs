@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use world_sim::snapshot::{CarryView, Pos3, SiteView};
 use world_sim::WorldSnapshot;
 
-use noto_sds::LogLine;
+use crate::sds::LogLine;
 
 use crate::precision::Judged;
 use crate::runtime::{label_ko, FrameView, Runtime, Submission};
@@ -422,19 +422,19 @@ fn text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str)
 }
 
-pub fn stereo_json(st: noto_vision::StereoStats) -> Value {
+pub fn stereo_json(st: crate::vision_compat::StereoStats) -> Value {
     let px = st.pixels().max(1) as f32;
     let share = |n: u32| r3(n as f32 / px);
     json!({
-        "grid": [st.width, st.height], "disparities": st.disparities, "focal_px": r3(st.focal_px), "baseline_m": r3(st.baseline_m), "ms": r3(st.ms),
+        "grid": [st.width, st.height], "disparities": st.disparities, "focal_px": r3(st.focal_px), "baseline_m": r3(st.baseline_m), "ms": r3(st.elapsed_ms),
         "valid": share(st.valid), "far": share(st.far),
-        "rejected": {"border": share(st.border), "saturated": share(st.saturated), "no_texture": share(st.no_texture), "not_unique": share(st.not_unique), "lr_mismatch": share(st.lr_mismatch), "speckle": share(st.speckle)},
+        "rejected": {"border": share(st.border), "saturated": share(st.saturated), "no_texture": share(st.no_texture), "not_unique": share(st.non_unique), "lr_mismatch": share(st.occluded), "speckle": share(st.speckle)},
     })
 }
 
-pub fn device_json(sel: &noto_ml::Selection) -> Value {
+pub fn device_json(sel: &crate::ml_bridge::Selection) -> Value {
     json!({
-        "backends": noto_ml::probe_backends(),
+        "backends": crate::ml_bridge::probe_backends(),
         "selected": sel.backend.name(),
         "ordinal": sel.ordinal,
         "reason": sel.reason,
@@ -474,7 +474,7 @@ impl Runtime {
         }
         if let Some(cmd) = self.live_queue.pop_front() {
             if let Err(e) = self.live_start(&cmd) {
-                self.log("quest", noto_sds::Level::Warn, format!("대기 명령 \"{cmd}\"을 시작하지 못함: {e}"), None);
+                self.log("quest", crate::sds::Level::Warn, format!("대기 명령 \"{cmd}\"을 시작하지 못함: {e}"), None);
             }
         }
     }
@@ -513,7 +513,7 @@ impl Runtime {
             self.step(ticks)
         };
         self.live_pump();
-        let notable: Vec<&LogLine> = lines.iter().filter(|l| l.level != noto_sds::Level::Debug).collect();
+        let notable: Vec<&LogLine> = lines.iter().filter(|l| l.level != crate::sds::Level::Debug).collect();
         let events: Vec<Value> = notable[notable.len().saturating_sub(50)..].iter().map(|l| log_json(l)).collect();
         let progress = crate::progress::build_progress(self, focus);
         Ok(json!({
@@ -723,7 +723,7 @@ impl Runtime {
         let cam = world_sim::Camera { width, height, ..*self.camera() };
         let frame = self.world_mut().render_unit(unit, &cam, mode == "fork").ok_or_else(|| format!("유닛 {unit}가 없습니다"))?;
         let (rgb, depth_name) = if mode == "depth" {
-            let map = noto_vision::DepthMap { width: frame.width as u32, height: frame.height as u32, kind: noto_vision::DepthKind::Metric, data: frame.depth.clone() };
+            let map = crate::vision_compat::DepthMap { width: frame.width as u32, height: frame.height as u32, kind: crate::vision_compat::DepthKind::Metric, data: frame.depth.clone() };
             let (lo, hi) = map.range();
             (map.colorize_in(lo, hi).data, if unit == 1 { self.ml.depth_mode() } else { "렌더러 깊이".to_string() })
         } else {
@@ -801,7 +801,7 @@ impl Runtime {
             .enumerate()
             .map(|(i, (id, ko))| json!({"id": id, "label_ko": ko, "state": if i < at { "done" } else if i == at { "active" } else { "pending" }}))
             .collect();
-        let item_json = |p: &noto_vision::ItemPose| {
+        let item_json = |p: &crate::vision_compat::ItemPose| {
             json!({"yaw_deg": r3(p.yaw_deg), "rel_yaw_deg": r3(p.rel_yaw_deg), "length_m": r3(p.length_m), "width_m": r3(p.width_m), "height_m": r3(p.height_m), "top_tilt_deg": r3(p.top_tilt_deg), "elongation": r3(p.elongation), "form": p.form, "points": p.points})
         };
         let check = self.gaze_check.as_ref().filter(|g| Some(g.drop) == drop && w.tick.saturating_sub(g.tick) < 600).map(|g| {
@@ -887,7 +887,7 @@ impl Runtime {
             "raw_webp_base64": d.raw_webp.as_ref().map(|b| STANDARD.encode(b)),
             "seg_webp_base64": d.seg_webp.as_ref().map(|b| STANDARD.encode(b)),
             "normals_webp_base64": d.normals_webp.as_ref().map(|b| STANDARD.encode(b)),
-            "align": d.align.map(|a| json!({"a": r3(a.a), "b": r3(a.b), "inliers": a.inliers, "candidates": a.candidates, "inlier_share": r3(a.inlier_share), "median_rel_err": r3(a.median_rel_err), "span_m": [r3(a.span_m.0), r3(a.span_m.1)], "off_ground_normals": a.off_ground_normals})),
+            "align": d.align.map(|a| json!({"a": r3(a.a), "b": r3(a.b), "inlier_share": r3(a.inlier_share), "median_rel_err": r3(a.median_rel_err)})),
             "sky": d.sky_frac.map(|f| json!({"frac": r3(f)})),
             "flip_tta": d.flip_tta,
             "camera": self.head_view_json(),
@@ -919,7 +919,7 @@ impl Runtime {
         if probe.plan.is_some() && (self.live_running() || self.busy()) {
             self.live_queue.push_back(input.to_string());
             let n = self.live_queue.len();
-            self.log("quest", noto_sds::Level::Info, format!("명령 대기 ({n}번째): \"{input}\" — 지금 기록이 끝나면 시작"), None);
+            self.log("quest", crate::sds::Level::Info, format!("명령 대기 ({n}번째): \"{input}\" — 지금 기록이 끝나면 시작"), None);
             let s = self.submit_preview(input);
             let mut v = submission_json(self, input, &s);
             v["queued"] = json!(n);
@@ -1000,7 +1000,7 @@ impl Runtime {
                 let moved = self.sds.purge();
                 self.log(
                     "sds_purge",
-                    noto_sds::Level::Warn,
+                    crate::sds::Level::Warn,
                     format!("SDS 보관 이동(purge): {}건", obs),
                     Some(json!({"moved": moved.as_ref().map(|p| p.display().to_string()), "observations": obs, "seal": seal})),
                 );
@@ -1017,7 +1017,7 @@ impl Runtime {
                 let removed = self.sds.prune_archive(keep);
                 self.log(
                     "sds_prune",
-                    noto_sds::Level::Info,
+                    crate::sds::Level::Info,
                     format!("SDS 보관 정리: {}건 삭제 (유지 {keep})", removed.len()),
                     Some(json!({"removed": removed, "keep": keep})),
                 );
@@ -1047,7 +1047,7 @@ impl Runtime {
         if let Some(dir) = self.data_dir().map(std::path::Path::to_path_buf) {
             self.audit.sync_anchor();
             let digests = self.sds.ledger_digests();
-            let files = noto_sds::verify_dir(&dir.join("logs"), Some(&digests));
+            let files = crate::sds::verify_dir(&dir.join("logs"), Some(&digests));
             Ok(json!({"files": files}))
         } else {
             let (lines, _) = self.audit.tail(0, 10_000, None);
@@ -1116,13 +1116,13 @@ impl Runtime {
             let t0 = num(args, "t0").map(|v| v.max(0.0) as u32);
             let period = num(args, "period").unwrap_or(0.0).max(0.0) as u32;
             let n = num(args, "n").map(|v| v.max(1.0) as usize);
-            let spans: Vec<noto_ts::series::SpanRef> = args
+            let spans: Vec<crate::ts::series::SpanRef> = args
                 .get("spans")
                 .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|v| {
-                            Some(noto_ts::series::SpanRef {
+                            Some(crate::ts::series::SpanRef {
                                 span_id: v.get("span_id")?.as_u64()? as u32,
                                 start: v.get("start")?.as_u64()? as u32,
                                 end: v.get("end").and_then(Value::as_u64).map(|x| x as u32),
@@ -1220,7 +1220,7 @@ impl Runtime {
                     "attached": true,
                     "fp8": fp.fp8,
                     "verified": fp.verified,
-                    "device": noto_ml::device_label(t.device()),
+                    "device": crate::ml_bridge::device_label(t.device()),
                     "stats": t.call_stats(),
                 })
             }
@@ -1253,16 +1253,16 @@ impl Runtime {
             diffs[diffs.len() / 2]
         };
         let ttm_arc = self.gates.ttm();
-        let run_fc = |vals: &[f64], past: &[noto_ts::HistoryMse], prior_s0: Option<f64>| -> Option<noto_ts::Forecast> {
+        let run_fc = |vals: &[f64], past: &[crate::ts::HistoryMse], prior_s0: Option<f64>| -> Option<crate::ts::Forecast> {
             if vals.is_empty() {
                 return None;
             }
             match &ttm_arc {
                 Some(t) => {
-                    let tp = noto_ts::TtmPredictor(t.as_ref());
-                    Some(noto_ts::forecast_with_prior(vals, horizon, &[&tp], past, prior_s0))
+                    let tp = crate::ts::TtmPredictor(t.as_ref());
+                    Some(crate::ts::forecast_with_prior(vals, horizon, &[&tp], past, prior_s0))
                 }
-                None => Some(noto_ts::forecast_with_prior(vals, horizon, &[], past, prior_s0)),
+                None => Some(crate::ts::forecast_with_prior(vals, horizon, &[], past, prior_s0)),
             }
         };
 
@@ -1271,9 +1271,9 @@ impl Runtime {
         let mut band_1step: Vec<Value> = Vec::new();
         let mut vals_for_fc: Vec<f64> = Vec::new();
         let mut ticks_seen: Vec<u64> = Vec::new();
-        let mut past_err: Vec<noto_ts::HistoryMse> = Vec::new();
+        let mut past_err: Vec<crate::ts::HistoryMse> = Vec::new();
         let mut prior_s0: Option<f64> = None;
-        let mut book_ref: Option<&noto_ts::ErrBook> = None;
+        let mut book_ref: Option<&crate::ts::ErrBook> = None;
 
         if let Some(rest) = series_id.strip_prefix("lm:") {
             let mut sp = rest.split(':');
@@ -1535,7 +1535,7 @@ impl Runtime {
         let mut gate_hi = Vec::with_capacity(fc.point.len());
         for i in 0..fc.point.len() {
             let s_m = ((fc.p90[i] - fc.p10[i]) * 0.5 / 1.2816).max(1e-4);
-            let h_idx = noto_ts::HORIZONS.iter().position(|&h| h == i + 1);
+            let h_idx = crate::ts::HORIZONS.iter().position(|&h| h == i + 1);
             let (kh, sf) = match (book, h_idx) {
                 (Some(b), Some(hi)) => (b.h_aci[hi].k, b.s_for_horizon(hi, s_m)),
                 (Some(b), None) => (b.k, b.s_fused(s_m) * ((i + 1) as f64).sqrt().min(4.0)),
@@ -1566,7 +1566,7 @@ impl Runtime {
             }
             None => json!({"model80": null, "cal80": null, "gate": null, "n": 0, "pit_mean": null, "pit_sd": null}),
         };
-        let horizons: Vec<Value> = noto_ts::HORIZONS
+        let horizons: Vec<Value> = crate::ts::HORIZONS
             .iter()
             .enumerate()
             .map(|(i, &h)| {
@@ -1643,20 +1643,17 @@ impl Runtime {
 
     pub fn api_model_use(&mut self, which: &str, args: &Value) -> Result<Value, String> {
         let enabled = args.get("enabled").and_then(Value::as_bool).unwrap_or(true);
-        let sel = noto_ml::preferred();
+        let sel = crate::ml_bridge::preferred();
         let folder = |env: &str, default: &str| -> std::path::PathBuf {
             text(args, "dir").map(std::path::PathBuf::from).or_else(|| std::env::var(env).ok().map(std::path::PathBuf::from)).unwrap_or_else(|| std::path::PathBuf::from(default))
         };
         match (which, enabled) {
             ("tips", false) => self.use_depth_stand_in(),
-            ("sam", false) => self.use_region_tracker_clamped(),
-            (w, true) => {
+            ("sam", false) => self.use_stereo_fast_tick(),
+            ("sam", true) => self.use_stereo_metric_grasp(),
+            ("tips", true) => {
                 let device = sel.backend.device(sel.ordinal).map_err(|e| format!("{} 장치를 열 수 없습니다: {e:#}", sel.backend.name()))?;
-                if w == "tips" {
-                    self.use_tips(&folder(noto_vision::tips::DIR_ENV, noto_vision::tips::DEFAULT_DIR), &device).map_err(|e| format!("{e:#}"))?;
-                } else {
-                    self.use_sam(&folder(noto_vision::sam::DIR_ENV, noto_vision::sam::DEFAULT_DIR), &device).map_err(|e| format!("{e:#}"))?;
-                }
+                self.use_tips(&folder(crate::vision_compat::tips::DIR_ENV, crate::vision_compat::tips::DEFAULT_DIR), &device).map_err(|e| format!("{e:#}"))?;
             }
             _ => {}
         }
@@ -1674,7 +1671,7 @@ impl Runtime {
             "ttm_fingerprint": self.gates.ttm().map(|t| t.fingerprint().clone()),
             "ttm_stats": self.gates.ttm().map(|t| t.call_stats()),
             "parser_embedding": self.has_embedder(),
-            "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device(), "ttm": self.gates.ttm().map(|t| noto_ml::device_label(t.device()))},
+            "devices": {"depth": self.ml.depth_device(), "locate": self.ml.locate_device(), "track": self.ml.tracker.device(), "ttm": self.gates.ttm().map(|t| crate::ml_bridge::device_label(t.device()))},
             "ml": {"depth": self.ml.depth_mode(), "locate": self.ml.locate_mode(), "track": self.ml.track_mode()},
             "stand_ins": self.stand_ins(),
             "cameras": self.cameras(),
@@ -1760,7 +1757,7 @@ impl Runtime {
             "depth_view" => self.api_depth_view(num(args, "quality").unwrap_or(80.0) as f32),
             "tips_use" => self.api_model_use("tips", args),
             "sam_use" => self.api_model_use("sam", args),
-            "devices" => Ok(device_json(&noto_ml::preferred())),
+            "devices" => Ok(device_json(&crate::ml_bridge::preferred())),
             "camera_rig" => self.api_camera_rig(args),
             "crew_status" => Ok(self.crew_json()),
             "crew_add" => {
@@ -2097,7 +2094,7 @@ mod tests {
     fn granite_ttm_joins_the_fusion_once_it_is_attached() {
         use candle_core::{DType, Device};
         use candle_nn::{VarBuilder, VarMap};
-        use noto_ts::ttm::{TtmConfig, TtmForecaster};
+        use crate::ts::ttm::{TtmConfig, TtmForecaster};
 
         let cfg: TtmConfig = serde_json::from_value(json!({
             "context_length": 52, "prediction_length": 16, "patch_length": 4, "patch_stride": 4, "num_input_channels": 1,

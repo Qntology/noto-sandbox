@@ -1,6 +1,6 @@
 use noto_core::{BaseKind, BodyPlan, Tier};
 use noto_runtime::{NoiseCfg, Runtime, RuntimeConfig, TestPhase};
-use noto_sds::{Scope, Track};
+use noto_runtime::sds::{Scope, Track};
 use serde_json::Value;
 
 const LEXICON: &str = include_str!("../../../data/world_lexicon.json");

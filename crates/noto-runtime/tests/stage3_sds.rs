@@ -7,7 +7,7 @@ use noto_runtime::feedback::{FeedbackHub, FeedbackPath, Mode, SdsMode};
 use noto_runtime::nnlive::{NnLive, NnView};
 use noto_runtime::precision::PrecisionGates;
 use noto_runtime::Runtime;
-use noto_sds::{DriftState, Facet, Scope, ScopeKey, SdsStore, Track};
+use noto_runtime::sds::{DriftState, Facet, Scope, ScopeKey, SdsStore, Track};
 use serde_json::json;
 
 fn lexicon() -> String {

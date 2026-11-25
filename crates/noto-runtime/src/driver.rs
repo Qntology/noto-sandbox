@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use noto_quest::{QuestResult, State};
-use noto_sds::{Level, Scope, Track};
+use crate::sds::{Level, Scope, Track};
 use noto_search::{DropTarget, Plan};
 use serde_json::json;
 use world_sim::explore::{Coverage, Viewpoint};
@@ -1673,12 +1673,12 @@ impl Runtime {
         let intr = crate::record::intrinsics(&self.world, &self.cam);
         let pose = crate::record::odometry(&self.world, &self.cam);
         let fix = self.ml.fix.clone();
-        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let rgb = crate::vision_compat::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
         let right = self.stereo_baseline().filter(|_| self.ml.stereo_rig().is_some()).map(|b| self.world.render_right(&self.cam, b));
         let (depth, source, rel) = match &mut self.ml.depth {
             crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
                 let Some(r) = right else { return BoxDepth::none("sgbm", "오른쪽 화면 없음") };
-                let pair = noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb);
+                let pair = crate::vision_compat::Rgb::new(r.width as u32, r.height as u32, r.rgb);
                 match m.infer_pair(&rgb, &pair) {
                     Ok(d) => (d, "sgbm", None),
                     Err(e) => return BoxDepth::none("sgbm", format!("SGBM 실패: {e}")),
@@ -1690,7 +1690,7 @@ impl Runtime {
                 let mut d = s.depth;
                 let mut rel = fix.depth_rel_sigma;
                 if let Some(cfg) = &fix.align {
-                    match noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, max, cfg) {
+                    match crate::vision_compat::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, max, cfg) {
                         Some(f) => rel = f.median_rel_err.max(fix.depth_rel_sigma),
                         None => return BoxDepth::none("tipsv2+ground", "지면 정렬 실패 (화면에 지면이 모자람)"),
                     }
@@ -1710,7 +1710,7 @@ impl Runtime {
             return BoxDepth { valid_frac, ..BoxDepth::none("sgbm", "민무늬·반사·근접으로 매칭 안 됨") };
         }
         let (Some(d), Some(at)) = (d, at) else { return BoxDepth { valid_frac, ..BoxDepth::none(source, "상자에 깊이 없음") } };
-        let item = noto_vision::item_pose(&depth, &intr, &pose, bbox, 0.0);
+        let item = crate::vision_compat::item_pose(&depth, &intr, &pose, bbox, 0.0);
         let range_m = self.dist_me(at.0, at.1);
         let sigma_m = match rel {
             Some(r) => r * range_m,
@@ -2041,22 +2041,22 @@ impl Runtime {
         let cam = self.cam;
         let frame = self.world.render(&cam);
         let truth = crate::ml::KeyTruth::capture(&self.world, &frame);
-        let rgb = noto_vision::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
+        let rgb = crate::vision_compat::Rgb::new(frame.width as u32, frame.height as u32, frame.rgb.clone());
         let (intr, pose) = (crate::record::intrinsics(&self.world, &cam), crate::record::odometry(&self.world, &cam));
         let right = self.stereo_baseline().map(|b| self.world.render_right(&cam, b));
         let fix = self.ml.fix.clone();
         let (depth, source) = match &mut self.ml.depth {
             crate::ml::DepthEngine::Model(m) if m.stereo_rig().is_some() => {
-                let pair = right.as_ref().map(|r| noto_vision::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone()));
+                let pair = right.as_ref().map(|r| crate::vision_compat::Rgb::new(r.width as u32, r.height as u32, r.rgb.clone()));
                 (pair.and_then(|p| m.infer_pair(&rgb, &p).ok()), "SGBM")
             }
             crate::ml::DepthEngine::Model(m) => {
                 let max = m.max_depth_m();
-                let scene = m.infer_scene(&rgb, noto_vision::SceneHeads::ALL).ok();
+                let scene = m.infer_scene(&rgb, crate::vision_compat::SceneHeads::ALL).ok();
                 let depth = scene.map(|s| {
                     let mut d = s.depth;
                     if let (Some(max), Some(cfg)) = (max, &fix.align) {
-                        noto_vision::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg);
+                        crate::vision_compat::ground_align_with(&mut d, s.normals.as_ref().filter(|_| fix.normals), &intr, &pose, None, Some(max), cfg);
                     }
                     d
                 });
@@ -2065,7 +2065,7 @@ impl Runtime {
             crate::ml::DepthEngine::StandIn(s) => (Some(s.run(&truth)), "깊이 대역"),
         };
         let Some(depth) = depth else { return };
-        if let Some(read) = noto_vision::stairs::read_step(&depth, &intr, &pose, &noto_vision::stairs::StepCfg::default()).filter(|r| r.height_m.abs() <= STEP_READ_MAX_M) {
+        if let Some(read) = crate::vision_compat::stairs::read_step(&depth, &intr, &pose, &crate::vision_compat::stairs::StepCfg::default()).filter(|r| r.height_m.abs() <= STEP_READ_MAX_M) {
             let mut ev = Vec::new();
             self.world.note_step(read.height_m, read.dist_m, source, 1, &mut ev);
             self.log_world_events(&ev);

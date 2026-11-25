@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, VecDeque};
 use noto_core::balance::Source;
 use noto_core::nn::{self, GateHit, PhaseResult, RefState, SEGMENTS};
 use noto_core::parts::Segment;
-use noto_sds::{Scope, Track};
+use crate::sds::{Scope, Track};
 use serde::Serialize;
 use serde_json::{json, Value};
 

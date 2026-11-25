@@ -11,7 +11,7 @@
 //! `MemCtx::sigma_obs` uses). Where it could not match (no texture, a highlight, a strip one eye cannot see, nearer
 //! than its disparity range) the box has no depth, and the look gives no range rather than a guessed one.
 
-use noto_vision::{stereo_grid, DepthMap, Intrinsics, Pose, PyramidCfg, SgbmCfg, StereoRig};
+use crate::vision_compat::{stereo_grid, DepthMap, Intrinsics, Pose, PyramidCfg, SgbmCfg, StereoRig};
 use serde::Serialize;
 use world_sim::Camera;
 
@@ -56,8 +56,8 @@ pub struct BoxDepth {
     pub valid_frac: f32,
     pub reason: Option<String>,
     /// Which way the item lies, its size and its top, read from the same depth over the whole box
-    /// (`noto_vision::item_pose`).
-    pub item: Option<noto_vision::ItemPose>,
+    /// (`crate::vision_compat::item_pose`).
+    pub item: Option<crate::vision_compat::ItemPose>,
 }
 
 impl BoxDepth {
@@ -118,11 +118,11 @@ pub fn in_box(depth: &DepthMap, intr: &Intrinsics, pose: &Pose, bbox: [f32; 4], 
 pub fn eye_depth(world: &world_sim::World, cam: &Camera, baseline_m: f32, target: Option<((f32, f32), [f32; 3])>) -> anyhow::Result<(world_sim::Frame, serde_json::Value)> {
     let left = world.render(cam);
     let right = world.render_right(cam, baseline_m);
-    let l = noto_vision::Rgb::new(left.width as u32, left.height as u32, left.rgb);
-    let r = noto_vision::Rgb::new(right.width as u32, right.height as u32, right.rgb);
+    let l = crate::vision_compat::Rgb::new(left.width as u32, left.height as u32, left.rgb);
+    let r = crate::vision_compat::Rgb::new(right.width as u32, right.height as u32, right.rgb);
     let rig = StereoRig { baseline_m, ..rig_for(cam, world.body.head.sensor) };
     let t0 = std::time::Instant::now();
-    let out = noto_vision::sgbm(&l, &r, &rig, &SgbmCfg::default(), Some(&PyramidCfg::default()))?;
+    let out = crate::vision_compat::sgbm(&l, &r, &rig, &SgbmCfg::default(), Some(&PyramidCfg::default()))?;
     let ms = t0.elapsed().as_secs_f32() * 1000.0;
     let depth = out.depth;
     let mut seen: Vec<f32> = depth.data.iter().copied().filter(|d| d.is_finite() && *d > 0.0).collect();
@@ -156,7 +156,7 @@ pub fn eye_depth(world: &world_sim::World, cam: &Camera, baseline_m: f32, target
         let (d, frac, _) = in_box(&depth, &intr, &pose, b, 0.0);
         (d, Some(frac))
     });
-    let item = bbox.and_then(|b| noto_vision::item_pose(&depth, &intr, &pose, b, 0.0));
+    let item = bbox.and_then(|b| crate::vision_compat::item_pose(&depth, &intr, &pose, b, 0.0));
     let frame = world_sim::Frame { width: img.width as usize, height: img.height as usize, rgb: img.data, ids: vec![0; (img.width * img.height) as usize], depth: vec![0.0; (img.width * img.height) as usize], tick: world.tick };
     let overlay = serde_json::json!({
         "source": "sgbm", "valid": valid, "scale_m": [lo, hi], "ms": ms, "grid": [depth.width, depth.height],
@@ -174,7 +174,7 @@ pub fn enough_stereo(valid_frac: f32, pixels: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noto_vision::DepthKind;
+    use crate::vision_compat::DepthKind;
 
     fn intr() -> Intrinsics {
         Intrinsics { width: 384, height: 256, fov_deg: 70.0, pitch_deg: -12.0, roll_deg: 0.0 }

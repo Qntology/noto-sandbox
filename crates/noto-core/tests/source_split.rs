@@ -22,7 +22,7 @@ fn the_registry_finds_the_engine_and_leaves_the_benchmarks_out() {
         "crates/world-sim/src/world/acts.rs",
         "crates/world-sim/src/world/eye.rs",
         "crates/world-sim/src/render.rs",
-        "crates/noto-vision/src/decide.rs",
+        "crates/noto-runtime/src/stereo.rs",
         "crates/noto-runtime/src/driver.rs",
         "crates/noto-runtime/src/vision.rs",
     ] {

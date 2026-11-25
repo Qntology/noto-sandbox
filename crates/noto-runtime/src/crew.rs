@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use noto_quest::{QuestResult, State, StepKind, FIRST_WORKER, TEAM};
-use noto_sds::Level;
+use crate::sds::Level;
 use noto_search::{PlaceRef, Plan, Target};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

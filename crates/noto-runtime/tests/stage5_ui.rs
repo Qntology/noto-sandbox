@@ -161,7 +161,7 @@ fn ts_view_until_tick_uses_only_past_points() {
     };
     let mut lm_id = 0u32;
     let mut g = noto_runtime::PrecisionGates::new(rt.cfg.gates.clone());
-    let mut sds = noto_sds::SdsStore::memory();
+    let mut sds = noto_runtime::sds::SdsStore::memory();
     for i in 1..=12u64 {
         let sc = if i <= 8 { 0.80 + 0.01 * ((i % 3) as f32 - 1.0) } else { 0.50 };
         let j = g.judge(vec![make_c(sc)], i * 10, &mut sds).pop().unwrap();
@@ -265,14 +265,14 @@ fn audit_old_lines_still_verify() {
     // Mixed log containing lines without `tick` (omitted in JSON) and lines with `tick` must verify cleanly.
     let dir = std::env::temp_dir().join(format!("noto_rt_audit_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let mut log = noto_sds::AuditLog::open(&dir, "mixed", 32).expect("open audit");
+    let mut log = noto_runtime::sds::AuditLog::open(&dir, "mixed", 32).expect("open audit");
     log.info("world", "legacy without tick");
-    log.log_with_tick("quest", noto_sds::Level::Info, "with tick", None, Some(42));
+    log.log_with_tick("quest", noto_runtime::sds::Level::Info, "with tick", None, Some(42));
     let path = log.path().unwrap().to_path_buf();
     let txt = std::fs::read_to_string(&path).unwrap();
     assert!(!txt.lines().next().unwrap().contains("\"tick\""), "None tick must be omitted from JSON");
     assert!(txt.lines().nth(1).unwrap().contains("\"tick\":42"), "Some tick must be serialized");
-    let ok = noto_sds::verify_file(&path).expect("mixed audit file must verify");
+    let ok = noto_runtime::sds::verify_file(&path).expect("mixed audit file must verify");
     assert_eq!(ok.lines, 2);
     drop(log);
     let _ = std::fs::remove_dir_all(&dir);

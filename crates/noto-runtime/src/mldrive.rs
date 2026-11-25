@@ -1,10 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use noto_quest::{QuestResult, State};
-use noto_sds::{Level, Scope, Track};
+use crate::sds::{Level, Scope, Track};
 use noto_search::{DropTarget, Plan};
-use noto_ts::{Predictor, TtmPredictor};
-use noto_vision::{DecideCfg, Decider, Decision, TriStep};
+use crate::ts::{Predictor, TtmPredictor};
+use crate::vision_compat::{DecideCfg, Decider, Decision, TriStep};
 use serde_json::json;
 use world_sim::explore::{line_of_sight, Coverage, TARGET_H_M};
 use world_sim::world::{AMOUNT_EPS, DELIVER_REACH_M, MINE_REACH_M, PICKUP_REACH_M};
@@ -570,7 +570,7 @@ impl Runtime {
         }
 
         if let (Some(fix), Some(s)) = (&rep.fix, &sighting) {
-            if let Some(d) = s.depth_range_m.filter(|_| noto_vision::scale_usable(fix, s)) {
+            if let Some(d) = s.depth_range_m.filter(|_| crate::vision_compat::scale_usable(fix, s)) {
                 let dmode = self.ml.depth_mode();
                 let scope = Scope::new(Track::Depth, &dmode, &label);
                 self.active_sds_mut().record_calibration(&scope, "scale", fix.range_m as f64, d as f64);

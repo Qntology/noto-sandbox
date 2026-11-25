@@ -76,20 +76,35 @@ pub struct Verdict {
 }
 
 pub fn likeness(z: f32) -> f32 {
-    (100.0 - 10.0 * z.abs()).max(0.0)
+    premium_discount_eval::rule::likeness(z)
 }
 
 pub fn judge(value: Option<f32>, rule: Rule) -> Verdict {
+    use premium_discount_eval::rule::{judge as pd_judge, Rule as PdRule};
     let Some(v) = value else {
         return Verdict { score: (!matches!(rule, Rule::Raw)).then_some(0.0), ..Verdict::default() };
     };
-    let scored = |z: f32| Verdict { z: Some(z), score: Some(likeness(z)), broken: None };
     match rule {
-        Rule::Like { reference, tolerance } => scored((v - reference) / tolerance.max(1e-6)),
-        Rule::AtLeast { reference, tolerance } => scored(((v - reference) / tolerance.max(1e-6)).min(0.0)),
-        Rule::NoWorse { reference, tolerance } => scored(((v - reference) / tolerance.max(1e-6)).max(0.0)),
-        Rule::AtMost { limit } => Verdict { broken: (v > limit).then_some((v, limit)), ..Verdict::default() },
-        Rule::Raw => Verdict::default(),
+        Rule::Like { reference, tolerance } => {
+            let pv = pd_judge(Some(v), PdRule::Like { reference, tolerance: tolerance.max(1e-6) });
+            Verdict { z: pv.z, score: pv.score, broken: None }
+        }
+        Rule::AtLeast { reference, tolerance } => {
+            let pv = pd_judge(Some(v), PdRule::AtLeast { reference, tolerance: tolerance.max(1e-6) });
+            Verdict { z: pv.z, score: pv.score, broken: None }
+        }
+        Rule::NoWorse { reference, tolerance } => {
+            let pv = pd_judge(Some(v), PdRule::NoWorse { reference, tolerance: tolerance.max(1e-6) });
+            Verdict { z: pv.z, score: pv.score, broken: None }
+        }
+        Rule::AtMost { limit } => {
+            let pv = pd_judge(Some(v), PdRule::AtMost { limit });
+            Verdict { broken: pv.broken.then_some((v, limit)), ..Verdict::default() }
+        }
+        Rule::Raw => {
+            let _ = pd_judge(Some(v), PdRule::Raw);
+            Verdict::default()
+        }
     }
 }
 
@@ -519,7 +534,7 @@ pub fn ux_lines(summaries: &[Summary]) -> Vec<String> {
 pub const ENGINE_FILES: [&str; 13] = [
     "crates/noto-core/src/**/*.rs",
     "crates/world-sim/src/**/*.rs",
-    "crates/noto-vision/src/**/*.rs",
+    "crates/noto-runtime/src/stereo.rs",
     "crates/noto-runtime/src/driver.rs",
     "crates/noto-runtime/src/mldrive.rs",
     "crates/noto-runtime/src/vision.rs",

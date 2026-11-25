@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use noto_core::balance::REACTION_DELAY_S;
-use noto_sds::{Scope, SdsStore, Track};
+use crate::sds::{Scope, SdsStore, Track};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

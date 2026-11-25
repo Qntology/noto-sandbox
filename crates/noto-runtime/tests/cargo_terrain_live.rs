@@ -1,6 +1,6 @@
 use noto_core::{BaseKind, BodyPlan, NotoConfig, Tier};
 use noto_quest::State;
-use noto_sds::{Scope, Track};
+use noto_runtime::sds::{Scope, Track};
 use noto_runtime::{NoiseCfg, Runtime, RuntimeConfig, TestPhase};
 use serde_json::{json, Value};
 use world_sim::{ItemKind, TerrainKind};

@@ -126,7 +126,7 @@ fn the_team_track_with_a_lift_truck_first_worker_takes_the_staged_logs_with_its_
         let first: Vec<(State, String)> = rt.quest_book().all().iter().filter(|q| q.owner == 1).map(|q| (q.state, q.title.clone())).collect();
         (crew_log(&rt), stock(&rt, "warehouse", ItemKind::Log), (q.state, q.failure), first, rt.ml_pipeline().depth_mode())
     });
-    assert_eq!(depth, noto_vision::stereo::MODE, "two cameras: SGBM in the depth slot, no TIPSv2");
+    assert_eq!(depth, noto_runtime::vision_compat::stereo::MODE, "two cameras: SGBM in the depth slot, no TIPSv2");
     assert_eq!(team.0, State::Done, "{:?}\n{log}", team.1);
     assert!(stocked >= 3, "{stocked}\n{log}");
     assert!(!first.is_empty() && first.iter().all(|(s, t)| *s == State::Done && t.starts_with("[협업 · 작업자 1 · 상차·운반]")), "{first:?}\n{log}");

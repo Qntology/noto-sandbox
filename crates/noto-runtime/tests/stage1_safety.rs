@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use noto_runtime::feedback::{FeedbackPath, Mode, SdsMode};
 use noto_runtime::{Runtime, RuntimeConfig};
-use noto_sds::{Scope, Track};
+use noto_runtime::sds::{Scope, Track};
 use serde_json::json;
 
 fn lexicon() -> String {
@@ -72,7 +72,7 @@ fn frozen_mode_ignores_writes_during_the_run() {
 
 #[test]
 fn forecast_scope_separates_ttm_fingerprints() {
-    let mut sds = noto_sds::SdsStore::memory();
+    let mut sds = noto_runtime::sds::SdsStore::memory();
     let s1 = Scope::new(Track::Forecast, "tree", "ttm@aaaaaaaa");
     let s2 = Scope::new(Track::Forecast, "tree", "ttm@bbbbbbbb");
     for _ in 0..10 {

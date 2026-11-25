@@ -8,11 +8,12 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
+use premium_discount_manifest::{hash_prefix, hex, part_path};
 use sha2::{Digest, Sha256};
 use tauri::State;
 
 use crate::sim::models_json;
-use crate::state::{bank_dir, model_dir, sam_dir, tips_dir, ttm_dir, ttm_download_dir, AppState};
+use crate::state::{bank_dir, model_dir, tips_dir, ttm_dir, ttm_download_dir, AppState};
 
 type App<'a> = State<'a, Arc<AppState>>;
 
@@ -32,7 +33,7 @@ pub struct ModelSpec {
     pub files: &'static [FileSpec],
 }
 
-pub const MODELS: [ModelSpec; 4] = [
+pub const MODELS: [ModelSpec; 3] = [
     ModelSpec {
         id: "siglip2",
         label: "SigLIP2 base (patch16, NaFlex)",
@@ -70,15 +71,6 @@ pub const MODELS: [ModelSpec; 4] = [
             FileSpec { name: "model.safetensors", bytes: 632_066_716, sha256: "718757c7c816630bbe2a9ac9bdce4ee3ec22f2e1ddbb32c838ff569dc15f88a9" },
         ],
     },
-    ModelSpec {
-        id: "sam",
-        label: "MobileSAM (TinyViT)",
-        role_ko: "마스크 추적",
-        repo: "lmz/candle-sam",
-        revision: "8b4cb7c743f3b3cb8afd212a86ae15b1bbfdac97",
-        license: "Apache-2.0",
-        files: &[FileSpec { name: noto_vision::sam::TINY_FILE, bytes: 40_613_024, sha256: "5ad43a841b57cc798e2837e251c15aa9f602868a1780d195459383d117784cf7" }],
-    },
 ];
 
 pub fn spec(id: &str) -> Option<&'static ModelSpec> {
@@ -89,13 +81,8 @@ pub fn folder(id: &str) -> PathBuf {
     match id {
         "siglip2" => model_dir().unwrap_or_default(),
         "ttm" => ttm_download_dir(),
-        "tips" => tips_dir(),
-        _ => sam_dir(),
+        _ => tips_dir(),
     }
-}
-
-fn part_path(dir: &Path, f: &FileSpec) -> PathBuf {
-    dir.join(format!("{}.part", f.name))
 }
 
 fn hash_verified(path: &Path, expected_sha256: &str, mtime_ns: u128, len: u64) -> bool {
@@ -137,7 +124,7 @@ fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_nanos());
             // Re-verify SHA-256 on small/fast weights (e.g., TTM <= 64 MiB) with mtime+size cache.
-            let ok = if f.bytes <= 64 * 1024 * 1024 {
+            let ok = if !f.sha256.is_empty() && f.bytes <= 64 * 1024 * 1024 {
                 hash_verified(&p, f.sha256, mtime_ns, m.len())
             } else {
                 true
@@ -148,34 +135,16 @@ fn file_state(dir: &Path, f: &FileSpec) -> (u64, bool) {
             return (0, false);
         }
     }
-    (fs::metadata(part_path(dir, f)).map_or(0, |m| m.len().min(f.bytes)), false)
+    (fs::metadata(part_path(&dir.join(f.name))).map_or(0, |m| m.len().min(f.bytes)), false)
 }
 
 pub fn present(m: &ModelSpec) -> bool {
-    match m.id {
-        "sam" => noto_vision::SamModel::find_weights(&sam_dir()).is_some(),
-        _ => m.files.iter().all(|f| file_state(&folder(m.id), f).1),
-    }
+    m.files.iter().all(|f| file_state(&folder(m.id), f).1)
 }
 
 /// Whether the eye needs this model: a stereo pair measures depth with SGBM and has no use for TIPSv2.
-/// `NOTO_SAM=1`: track masks with MobileSAM. Without it the masks come from region growing kept to each item's
-/// size (`Runtime::use_region_tracker_clamped`): on the RX 6600 SAM took 13.8 s of a 17 s keyframe (its depthwise
-/// convolutions go to the host one channel group at a time), region growing 7 ms
-/// (docs/research/ml-perforated.md, the hybrid section).
-pub const SAM_ENV: &str = "NOTO_SAM";
-
-pub fn sam_opt_in() -> bool {
-    std::env::var(SAM_ENV).is_ok_and(|v| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "vit_b" | "vit-b" | "mobile"
-        )
-    })
-}
-
 pub fn needed(m: &ModelSpec, stereo: bool) -> bool {
-    !(stereo && m.id == "tips") && (m.id != "sam" || sam_opt_in())
+    !(stereo && m.id == "tips")
 }
 
 pub fn missing(stereo: bool) -> Vec<&'static ModelSpec> {
@@ -307,7 +276,7 @@ impl Meter {
 
 async fn fetch(client: &reqwest::Client, dl: &Downloads, m: &ModelSpec, f: &FileSpec, dir: &Path, mut on_bytes: impl FnMut(u64)) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("폴더 {}를 만들 수 없습니다", dir.display()))?;
-    let part = part_path(dir, f);
+    let part = part_path(&dir.join(f.name));
     let mut have = fs::metadata(&part).map_or(0, |m| m.len());
     if have > f.bytes {
         fs::remove_file(&part)?;
@@ -365,22 +334,6 @@ async fn fetch(client: &reqwest::Client, dl: &Downloads, m: &ModelSpec, f: &File
     fs::rename(&part, &dest).with_context(|| format!("{}의 이름을 바꿀 수 없습니다", part.display()))?;
     dl.update(|p| p.phase = "download".into());
     Ok(())
-}
-
-fn hash_prefix(path: &Path, len: u64, h: &mut Sha256) -> Result<()> {
-    let mut f = File::open(path)?.take(len);
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = f.read(&mut buf)?;
-        if n == 0 {
-            return Ok(());
-        }
-        h.update(&buf[..n]);
-    }
-}
-
-fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn catalog(state: &AppState) -> Value {
@@ -478,7 +431,7 @@ pub async fn models_delete(state: App<'_>, id: String) -> Result<Value, String> 
         let dir = folder(m.id);
         let mut removed = Vec::new();
         for f in m.files {
-            for p in [dir.join(f.name), part_path(&dir, f)] {
+            for p in [dir.join(f.name), part_path(&dir.join(f.name))] {
                 if p.exists() {
                     fs::remove_file(&p).map_err(|e| format!("{}를 지울 수 없습니다: {e}", p.display()))?;
                     removed.push(p.display().to_string());
@@ -514,10 +467,10 @@ pub async fn models_activate(state: App<'_>) -> Result<Value, String> {
 
 fn gpu_hint(state: &AppState) -> Option<String> {
     let (backend, _) = state.selected();
-    if backend != noto_ml::Backend::Cpu {
+    if backend != noto_runtime::ml_bridge::Backend::Cpu {
         return None;
     }
-    if noto_ml::device::GPU_ORDER.iter().any(|b| b.compiled()) {
+    if noto_runtime::ml_bridge::device::GPU_ORDER.iter().any(|b| b.compiled()) {
         return Some("GPU 백엔드가 이 빌드에 있지만 열리지 않아 CPU에서 돕니다 (장치 칩의 설명 참고)".into());
     }
     if cfg!(target_os = "macos") {
@@ -567,15 +520,11 @@ fn activate(state: &Arc<AppState>) -> Result<(), String> {
         } else {
             step("tips", &mut || rt.use_tips(&tips_dir(), &device))?;
         }
-        if sam_opt_in() {
-            step("sam", &mut || rt.use_sam(&sam_dir(), &device))?;
-        } else {
-            rt.use_region_tracker_clamped();
-        }
+        rt.use_stereo_fast_tick();
         let v = rt.api_models_status()?;
         let dev = |k: &str| v["devices"][k].as_str().unwrap_or("-").to_string();
         let depth = if stereo { "sgbm" } else { "tips" };
-        Ok([("siglip2", noto_ml::device_label(engine.model.device())), ("ttm", dev("ttm")), (depth, dev("depth")), ("sam", dev("track"))]
+        Ok([("siglip2", noto_runtime::ml_bridge::device_label(engine.model.device())), ("ttm", dev("ttm")), (depth, dev("depth")), ("track", dev("track"))]
             .into_iter()
             .map(|(k, d)| (k.to_string(), d))
             .collect::<std::collections::BTreeMap<_, _>>())
@@ -599,8 +548,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_lists_four_pinned_models() {
-        assert_eq!(MODELS.len(), 4);
+    fn catalog_lists_three_pinned_models() {
+        assert_eq!(MODELS.len(), 3);
+        assert!(!MODELS.iter().any(|m| m.id == "sam"));
         for m in &MODELS {
             assert_eq!(m.revision.len(), 40, "{} must be pinned to a commit", m.id);
             for f in m.files {
@@ -617,12 +567,37 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let f = FileSpec { name: "w.bin", bytes: 10, sha256: "" };
         assert_eq!(file_state(&dir, &f), (0, false));
-        fs::write(part_path(&dir, &f), [0u8; 4]).unwrap();
+        fs::write(part_path(&dir.join(f.name)), [0u8; 4]).unwrap();
         assert_eq!(file_state(&dir, &f), (4, false));
         fs::write(dir.join("w.bin"), [0u8; 10]).unwrap();
         assert_eq!(file_state(&dir, &f), (10, true));
         fs::write(dir.join("w.bin"), [0u8; 9]).unwrap();
         assert_eq!(file_state(&dir, &f), (4, false));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_state_rejects_mismatched_sha256() {
+        let dir = std::env::temp_dir().join(format!("noto-models-sha-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let data = [0u8; 10];
+        let p = dir.join("w.bin");
+        fs::write(&p, data).unwrap();
+        let expected = hex(&Sha256::digest(data));
+        let meta = fs::metadata(&p).unwrap();
+        let mt = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        assert!(hash_verified(&p, &expected, mt, meta.len()));
+        let bad = FileSpec {
+            name: "w.bin",
+            bytes: 10,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+        };
+        assert_eq!(file_state(&dir, &bad), (0, false));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -657,10 +632,10 @@ mod tests {
         let live = state.live_devices();
         println!("[MODELS] loaded on {:?} in {:.1} s · {live:?}", state.selected(), t0.elapsed().as_secs_f32());
         assert!(state.models_ready());
-        if noto_ml::device::select(None).backend != noto_ml::Backend::Cpu && std::env::var(noto_ml::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
+        if noto_runtime::ml_bridge::device::select(None).backend != noto_runtime::ml_bridge::Backend::Cpu && std::env::var(noto_runtime::ml_bridge::device::DEVICE_ENV).map_or(true, |v| !v.eq_ignore_ascii_case("cpu")) {
             assert!(
                 live.iter()
-                    .filter(|(k, _)| sam_opt_in() || k.as_str() != "sam")
+                    .filter(|(k, _)| k.as_str() != "track")
                     .all(|(_, d)| !d.starts_with("CPU") && d != "cpu"),
                 "a model is not on the GPU: {live:?}"
             );
@@ -670,7 +645,7 @@ mod tests {
                 assert!(rt.stand_ins().is_empty(), "stand-ins left: {:?}", rt.stand_ins());
                 let d = rt.depth_view(80.0).map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] depth {} on {} · {:.0} ms · {:?}", d.mode, d.device, d.infer_ms, d.metrics);
-                assert!(d.mode.starts_with(noto_vision::tips::MODE), "{}", d.mode);
+                assert!(d.mode.starts_with(lv_spatial::tips::MODE), "{}", d.mode);
                 let s = rt.scan_now("test").map_err(|e| format!("{e:#}"))?;
                 println!("[MODELS] scan {} on {} · {} tiles · {} judged", s.mode, s.device, s.tiles, s.judged.len());
                 assert_ne!(s.mode, "oracle");

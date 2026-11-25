@@ -9,3 +9,5 @@ description = "Natural-language command search over a logis-center style word di
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+premium-discount-nms = { workspace = true }
+premium-discount-sds = { workspace = true }

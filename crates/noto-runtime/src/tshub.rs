@@ -6,7 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use noto_ts::series::{align_span, q, regularize, ChannelKind, ChannelSpec, SpanRef, TsSample};
+use crate::ts::series::{align_span, q, regularize, ChannelKind, ChannelSpec, SpanRef, TsSample};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 

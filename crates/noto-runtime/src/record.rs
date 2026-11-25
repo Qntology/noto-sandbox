@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use anyhow::{anyhow, Result};
 use noto_core::act::focus::FocusFrame;
 use noto_core::BalanceSummary;
-use noto_vision::{DepthMetrics, Features, Intrinsics, Pose, Rgb};
+use crate::vision_compat::{DepthMetrics, Features, Intrinsics, Pose, Rgb};
 use serde::{Deserialize, Serialize};
 use world_sim::render::{render_focus, FocusCam};
 use world_sim::{decode_webp, encode_webp, Camera, World};
@@ -48,7 +48,7 @@ pub struct MlView {
     pub flags: Vec<String>,
     /// The 1 : 2 : 4 grids this keyframe ran on and what the cross-layer checks changed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pyramid: Option<noto_vision::PyramidReport>,
+    pub pyramid: Option<crate::vision_compat::PyramidReport>,
     /// Where the analysis spent its time (`ml::StageMs`).
     pub stage_ms: crate::ml::StageMs,
 }

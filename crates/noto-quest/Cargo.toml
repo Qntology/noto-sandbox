@@ -8,6 +8,7 @@ description = "Game-style quests: a command plan becomes steps that move through
 [dependencies]
 noto-search = { path = "../noto-search" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

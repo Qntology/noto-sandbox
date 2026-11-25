@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use noto_sds::{BalanceRow, KeyframeRow, MirrorBatch, NnPhaseRow, QuestRun, SuccessStat};
+use noto_quest::records::{BalanceRow, KeyframeRow, MirrorBatch, NnPhaseRow, QuestRun, SuccessStat};
 use lancedb::arrow::arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
 use lancedb::arrow::arrow_schema::{DataType, Field, Schema, SchemaRef};
 
