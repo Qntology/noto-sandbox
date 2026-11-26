@@ -2537,7 +2537,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5171,7 +5171,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lv-core"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -5201,7 +5201,7 @@ dependencies = [
 [[package]]
 name = "lv-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "premium-discount-cpu-kernels",
  "rayon",
@@ -5210,7 +5210,7 @@ dependencies = [
 [[package]]
 name = "lv-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -5224,7 +5224,7 @@ dependencies = [
 [[package]]
 name = "lv-spatial"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=341e54cdc822aa7ee6201fba8f48472df11e1bd6#341e54cdc822aa7ee6201fba8f48472df11e1bd6"
+source = "git+https://github.com/Qntology/louis-vision?rev=afa2f8afce076ee418b669e701e3c1668463da56#afa2f8afce076ee418b669e701e3c1668463da56"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -6752,7 +6752,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -6939,7 +6939,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7453,7 +7453,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8011,7 +8011,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8023,7 +8023,7 @@ version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "287f59010008f0d7cf5e3b03196d666c1acc46c8d3e9cf34c28a1a7157601e72"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -8625,7 +8625,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -9636,7 +9636,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
