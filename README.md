@@ -1,5 +1,22 @@
 # noto-sandbox
 
+> **Migrated & Consolidated into `vision-sandbox` (`Qntology/louis-vision/apps/vision`)**
+>
+> `noto-sandbox` has been consolidated and migrated into [`Qntology/louis-vision/apps/vision`](https://github.com/Qntology/louis-vision/tree/main/apps/vision) (`vision-sandbox`, merged in [Qntology/louis-vision#6](https://github.com/Qntology/louis-vision/pull/6)). Active development continues there.
+>
+> 이 저장소의 추적 소스는 [`Qntology/louis-vision/apps/vision`](https://github.com/Qntology/louis-vision/tree/main/apps/vision) (`vision-sandbox`) 워크스페이스로 통합 이전되었습니다 ([Qntology/louis-vision#6](https://github.com/Qntology/louis-vision/pull/6)). 이후 개발은 통합 워크스페이스에서 이어집니다.
+>
+> | Legacy (`noto-sandbox`) | Unified (`Qntology/louis-vision/apps/vision`) |
+> | --- | --- |
+> | `crates/noto-core` (`noto-core`) | `crates/sandbox-core` (`sandbox-core`) |
+> | `crates/noto-data` (`noto-data`) | `crates/sandbox-data` (`sandbox-data`) |
+> | `crates/world-sim` (`world-sim`) | `crates/sandbox-world` (`sandbox-world`) |
+> | `crates/noto-search` (`noto-search`) | `crates/sandbox-search` (`sandbox-search`) |
+> | `crates/noto-quest` (`noto-quest`) | `crates/sandbox-quest` (`sandbox-quest`) |
+> | `crates/noto-runtime` (`noto-runtime`) | `crates/sandbox-runtime` (`sandbox-runtime`) |
+> | `src-tauri` (`noto-sim-app`) | `src-tauri` (`vision-sandbox-app`) |
+> | `NotoConfig` / `NOTO_*` | `SandboxConfig` / `VISION_SANDBOX_*` |
+
 ## Noto 물류 로봇 시뮬레이터 (Rust + Tauri)
 
 손가락 수(2–5)와 관절 옵션, 발(바퀴·메카넘·트랙·사람 발)을 바꿔 보며 파지와 주행을 시뮬레이션합니다. SigLIP2로 물류 물체를 분류하고, 합성 데이터를 LanceDB에 기록합니다.
