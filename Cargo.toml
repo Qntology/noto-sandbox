@@ -31,18 +31,18 @@ candle-nn = "0.11.0"
 candle-rocm = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
 
 # Tier 0 (Qntology/premium-discount) pinned to PD_LIB_PIN_REV_2
-premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-eval        = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-manifest    = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-nms         = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-quant       = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675" }
-premium-discount-sds         = { git = "https://github.com/Qntology/premium-discount", rev = "dae2667e498b65e6eb92ca0bd3ebf7e10c75c675", features = ["audit"] }
+premium-discount-cpu-kernels = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-eval        = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-manifest    = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-nms         = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-quant       = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5" }
+premium-discount-sds         = { git = "https://github.com/Qntology/premium-discount", rev = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5", features = ["audit"] }
 
 # Tier 1 (Qntology/louis-vision) pinned to LV_LIB_PIN_REV_2
-lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
-lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "afa2f8afce076ee418b669e701e3c1668463da56" }
+lv-kernels = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-sds     = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-core    = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
+lv-spatial = { git = "https://github.com/Qntology/louis-vision", rev = "5ea66a0f8727d8560bd16991cccff7f1e6a00132" }
 
 [patch.crates-io]
 candle-core = { git = "https://github.com/Qntology/candle-rocm-vulkan", rev = "f73415d4d149d7949e8a6a94911af670e4e10f7f" }
