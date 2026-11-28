@@ -5171,7 +5171,7 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 [[package]]
 name = "lv-core"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
+source = "git+https://github.com/Qntology/louis-vision?rev=54b161b3f182ccef867ff9fafa1c684946be2611#54b161b3f182ccef867ff9fafa1c684946be2611"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -5201,7 +5201,7 @@ dependencies = [
 [[package]]
 name = "lv-kernels"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
+source = "git+https://github.com/Qntology/louis-vision?rev=54b161b3f182ccef867ff9fafa1c684946be2611#54b161b3f182ccef867ff9fafa1c684946be2611"
 dependencies = [
  "premium-discount-cpu-kernels",
  "rayon",
@@ -5210,7 +5210,7 @@ dependencies = [
 [[package]]
 name = "lv-sds"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
+source = "git+https://github.com/Qntology/louis-vision?rev=54b161b3f182ccef867ff9fafa1c684946be2611#54b161b3f182ccef867ff9fafa1c684946be2611"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -5224,7 +5224,7 @@ dependencies = [
 [[package]]
 name = "lv-spatial"
 version = "0.1.0"
-source = "git+https://github.com/Qntology/louis-vision?rev=5ea66a0f8727d8560bd16991cccff7f1e6a00132#5ea66a0f8727d8560bd16991cccff7f1e6a00132"
+source = "git+https://github.com/Qntology/louis-vision?rev=54b161b3f182ccef867ff9fafa1c684946be2611#54b161b3f182ccef867ff9fafa1c684946be2611"
 dependencies = [
  "anyhow",
  "candle-core",

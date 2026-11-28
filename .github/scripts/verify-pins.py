@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 CANDLE_PIN_REV = "f73415d4d149d7949e8a6a94911af670e4e10f7f"
 PD_LIB_PIN_REV_2 = "b024dbb5e12bdb4fc1fcf83d0d62e5a645baccb5"
-LV_LIB_PIN_REV_2 = "5ea66a0f8727d8560bd16991cccff7f1e6a00132"
+LV_LIB_PIN_REV_2 = "54b161b3f182ccef867ff9fafa1c684946be2611"
 
 FORBIDDEN_CRATE_DIRS = [
     "crates/noto-cpu-kernels",
